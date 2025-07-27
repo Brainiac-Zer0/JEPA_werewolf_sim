@@ -20,7 +20,7 @@ else:
     print("[INFO] Using CPU")
 
 def chatgpt_llm_from_latent(z, agent):
-    """Generate a natural, in-character message from latent state."""
+    """Generate a natural, in-character message from latent state, with recent message context."""
     try:
         z_summary = agent.decode_z(z)
         name = agent.name
@@ -30,14 +30,22 @@ def chatgpt_llm_from_latent(z, agent):
         name = agent.name
         role = agent.role or "UNDEFINED"
 
+    # Format recent messages from heard agents
+    if hasattr(agent, 'heard_messages') and agent.heard_messages:
+        heard_lines = [f"- {n} said: \"{msg.strip()}\"" for n, msg in agent.heard_messages.items() if msg.strip()]
+        heard_block = "\n".join(heard_lines[:6])  # Limit context
+    else:
+        heard_block = "- (no recent messages heard)"
+
     prompt = f"""You are agent {name}, a {role}, in a social deduction scenario.
 
-You do not know the roles of others. You are simply speaking to the group.
+Here is what others have recently said:
+{heard_block}
 
 Your current internal state tells you:
 - {z_summary}
 
-Say ONE short, natural sentence aloud, in-character. Speak like a real person. Avoid narration, game terms, or commands. Just express what you think or feel, based on your internal belief. Statements should aimed at your general situation or at specific other agents.
+Say ONE short, natural sentence aloud, in-character. Speak like a real person. Avoid narration, game terms, or commands. Just express what you think or feel, based on your internal belief. Statements should be aimed at your general situation or at specific other agents.
 Only output the line of dialog — no narration, no formatting.
 """
 
