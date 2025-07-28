@@ -1,91 +1,90 @@
-# train.py
-import sys
+# train.py ── offline JEPA role-conditioned training loop
+# ---------------------------------------------------------------------------
+# 1. For each role (Werewolf / Villager) we
+#       a) load (or freshly create) that role’s JEPA sub-modules
+#       b) run N_GAMES simulations collecting only that role’s roll-outs
+#       c) call train_jepa(...) to update the three sub-modules
+#
+# 2. The simulation itself is delegated to training_utils.run_sim_and_collect_rollouts
+#    which returns either  (rollouts, meta_dict)  or just rollouts.
+#
+# 3. Each rollout tuple is:
+#       ( z_t , a_t_idx , z_next , role_name )
+#
+# 4. Models are **saved by train_jepa**; we do not manage checkpoints here.
+# ---------------------------------------------------------------------------
+
 import os
-import random
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import sys
+import random                         # noqa: F401  (kept for future sampling needs)
+from typing import List, Tuple        # type hints
 
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from roles import ROLE_PRIORS
 
-# Training hyperparameters
-LATENT_DIM = 32
-ACTION_DIM = 8
-NUM_ACTIONS = 6
-LEARNING_RATE = 1e-3
-TRAIN_EPOCHS = 10
-BATCH_SIZE = 16
-KL_WEIGHT = 0.1
-ENTROPY_WEIGHT = 0.05
+# Make project root importable when train.py is launched directly
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-def compute_kl_divergence(z_pred, z_prior):
-    return torch.mean((z_pred - z_prior).pow(2))
+from roles            import WEREWOLF, VILLAGER                     # noqa: E402
+from training_utils   import load_role_models, run_sim_and_collect_rollouts, train_jepa  # noqa: E402
 
-def compute_entropy(z):
-    return z.var(dim=0).mean()
 
-def compute_expected_free_energy(z_pred, z_goal, beta=ENTROPY_WEIGHT):
-    prediction_error = torch.mean((z_pred - z_goal) ** 2, dim=1)
-    entropy = compute_entropy(z_pred)
-    efe = prediction_error + beta * entropy
-    return efe.mean()
+# ─────────────────────────────── hyper-params
+N_GAMES: int = 50                    # number of simulated games per role
+LATENT_DIM: int = 32                 # kept for reference; not used directly here
+ACTION_DIM: int = 8
+NUM_ACTIONS: int = 6
 
-def train_jepa(rollout_data, world_model, action_encoder):
-    if not rollout_data:
-        return
+CHECKPOINT_DIR = "checkpoints"
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-    optimizer = optim.Adam(
-        list(world_model.parameters()) + list(action_encoder.parameters()),
-        lr=LEARNING_RATE
-    )
-    criterion = nn.MSELoss()
 
-    for epoch in range(TRAIN_EPOCHS):
-        total_loss = 0.0
-        random.shuffle(rollout_data)
+# ─────────────────────────────── helpers
+def collect_rollouts_for_role(
+    role: str,
+    n_games: int,
+) -> List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]]:
+    """
+    Run `n_games` simulations and grab only the rollout tuples whose
+    *actor* has `role == role`.
+    """
+    all_rollouts: list = []
 
-        for i in range(0, len(rollout_data), BATCH_SIZE):
-            batch = rollout_data[i:i + BATCH_SIZE]
+    for _ in range(n_games):
+        sim_ret = run_sim_and_collect_rollouts(visual=False)
 
-            z_batch = torch.stack([triplet[0] for triplet in batch])
-            a_batch = torch.stack([triplet[1] for triplet in batch]).long().squeeze()
-            z_next_batch = torch.stack([triplet[2] for triplet in batch])
-            roles = [triplet[3] for triplet in batch]
+        # run_sim_and_collect_rollouts may return (rollouts, meta) or rollouts
+        rollouts = sim_ret[0] if isinstance(sim_ret, tuple) else sim_ret
 
-            a_embed = action_encoder(a_batch)
-            z_pred = world_model(z_batch, a_embed)
+        # filter by role so we train each role’s JEPA on its own data
+        all_rollouts.extend(r for r in rollouts if r[3] == role)
 
-            mse_loss = criterion(z_pred, z_next_batch)
-            prior_z = z_batch.detach()
-            kl_loss = compute_kl_divergence(z_pred, prior_z)
-            z_goal = torch.stack([ROLE_PRIORS[r] for r in roles])
-            efe_loss = compute_expected_free_energy(z_pred, z_goal=z_goal)
+    return all_rollouts
 
-            total_batch_loss = mse_loss + KL_WEIGHT * kl_loss + efe_loss
 
-            optimizer.zero_grad()
-            total_batch_loss.backward()
-            optimizer.step()
+# ─────────────────────────────── main training routine
+def main() -> None:
+    for role_name in (WEREWOLF, VILLAGER):
+        # 1) Load / init models for this role
+        world_model, action_encoder, planner = load_role_models(role_name)
 
-            total_loss += total_batch_loss.item()
+        # 2) Simulate games and collect data
+        print(f"[JEPA] Simulating {N_GAMES} games for role: {role_name}")
+        role_rollouts = collect_rollouts_for_role(role_name, N_GAMES)
+        print(f"[JEPA] Collected {len(role_rollouts)} roll-outs for role {role_name}")
 
-        avg_loss = total_loss / max(1, len(rollout_data) // BATCH_SIZE)
-        print(f"[JEPA TRAINING] Epoch {epoch + 1}/{TRAIN_EPOCHS}, Avg Loss: {avg_loss:.4f}")
+        # 3) Train
+        print(f"[JEPA] Training JEPA modules for role: {role_name}")
+        train_jepa(
+            rollout_data=role_rollouts,
+            world_model=world_model,
+            action_encoder=action_encoder,
+            planner=planner,
+            role_name=role_name,
+        )
 
-def main():
-    from sim import run_sim_and_collect_rollouts
+    print("\n[JEPA] All roles trained and checkpoints updated.")
 
-    print("[SIM] Running simulation and collecting rollout data...")
-    rollout_data, _ = run_sim_and_collect_rollouts()
 
-    from encoders import WorldModelMLP, ActionEncoder
-    print("[JEPA] Initializing models...")
-    world_model = WorldModelMLP(latent_dim=LATENT_DIM, action_dim=ACTION_DIM)
-    action_encoder = ActionEncoder(num_actions=NUM_ACTIONS, action_dim=ACTION_DIM)
-
-    print("[JEPA] Starting training...")
-    train_jepa(rollout_data, world_model, action_encoder)
-
+# ─────────────────────────────── CLI entry
 if __name__ == "__main__":
     main()

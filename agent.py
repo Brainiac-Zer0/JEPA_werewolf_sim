@@ -1,124 +1,154 @@
 import torch
 import torch.nn.functional as F
-from encoders import MessageEncoder, MLPBeliefEncoder, WorldModelMLP, ActionEncoder, package_features, INPUT_DIM, LATENT_DIM
+from collections import deque
+from encoders import (
+    MessageEncoder,
+    MLPBeliefEncoder,
+    WorldModelMLP,
+    ActionEncoder,
+    package_features,
+    INPUT_DIM,
+    LATENT_DIM,
+    PlannerHead,
+)
 
 NUM_AGENTS = 6  # Used for vote vector size
 MAX_MEMORY = 5  # Max stored latent states for belief memory
 
+
 class BaseAgent:
-    def __init__(self, name, encoder=None, world_model=None, action_encoder=None):
+    """Single Werewolf / Villager agent driven by JEPA components + an LLM mouthpiece."""
+
+    def __init__(
+        self,
+        name: str,
+        encoder: MLPBeliefEncoder | None = None,
+        world_model: WorldModelMLP | None = None,
+        action_encoder: ActionEncoder | None = None,
+        planner: PlannerHead | None = None,
+    ) -> None:
         self.name = name
-        self.role = None       # Assigned by roles.py
-        self.alive = True
-        self.last_message = ""
-        self.llm_fn = None     # Assigned externally
+        self.role: str | None = None  # assigned externally via roles.py
+        self.alive: bool = True
+        self.last_message: str = ""
+        self.llm_fn = None  # (z, self) -> str  • attached from llm_script
 
-        # 🔧 JEPA Modules (shared or individual)
+        # ─── JEPA sub‑modules ──────────────────────────────────────────────
         self.message_encoder = MessageEncoder()
-        self.encoder = encoder if encoder is not None else MLPBeliefEncoder(input_dim=INPUT_DIM, latent_dim=LATENT_DIM)
-        self.world_model = world_model if world_model is not None else WorldModelMLP(latent_dim=LATENT_DIM, action_dim=8)
-        self.action_encoder = action_encoder if action_encoder is not None else ActionEncoder(num_actions=6, action_dim=8)
+        self.encoder = encoder or MLPBeliefEncoder(input_dim=INPUT_DIM, latent_dim=LATENT_DIM)
+        self.world_model = world_model or WorldModelMLP(latent_dim=LATENT_DIM, action_dim=8)
+        self.action_encoder = action_encoder or ActionEncoder(num_actions=6, action_dim=8)
+        self.planner = planner or PlannerHead(latent_dim=LATENT_DIM, num_agents=NUM_AGENTS)
 
-        # 🧠 Memory buffers
-        self.vote_history = []        # List of voted agent names
-        self.latent_history = []      # List of past z_t vectors
-        self.heard_messages = {}      # Dict of agent name → message
+        # ─── Memories ──────────────────────────────────────────────────────
+        self.vote_history: list[str] = []      # last MAX_MEMORY votes cast
+        self.latent_history: list[torch.Tensor] = []  # past latent states
+        self.heard_messages: dict[str, str] = {}      # last message per neighbour
+        self.message_memory: deque[tuple[str, str]] = deque(maxlen=20)  # running dialog context
 
-    def observe(self, agents):
-        observed = []
+    # ╭───────────────────────────────────────────────────────────────────╮
+    # │  Perception                                                     │
+    # ╰───────────────────────────────────────────────────────────────────╯
+    def observe(self, agents: list["BaseAgent"]):
+        """Collect (name, message) tuples from other alive agents."""
+        observed: list[tuple[str, str]] = []
         for a in agents:
             if a.alive and a.name != self.name:
                 observed.append((a.name, a.last_message))
                 self.heard_messages[a.name] = a.last_message
+                self.message_memory.append((a.name, a.last_message))
         return observed
 
-    def vote(self, agents):
+    # ╭───────────────────────────────────────────────────────────────────╮
+    # │  Action selection                                               │
+    # ╰───────────────────────────────────────────────────────────────────╯
+    def plan_vote(self, z: torch.Tensor, agents: list["BaseAgent"]):
+        """Choose a player to vote out based on planner logits."""
         alive = [a for a in agents if a.alive and a.name != self.name]
-        if alive:
-            chosen = alive[0]
-            self.vote_history.append(chosen.name)
-            if len(self.vote_history) > MAX_MEMORY:
-                self.vote_history.pop(0)
-            return chosen
-        return self
+        if not alive:
+            return self  # fallback – vote for self (won't count)
+
+        logits = self.planner(z)  # → R^{NUM_AGENTS}
+        alive_idx = [int(a.name.split("_")[1]) for a in alive]
+        filtered = torch.tensor([logits[i] for i in alive_idx])
+        chosen = alive[torch.argmax(filtered).item()]
+
+        # memory
+        self.vote_history.append(chosen.name)
+        if len(self.vote_history) > MAX_MEMORY:
+            self.vote_history.pop(0)
+        return chosen
 
     def choose_night_target(self, agents):
         candidates = [a for a in agents if a.alive and a.name != self.name]
         return candidates[0].name if candidates else None
 
-    def receive_messages(self, agents):
-        pass
-
-    def encode_current_belief(self, round_num, agents):
-        # Encode own message
+    # ╭───────────────────────────────────────────────────────────────────╮
+    # │  Latent belief encoding                                         │
+    # ╰───────────────────────────────────────────────────────────────────╯
+    def encode_current_belief(self, round_num: int, agents: list["BaseAgent"]):
+        """Encode the current belief state z_t from internal + social features."""
         self_msg_embed = self.message_encoder(self.last_message).squeeze()
 
-        # Encode messages from nearby agents
-        neighbor_data = self.observe(agents)
-        neighbor_msgs = [msg for _, msg in neighbor_data if msg]
-        if neighbor_msgs:
-            neighbor_msg_embed = self.message_encoder(neighbor_msgs).mean(dim=0)
+        # neighbour messages embedding
+        neighbour_msgs = [msg for _, msg in self.observe(agents) if msg]
+        if neighbour_msgs:
+            neighbour_embed = self.message_encoder(neighbour_msgs).mean(dim=0)
         else:
-            neighbor_msg_embed = torch.zeros_like(self_msg_embed)
+            neighbour_embed = torch.zeros_like(self_msg_embed)
 
-        # --- Voting history vector ---
-        vote_vector = torch.zeros(NUM_AGENTS)
+        # vote history vector
+        vote_vec = torch.zeros(NUM_AGENTS)
         for name in self.vote_history[-MAX_MEMORY:]:
             try:
-                idx = int(name.split('_')[1])
-                vote_vector[idx] += 1.0
-            except:
+                vote_vec[int(name.split("_")[1])] += 1.0
+            except Exception:
                 continue
-        if vote_vector.sum() > 0:
-            vote_vector /= vote_vector.sum()
+        if vote_vec.sum() > 0:
+            vote_vec /= vote_vec.sum()
 
-        # --- Belief memory vector ---
-        if self.latent_history:
-            memory_summary = torch.stack(self.latent_history).mean(dim=0)
-        else:
-            memory_summary = torch.zeros(32)
+        # memory summary of past latents
+        memory_summary = (
+            torch.stack(self.latent_history).mean(dim=0) if self.latent_history else torch.zeros(32)
+        )
 
-        # Package all features
+        # package + encode
         x = package_features(
             agent_alive=self.alive,
             round_num=round_num,
             self_msg_embed=self_msg_embed,
-            neighbor_msg_embed=neighbor_msg_embed,
-            vote_vector=vote_vector,
-            memory_summary=memory_summary
+            neighbor_msg_embed=neighbour_embed,
+            vote_vector=vote_vec,
+            memory_summary=memory_summary,
         )
-
         z = self.encoder(x)
 
+        # store for temporal context
         self.latent_history.append(z.detach())
         if len(self.latent_history) > MAX_MEMORY:
             self.latent_history.pop(0)
-
         return z
 
-    def decode_z(self, z):
-        mean = z.mean().item()
-        std = z.std().item()
-        lines = []
+    # ╭───────────────────────────────────────────────────────────────────╮
+    # │  Human‑readable decode (optional)                               │
+    # ╰───────────────────────────────────────────────────────────────────╯
+    def decode_z(self, z: torch.Tensor) -> str:
+        mean, std = z.mean().item(), z.std().item()
+        mood = (
+            "bad feeling about someone." if mean > 0.2 else
+            "quiet… too quiet." if mean < -0.2 else
+            "uncertain."  )
+        confidence = "unsure who to trust." if std > 0.5 else "confident in my suspicions."
+        return f"The group seems {mood} I am {confidence}"
 
-        if mean > 0.2:
-            lines.append("I have a bad feeling about someone.")
-        elif mean < -0.2:
-            lines.append("Things seem quiet... too quiet.")
-        else:
-            lines.append("The group seems uncertain.")
-
-        if std > 0.5:
-            lines.append("I'm unsure who to trust.")
-        else:
-            lines.append("I feel confident in my suspicions.")
-
-        return " ".join(lines)
-
-    def speak(self):
-        if self.llm_fn:
-            z = self.encode_current_belief(round_num=0, agents=[])
-            response = self.llm_fn(z, self)
-            self.last_message = response
-            return response
-        return "..."
+    # ╭───────────────────────────────────────────────────────────────────╮
+    # │  Speak                                                          │
+    # ╰───────────────────────────────────────────────────────────────────╯
+    def speak(self, round_num: int, agents: list["BaseAgent"]):
+        """Generate one line of dialogue using the current latent belief."""
+        if not self.llm_fn:
+            return "…"
+        z = self.encode_current_belief(round_num, agents)
+        response = self.llm_fn(z, self)
+        self.last_message = response
+        return response
