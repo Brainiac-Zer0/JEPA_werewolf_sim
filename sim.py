@@ -1,15 +1,16 @@
 # sim.py  ── verbose, multithreaded, responsive Pygame
 # -----------------------------------------------------------------------------
-# This version calls the *round‑aware* BaseAgent.speak(round_num, agents) API, so
-# every dialog line is generated from the correct latent belief state.  The
-# code is heavily commented to clarify the multithreaded flow, the belief
-# encoding pipeline, and the Pygame rendering loop.
+# This version fixes the rollout tuples to use the *true* post‑act z_{t+1},
+# and prints an acceptance metric: mean ||Δz|| per day. It also shares the
+# MessageEncoder across agents to save VRAM/CPU.
 # -----------------------------------------------------------------------------
 
 import sys
+import os
 import random
 import concurrent.futures as cf
 from collections import deque
+from typing import Dict, Tuple
 
 import pygame
 import torch
@@ -17,26 +18,25 @@ import torch
 from agent import BaseAgent
 from roles import WEREWOLF, VILLAGER, assign_roles
 from world import resolve_votes, eliminate_player
-from llm_script import chatgpt_llm_from_latent
 from training_utils import load_role_models
+from encoders import MessageEncoder  # shared instance
 
 # ───────────────────────── CONFIG
 NUM_AGENTS, NUM_WEREWOLVES = 6, 1
 SCREEN_W, SCREEN_H = 1200, 600
-FPS, AGENT_R = 1, 30                     # FPS only matters in visual mode
+FPS, AGENT_R = 1, 30
 MSG_LOG_LIMIT, MSG_BOX_W = 12, 360
 MSG_BOX_X = SCREEN_W - MSG_BOX_W
 
+# Language toggle (set with env var; PowerShell:  $env:USE_LANGUAGE="0")
+USE_LANGUAGE = os.environ.get("USE_LANGUAGE", "1") != "0"
+
 # ───────────────────────── runtime globals (populated iff visual=True)
-screen = font = font_s = clock = None    # pygame objects
-msg_log: deque[tuple[str, str]] = deque(maxlen=200)  # text lines for side‑panel
+screen = font = font_s = clock = None
+msg_log: deque[tuple[str, str]] = deque(maxlen=200)
 
 # ╭────────────────────────── UI HELPERS ───────────────────────────╮
-# | _wrap, _draw_log, draw_agents handle all Pygame visualisation. |
-# ╰─────────────────────────────────────────────────────────────────╯
-
 def _wrap(text: str, fnt: pygame.font.Font, width: int) -> list[str]:
-    """Simple word‑wrap so long chat lines fit the message box."""
     out, cur = [], ""
     for word in text.split():
         test = f"{cur}{word} "
@@ -49,23 +49,19 @@ def _wrap(text: str, fnt: pygame.font.Font, width: int) -> list[str]:
         out.append(cur)
     return out
 
-
 def _draw_log() -> None:
-    """Render the scrolling chat log on the right side of the screen."""
     box_h = 30 * MSG_LOG_LIMIT + 10
     pygame.draw.rect(
         screen, (20, 20, 20),
         (MSG_BOX_X - 10, SCREEN_H - box_h - 10, MSG_BOX_W + 20, box_h),
     )
     y = SCREEN_H - 40
-    for name, msg in list(msg_log)[-MSG_LOG_LIMIT:][::-1]:  # newest at bottom
+    for name, msg in list(msg_log)[-MSG_LOG_LIMIT:][::-1]:
         for line in _wrap(f"{name}: {msg}", font_s, MSG_BOX_W)[::-1]:
             screen.blit(font_s.render(line.strip(), True, (220, 220, 220)), (MSG_BOX_X, y))
             y -= 20
 
-
 def draw_agents(agents: list[BaseAgent]) -> None:
-    """Draw each agent as a circle + name."""
     screen.fill((30, 30, 30))
     pad = 80
     spacing = (SCREEN_W - MSG_BOX_W - 2 * pad) // max(1, len(agents) - 1)
@@ -79,18 +75,11 @@ def draw_agents(agents: list[BaseAgent]) -> None:
     pygame.display.flip()
 
 # ╭───────────────────────── GAME HELPERS ───────────────────────────╮
-# | choose_night_target  – very dumb wolf kill policy                |
-# ╰──────────────────────────────────────────────────────────────────╯
-
 def choose_night_target(wolf: BaseAgent, agents: list[BaseAgent]):
     non_wolves = [a for a in agents if a.alive and a.role != WEREWOLF]
     return random.choice(non_wolves) if non_wolves else None
 
 # ╭────────────────────────── MAIN LOOP ─────────────────────────────╮
-# | simulate_game(visual=bool) runs a *single* game and returns the  |
-# | JEPA rollout data plus simple meta‑stats.                        |
-# ╰──────────────────────────────────────────────────────────────────╯
-
 def simulate_game(visual: bool = True):
     # ───── Pygame initialisation (only when visual) ─────
     if visual:
@@ -107,11 +96,24 @@ def simulate_game(visual: bool = True):
     assign_roles(agents, NUM_WEREWOLVES)
     print("▶ Assigned roles:", ", ".join(f"{a.name}:{a.role}" for a in agents))
 
-    # Attach JEPA sub‑modules & LLM
+    # Share one MessageEncoder to reduce memory/latency
+    shared_msg_encoder = MessageEncoder()
+    for ag in agents:
+        ag.message_encoder = shared_msg_encoder
+
+    # Attach JEPA sub‑modules
     for ag in agents:
         wm, ae, planner = load_role_models(ag.role)
         ag.world_model, ag.action_encoder, ag.planner = wm, ae, planner
-        ag.llm_fn = chatgpt_llm_from_latent
+
+    # LLM hookup: if language is ablated, stub regardless of visual mode.
+    if not USE_LANGUAGE:
+        for ag in agents:
+            ag.llm_fn = lambda z, self: "..."
+    else:
+        from llm_script import chatgpt_llm_from_latent
+        for ag in agents:
+            ag.llm_fn = chatgpt_llm_from_latent
 
     executor = cf.ThreadPoolExecutor(max_workers=NUM_AGENTS)
     rollout = []
@@ -119,7 +121,7 @@ def simulate_game(visual: bool = True):
 
     # ───── main day/night loop ─────
     while True:
-        if visual: pygame.event.pump()  # keep window responsive
+        if visual: pygame.event.pump()
         round_num += 1
         living = [a for a in agents if a.alive]
         print(f"\n=== Day {round_num} ===")
@@ -142,13 +144,15 @@ def simulate_game(visual: bool = True):
                         pygame.quit()
                         sys.exit()
 
-        # ─── Belief encode, vote, collect rollout ───
+        # ─── PRE‑ACT: collect (z_t, a_idx, role) and remember per agent ───
+        pending: Dict[str, Tuple[torch.Tensor, torch.Tensor, str]] = {}
         vote_map = {}
         for ag in living:
             z_t = ag.encode_current_belief(round_num, agents)
             target = ag.plan_vote(z_t, living)
             vote_map[ag] = target
-            rollout.append((z_t, torch.tensor([int(target.name.split('_')[1])]), z_t, ag.role))
+            a_idx = torch.tensor([int(target.name.split('_')[1])])
+            pending[ag.name] = (z_t.detach(), a_idx, ag.role)
         print("✉ Votes:", ", ".join(f"{k.name}->{v.name}" for k, v in vote_map.items()))
 
         # resolve vote
@@ -171,6 +175,18 @@ def simulate_game(visual: bool = True):
                 print(f"🌙 Night kill: {victim.name}")
                 if visual:
                     msg_log.append(("Night", f"{victim.name} slain."))
+
+        # ─── POST‑ACT: re‑encode to get z_{t+1} and append rollouts ───
+        z_deltas = []
+        for ag in agents:
+            if ag.name in pending and ag.alive or ag.name in pending:
+                z_next = ag.encode_current_belief(round_num + 1, agents).detach()
+                z_t, a_idx, role = pending[ag.name]
+                rollout.append((z_t, a_idx, z_next, role))
+                z_deltas.append(torch.norm(z_next - z_t).item())
+        if z_deltas:
+            mean_delta = sum(z_deltas) / len(z_deltas)
+            print(f"[Δz] mean ||z_{round_num+1}-z_{round_num}|| = {mean_delta:.4f}")
 
         # win check
         wolves_alive = [a for a in agents if a.alive and a.role == WEREWOLF]
