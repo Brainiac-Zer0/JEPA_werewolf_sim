@@ -6,7 +6,9 @@ from transformers import pipeline, AutoModelForCausalLM, AutoTokenizer
 
 # Override the model via env to try Llama 3.1 8B:
 #   $env:LLM_MODEL_ID="meta-llama/Llama-3.1-8B-Instruct"
-MODEL_ID = os.environ.get("LLM_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2")
+#MODEL_ID = os.environ.get("LLM_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2")
+MODEL_ID = os.environ.get("LLM_MODEL_ID", "meta-llama/Llama-3.1-8B-Instruct")
+
 USE_GPU  = torch.cuda.is_available()
 
 # ── 1) Tokenizer
