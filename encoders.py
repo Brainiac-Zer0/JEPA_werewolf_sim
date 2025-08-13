@@ -43,14 +43,17 @@ class MessageEncoder(nn.Module):
 class MLPBeliefEncoder(nn.Module):
     def __init__(self, input_dim, latent_dim=32):
         super().__init__()
+        # Normalize the concatenated feature vector to stabilize early training
+        self.norm = nn.LayerNorm(input_dim)
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 64),
+            nn.Linear(input_dim, 128),
             nn.ReLU(),
-            nn.Linear(64, latent_dim)
+            nn.Linear(128, latent_dim)
         )
 
     def forward(self, input_vector):
-        return self.encoder(input_vector)
+        x = self.norm(input_vector)
+        return self.encoder(x)
 
 class ActionEncoder(nn.Module):
     def __init__(self, num_actions, action_dim):
@@ -86,8 +89,29 @@ class PlannerHead(nn.Module):
         return self.net(z)
 
 def package_features(agent_alive, round_num, self_msg_embed, neighbor_msg_embed, vote_vector, memory_summary):
-    alive_flag = torch.tensor([1.0 if agent_alive else 0.0])
-    round_norm = torch.tensor([round_num / 10.0])
+    """
+    Build the concatenated feature vector with sane scaling:
+      - round number scaled by /3.0 (capped at 1.0) for stronger early dynamics
+      - vote vector up-weighted (x2) then clamped to [0,1]
+      - all tensors moved to the same device/dtype as the embeddings
+    """
+    device = self_msg_embed.device
+    dtype  = self_msg_embed.dtype
+
+    alive_flag = torch.tensor([1.0 if agent_alive else 0.0], device=device, dtype=dtype)
+
+    # Stronger early signal from the round feature
+    round_scaled = min(1.0, round_num / 3.0)
+    round_norm = torch.tensor([round_scaled], device=device, dtype=dtype)
+
+    # Ensure other parts are on the same device/dtype
+    neighbor_msg_embed = neighbor_msg_embed.to(device=device, dtype=dtype)
+    vote_vector = vote_vector.to(device=device, dtype=dtype)
+    memory_summary = memory_summary.to(device=device, dtype=dtype)
+
+    # Up-weight vote signal a bit (cap to keep it bounded)
+    vote_vector = (vote_vector * 2.0).clamp(max=1.0)
+
     return torch.cat([
         alive_flag,
         round_norm,

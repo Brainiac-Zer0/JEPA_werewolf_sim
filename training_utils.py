@@ -16,9 +16,10 @@ CHECKPOINT_DIR = "checkpoints"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ── new: tunables
+# ── tunables
 LAMBDA_BC: float = 0.5
 MAX_NORM: float = 1.0
+PREDICT_DELTA: bool = True  # when True, train world model on Δz = z_next - z_t
 
 def train_jepa(
     rollout_data: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]],
@@ -58,18 +59,21 @@ def train_jepa(
         epoch_bc  = 0.0
         for batch in batches:
             z_t, a_idx, z_next = zip(*[(r[0], r[1], r[2]) for r in batch])
-            z_t_tensor     = torch.stack(z_t).to(DEVICE)            # [B, latent]
+
+            z_t_tensor     = torch.stack(z_t).to(DEVICE)                 # [B, latent]
             a_idx_tensor   = torch.stack(a_idx).long().squeeze().to(DEVICE)  # [B]
-            z_next_tensor  = torch.stack(z_next).to(DEVICE)          # [B, latent]
+            z_next_tensor  = torch.stack(z_next).to(DEVICE)               # [B, latent]
 
             # forward
-            a_embed = action_encoder(a_idx_tensor)                   # [B, a_dim]
-            z_pred  = world_model(z_t_tensor, a_embed)               # [B, latent]
-            logits  = planner(z_t_tensor)                            # [B, num_agents]
+            a_embed = action_encoder(a_idx_tensor)                        # [B, a_dim]
+            z_pred  = world_model(z_t_tensor, a_embed)                    # [B, latent]
+            logits  = planner(z_t_tensor)                                 # [B, num_agents]
 
-            L_mse = mse_loss(z_pred, z_next_tensor)
-            L_bc  = ce_loss(logits, a_idx_tensor)
-            loss  = L_mse + LAMBDA_BC * L_bc
+            # Δ-mode target vs absolute
+            target = (z_next_tensor - z_t_tensor) if PREDICT_DELTA else z_next_tensor
+            L_mse  = mse_loss(z_pred, target)
+            L_bc   = ce_loss(logits, a_idx_tensor)
+            loss   = L_mse + LAMBDA_BC * L_bc
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -88,7 +92,8 @@ def train_jepa(
             epoch_bc  += L_bc.item()
 
         denom = max(1, len(batches))
-        print(f"[{role_name}  Epoch {ep}/{epochs}]  MSE: {epoch_mse/denom:.4f}  BC: {epoch_bc/denom:.4f}")
+        mode = "Δ-mode" if PREDICT_DELTA else "abs"
+        print(f"[{role_name}  Epoch {ep}/{epochs}  ({mode})]  MSE: {epoch_mse/denom:.4f}  BC: {epoch_bc/denom:.4f}")
 
     # save
     save_path = os.path.join(CHECKPOINT_DIR, f"{role_name.lower()}_jepa.pt")
@@ -97,6 +102,7 @@ def train_jepa(
             "world_model": world_model.state_dict(),
             "action_encoder": action_encoder.state_dict(),
             "planner": planner.state_dict(),
+            "predict_delta": PREDICT_DELTA,
         },
         save_path,
     )

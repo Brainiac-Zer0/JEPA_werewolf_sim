@@ -1,19 +1,20 @@
-# sim.py  ── verbose, multithreaded, responsive Pygame
+# sim.py  ── verbose, batched dialogue, responsive Pygame
 # -----------------------------------------------------------------------------
-# This version fixes the rollout tuples to use the *true* post‑act z_{t+1},
-# and prints an acceptance metric: mean ||Δz|| per day. It also shares the
-# MessageEncoder across agents to save VRAM/CPU.
+# - Uses *true* post‑act z_{t+1} for rollouts
+# - Prints acceptance metrics: mean L2 ||Δz|| and (1 - cosine) per day
+# - Shares MessageEncoder across agents to save VRAM/CPU
+# - Batches all LLM generations per round (fast + consistent)
 # -----------------------------------------------------------------------------
 
 import sys
 import os
 import random
-import concurrent.futures as cf
 from collections import deque
 from typing import Dict, Tuple
 
 import pygame
 import torch
+import torch.nn.functional as F
 
 from agent import BaseAgent
 from roles import WEREWOLF, VILLAGER, assign_roles
@@ -106,49 +107,51 @@ def simulate_game(visual: bool = True):
         wm, ae, planner = load_role_models(ag.role)
         ag.world_model, ag.action_encoder, ag.planner = wm, ae, planner
 
-    # LLM hookup: if language is ablated, stub regardless of visual mode.
-    if not USE_LANGUAGE:
-        for ag in agents:
-            ag.llm_fn = lambda z, self: "..."
-    else:
-        from llm_script import chatgpt_llm_from_latent
-        for ag in agents:
-            ag.llm_fn = chatgpt_llm_from_latent
+    # LLM hookup is done *inside* the loop via batching when language is on.
 
-    executor = cf.ThreadPoolExecutor(max_workers=NUM_AGENTS)
     rollout = []
     round_num = 0
 
     # ───── main day/night loop ─────
     while True:
-        if visual: pygame.event.pump()
+        if visual:
+            pygame.event.pump()
         round_num += 1
         living = [a for a in agents if a.alive]
         print(f"\n=== Day {round_num} ===")
 
-        # ─── Asynchronous dialogue (one future per agent) ───
-        futures = {executor.submit(a.speak, round_num, agents): a for a in living}
-        while futures:
-            done, _ = cf.wait(futures, timeout=0.05, return_when=cf.FIRST_COMPLETED)
-            for fut in done:
-                ag = futures.pop(fut)
-                msg = fut.result() if fut.exception() is None else "..."
-                print(f"{ag.name}: {msg}")
-                if visual:
-                    msg_log.append((ag.name, msg))
+        # ─── Encode beliefs once for all living agents (z_t cache) ───
+        z_map: Dict[BaseAgent, torch.Tensor] = {
+            ag: ag.encode_current_belief(round_num, agents) for ag in living
+        }
+
+        # ─── Dialogue (batched when language is on) ───
+        if USE_LANGUAGE:
+            from llm_script import build_prompt_from_latent, chatgpt_llm_batch
+            prompts = [build_prompt_from_latent(z_map[ag], ag) for ag in living]
+            lines = chatgpt_llm_batch(prompts)
+        else:
+            lines = ["..."] * len(living)
+
+        # Emit lines & update state/UI
+        for ag, msg in zip(living, lines):
+            ag.last_message = msg
+            print(f"{ag.name}: {msg}")
             if visual:
-                draw_agents(agents)
-                clock.tick(FPS)
-                for ev in pygame.event.get():
-                    if ev.type == pygame.QUIT:
-                        pygame.quit()
-                        sys.exit()
+                msg_log.append((ag.name, msg))
+        if visual:
+            draw_agents(agents)
+            clock.tick(FPS)
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    pygame.quit()
+                    sys.exit()
 
         # ─── PRE‑ACT: collect (z_t, a_idx, role) and remember per agent ───
         pending: Dict[str, Tuple[torch.Tensor, torch.Tensor, str]] = {}
         vote_map = {}
         for ag in living:
-            z_t = ag.encode_current_belief(round_num, agents)
+            z_t = z_map[ag]  # reuse cached latent from this day
             target = ag.plan_vote(z_t, living)
             vote_map[ag] = target
             a_idx = torch.tensor([int(target.name.split('_')[1])])
@@ -178,15 +181,20 @@ def simulate_game(visual: bool = True):
 
         # ─── POST‑ACT: re‑encode to get z_{t+1} and append rollouts ───
         z_deltas = []
+        cos_deltas = []
         for ag in agents:
-            if ag.name in pending and ag.alive or ag.name in pending:
+            if ag.name in pending:
                 z_next = ag.encode_current_belief(round_num + 1, agents).detach()
                 z_t, a_idx, role = pending[ag.name]
                 rollout.append((z_t, a_idx, z_next, role))
                 z_deltas.append(torch.norm(z_next - z_t).item())
+                # (1 - cosine similarity)
+                cos_val = F.cosine_similarity(z_next.unsqueeze(0), z_t.unsqueeze(0)).item()
+                cos_deltas.append(1.0 - cos_val)
         if z_deltas:
-            mean_delta = sum(z_deltas) / len(z_deltas)
-            print(f"[Δz] mean ||z_{round_num+1}-z_{round_num}|| = {mean_delta:.4f}")
+            mean_l2 = sum(z_deltas) / len(z_deltas)
+            mean_1mcos = (sum(cos_deltas) / len(cos_deltas)) if cos_deltas else 0.0
+            print(f"[Δz] L2={mean_l2:.4f}  (1-cos)={mean_1mcos:.4f}")
 
         # win check
         wolves_alive = [a for a in agents if a.alive and a.role == WEREWOLF]
@@ -195,7 +203,6 @@ def simulate_game(visual: bool = True):
             break
 
     print("\n== Game over ==")
-    executor.shutdown(wait=True)
     return rollout, {"rounds": round_num}
 
 
