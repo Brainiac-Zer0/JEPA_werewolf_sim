@@ -4,6 +4,7 @@
 # - Prints acceptance metrics: mean L2 ||Δz|| and (1 - cosine) per day
 # - Shares MessageEncoder across agents to save VRAM/CPU
 # - Batches all LLM generations per round (fast + consistent)
+# - NEW: Light planner eval (top‑3 vote probs) for one Worker + one Werewolf
 # -----------------------------------------------------------------------------
 
 import sys
@@ -80,6 +81,36 @@ def choose_night_target(wolf: BaseAgent, agents: list[BaseAgent]):
     non_wolves = [a for a in agents if a.alive and a.role != WEREWOLF]
     return random.choice(non_wolves) if non_wolves else None
 
+def _planner_eval_topk(ag: BaseAgent, z_t: torch.Tensor, agents: list[BaseAgent], k: int = 3) -> str:
+    """
+    Return a short string showing the planner's top‑k vote probabilities
+    among currently alive opponents for a single agent.
+    """
+    with torch.no_grad():
+        logits = ag.planner(z_t.unsqueeze(0)).squeeze(0)  # [num_agents]
+        probs  = torch.softmax(logits, dim=-1)
+
+    alive = [x for x in agents if x.alive and x.name != ag.name]
+    if not alive:
+        return "(no targets)"
+    alive_idx = [int(x.name.split("_")[1]) for x in alive]
+
+    # Mask out dead/self by setting prob to -inf (for topk on logits) or 0
+    mask = torch.full_like(probs, float("-inf"))
+    mask[alive_idx] = logits[alive_idx]
+    k_eff = min(k, len(alive_idx))
+    topv, topi = torch.topk(mask, k=k_eff)
+
+    entries = []
+    for v, i in zip(topv.tolist(), topi.tolist()):
+        if v == float("-inf"):
+            continue
+        name = f"Agent_{i}"
+        p = probs[i].item()
+        entries.append(f"{name}:{p:.2f}")
+    role = ag.role or "Unknown"
+    return f"[PlannerEval] {ag.name} ({role}) → " + (", ".join(entries) if entries else "(no targets)")
+
 # ╭────────────────────────── MAIN LOOP ─────────────────────────────╮
 def simulate_game(visual: bool = True):
     # ───── Pygame initialisation (only when visual) ─────
@@ -106,8 +137,6 @@ def simulate_game(visual: bool = True):
     for ag in agents:
         wm, ae, planner = load_role_models(ag.role)
         ag.world_model, ag.action_encoder, ag.planner = wm, ae, planner
-
-    # LLM hookup is done *inside* the loop via batching when language is on.
 
     rollout = []
     round_num = 0
@@ -146,6 +175,17 @@ def simulate_game(visual: bool = True):
                 if ev.type == pygame.QUIT:
                     pygame.quit()
                     sys.exit()
+
+        # ─── Light planner eval (top‑k) BEFORE voting ───
+        # Pick one Worker and one Werewolf (if present) to keep logs readable.
+        sample_agents = []
+        worker = next((a for a in living if a.role != WEREWOLF), None)
+        wolf   = next((a for a in living if a.role == WEREWOLF), None)
+        if worker: sample_agents.append(worker)
+        if wolf and wolf is not worker: sample_agents.append(wolf)
+        for ag in sample_agents:
+            z_t = z_map[ag]
+            print(_planner_eval_topk(ag, z_t, agents, k=3))
 
         # ─── PRE‑ACT: collect (z_t, a_idx, role) and remember per agent ───
         pending: Dict[str, Tuple[torch.Tensor, torch.Tensor, str]] = {}

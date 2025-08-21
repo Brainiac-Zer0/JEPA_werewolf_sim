@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import random
+import csv
+from datetime import datetime
 from typing import List, Tuple
 
 import torch
@@ -17,9 +19,27 @@ os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ── tunables
-LAMBDA_BC: float = 0.5
+LAMBDA_BC: float = 0.75
 MAX_NORM: float = 1.0
 PREDICT_DELTA: bool = True  # when True, train world model on Δz = z_next - z_t
+
+LOG_DIR = "logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+METRICS_CSV = os.path.join(LOG_DIR, "metrics.csv")
+
+def _append_metrics_row(row: dict):
+    header = [
+        "ts", "role", "epoch", "epochs",
+        "mse", "bc",
+        "learning_rate", "lambda_bc", "batch_size", "dataset_size",
+        "predict_delta",
+    ]
+    file_exists = os.path.exists(METRICS_CSV)
+    with open(METRICS_CSV, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=header)
+        if not file_exists:
+            w.writeheader()
+        w.writerow(row)
 
 def train_jepa(
     rollout_data: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]],
@@ -46,6 +66,8 @@ def train_jepa(
     ce_loss  = nn.CrossEntropyLoss()
 
     world_model.train(), action_encoder.train(), planner.train()
+
+    dataset_size = len(rollout_data)
 
     for ep in range(1, epochs + 1):
         random.shuffle(rollout_data)
@@ -93,7 +115,23 @@ def train_jepa(
 
         denom = max(1, len(batches))
         mode = "Δ-mode" if PREDICT_DELTA else "abs"
-        print(f"[{role_name}  Epoch {ep}/{epochs}  ({mode})]  MSE: {epoch_mse/denom:.4f}  BC: {epoch_bc/denom:.4f}")
+        mean_mse = epoch_mse / denom
+        mean_bc  = epoch_bc  / denom
+        print(f"[{role_name}  Epoch {ep}/{epochs}  ({mode})]  MSE: {mean_mse:.4f}  BC: {mean_bc:.4f}")
+
+        _append_metrics_row({
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "role": role_name,
+            "epoch": ep,
+            "epochs": epochs,
+            "mse": f"{mean_mse:.6f}",
+            "bc": f"{mean_bc:.6f}",
+            "learning_rate": learning_rate,
+            "lambda_bc": LAMBDA_BC,
+            "batch_size": batch_size,
+            "dataset_size": dataset_size,
+            "predict_delta": int(PREDICT_DELTA),
+        })
 
     # save
     save_path = os.path.join(CHECKPOINT_DIR, f"{role_name.lower()}_jepa.pt")
@@ -116,7 +154,7 @@ def load_role_models(role: str) -> Tuple[WorldModelMLP, ActionEncoder, PlannerHe
     ckpt_path = os.path.join(CHECKPOINT_DIR, f"{role.lower()}_jepa.pt")
     if os.path.exists(ckpt_path):
         print(f"[LOAD] {role} checkpoint ← {ckpt_path}")
-        state = torch.load(ckpt_path, map_location="cpu")
+        state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         wm.load_state_dict(state["world_model"])
         ae.load_state_dict(state["action_encoder"])
         planner.load_state_dict(state["planner"])
