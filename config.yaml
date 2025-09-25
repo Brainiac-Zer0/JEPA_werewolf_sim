@@ -1,0 +1,41 @@
+# config.yaml
+# Central config for JEPA-DGM Werewolf Sim + Judge
+# Adjust values here instead of editing code. Env/CLI can still override.
+
+simulation:
+  num_agents: 6
+  num_werewolves: 1
+  use_language: true   # can be overridden by USE_LANGUAGE env var
+  fps: 1               # frames per second for pygame UI
+  screen_w: 1200
+  screen_h: 600
+
+latent:
+  input_dim: 808
+  latent_dim: 32
+  action_dim: 8
+  max_memory: 5
+
+models:
+  mouthpiece_model: "meta-llama/Llama-3.1-8B-Instruct"
+  judge_model: "meta-llama/Llama-3.1-8B-Instruct"
+
+judge:
+  rubric_path: "rubrics/judge_rubric.yaml"
+  temperature: 0.0
+  top_p: 0.1
+  max_new_tokens: 160
+  rationale: true
+
+training:
+  epochs: 5
+  batch_size: 16
+  learning_rate: 0.001
+  lambda_bc: 0.75
+  predict_delta: true
+  min_rollouts: 64
+  default_n_games: 50
+
+persona:
+  enabled: false
+  config_path: "configs/persona_vectors.yaml"

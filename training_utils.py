@@ -16,9 +16,9 @@ CHECKPOINT_DIR = "checkpoints"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ── new: tunables
-LAMBDA_BC: float = 0.5
-MAX_NORM: float = 1.0
+# ── tunables (env-overrideable)
+LAMBDA_BC: float = float(os.environ.get("LAMBDA_BC", "0.5"))
+MAX_NORM: float = float(os.environ.get("MAX_NORM", "1.0"))
 
 def train_jepa(
     rollout_data: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]],
@@ -31,14 +31,18 @@ def train_jepa(
     batch_size: int = 16,
     learning_rate: float = 1e-3,
 ) -> None:
+    if not rollout_data:
+        print(f"[{role_name}] No rollout data; skipping JEPA update.")
+        return
+
     world_model.to(DEVICE)
     action_encoder.to(DEVICE)
     planner.to(DEVICE)
 
     optimizer = optim.Adam(
-        list(world_model.parameters())
-        + list(action_encoder.parameters())
-        + list(planner.parameters()),
+        list(world_model.parameters()) +
+        list(action_encoder.parameters()) +
+        list(planner.parameters()),
         lr=learning_rate,
     )
     mse_loss = nn.MSELoss()
@@ -58,14 +62,14 @@ def train_jepa(
         epoch_bc  = 0.0
         for batch in batches:
             z_t, a_idx, z_next = zip(*[(r[0], r[1], r[2]) for r in batch])
-            z_t_tensor     = torch.stack(z_t).to(DEVICE)            # [B, latent]
+            z_t_tensor     = torch.stack(z_t).to(DEVICE)                 # [B, latent]
             a_idx_tensor   = torch.stack(a_idx).long().squeeze().to(DEVICE)  # [B]
-            z_next_tensor  = torch.stack(z_next).to(DEVICE)          # [B, latent]
+            z_next_tensor  = torch.stack(z_next).to(DEVICE)               # [B, latent]
 
             # forward
-            a_embed = action_encoder(a_idx_tensor)                   # [B, a_dim]
-            z_pred  = world_model(z_t_tensor, a_embed)               # [B, latent]
-            logits  = planner(z_t_tensor)                            # [B, num_agents]
+            a_embed = action_encoder(a_idx_tensor)                        # [B, a_dim]
+            z_pred  = world_model(z_t_tensor, a_embed)                    # [B, latent]
+            logits  = planner(z_t_tensor)                                 # [B, num_agents]
 
             L_mse = mse_loss(z_pred, z_next_tensor)
             L_bc  = ce_loss(logits, a_idx_tensor)
@@ -120,5 +124,9 @@ def load_role_models(role: str) -> Tuple[WorldModelMLP, ActionEncoder, PlannerHe
     return wm, ae, planner
 
 def run_sim_and_collect_rollouts(visual: bool = False):
+    """Normalize sim output to (rollouts, meta) so train.py can use meta['agents']."""
     from sim import simulate_game
-    return simulate_game(visual=visual)
+    ret = simulate_game(visual=visual)
+    if isinstance(ret, tuple) and len(ret) == 2:
+        return ret
+    return ret, {}

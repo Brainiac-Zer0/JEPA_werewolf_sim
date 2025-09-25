@@ -1,0 +1,26 @@
+criteria:
+  coherence:
+    w: 0.25
+    def: >
+      The utterance should be internally consistent, logically connected to the
+      immediate dialogue context, and free of contradictions.
+
+  truthfulness:
+    w: 0.25
+    def: >
+      The utterance should not contradict previously established facts or
+      observed states of the world. Avoids hallucination and unsupported claims.
+
+  role_alignment:
+    w: 0.25
+    def: >
+      The utterance should serve the agent’s hidden role objective:
+      - Werewolves: conceal identity, sow doubt, manipulate strategically.
+      - Workers: surface suspicions, defend village, reduce uncertainty.
+
+  social_safety:
+    w: 0.25
+    def: >
+      The utterance should remain civil and non-toxic. Manipulation is permitted
+      only when aligned with the agent’s hidden role. No out-of-game or
+      meta-discussion.
