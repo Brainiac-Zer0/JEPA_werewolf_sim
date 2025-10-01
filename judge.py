@@ -65,10 +65,6 @@ _tok = None
 _model = None
 _pipe = None
 def _lazy_pipe():
-    """
-    Lazy-load a separate judge pipeline. Freeze *only* judge params;
-    do NOT call torch.set_grad_enabled(False) globally.
-    """
     global _tok, _model, _pipe
     if _pipe is None:
         use_gpu = (JUDGE_DEVICE != "cpu") and torch.cuda.is_available()
@@ -76,16 +72,13 @@ def _lazy_pipe():
         dtype = torch.float16 if use_gpu else torch.float32
 
         _tok   = AutoTokenizer.from_pretrained(JUDGE_MODEL_ID, use_fast=True)
-        # Fix decoder-only warning by left-padding
+        # ensure left padding for decoder-only models
         try:
             _tok.padding_side = "left"
         except Exception:
             pass
 
         _model = AutoModelForCausalLM.from_pretrained(JUDGE_MODEL_ID, torch_dtype=dtype)
-        _model.eval()
-        for p in _model.parameters():
-            p.requires_grad_(False)  # freeze judge
 
         # ensure pad token for batching
         if _tok.pad_token_id is None:
@@ -99,10 +92,11 @@ def _lazy_pipe():
             _model.config.pad_token_id = _tok.pad_token_id
 
         _pipe = pipeline("text-generation", model=_model, tokenizer=_tok, device=dev)
-
+        # ⛔️ DO NOT set torch.set_grad_enabled(False) here; it breaks training elsewhere.
         _dbg_print(f"Loaded judge model={JUDGE_MODEL_ID} device={'cuda' if dev==0 else 'cpu'} "
                    f"pad_id={_tok.pad_token_id} eos_id={_tok.eos_token_id}")
     return _pipe, _tok
+
 
 # ────────────── Prompt builder ──────────────
 _SYSTEM_HDR = (

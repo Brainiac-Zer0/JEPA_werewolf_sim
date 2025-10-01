@@ -16,7 +16,15 @@ USE_GPU  = torch.cuda.is_available()
 LLM_SPEAKER = os.environ.get("LLM_SPEAKER", "0") == "1"
 
 # ── 1) Tokenizer
-tok = AutoTokenizer.from_pretrained(MODEL_ID)
+tok = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=True)
+# Ensure safe padding for decoder-only models
+if tok.pad_token_id is None:
+    # Prefer EOS as PAD; otherwise add a fresh pad token
+    if tok.eos_token is not None:
+        tok.pad_token = tok.eos_token
+    else:
+        tok.add_special_tokens({"pad_token": "<|pad|>"})
+tok.padding_side = "left"
 
 # ── 2) Model
 device      = "cuda:0" if USE_GPU else "cpu"
@@ -25,7 +33,18 @@ model       = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
     torch_dtype=torch_dtype,
     low_cpu_mem_usage=False,
-).to(device)
+)
+# If we added a PAD token, make sure embeddings are resized
+if getattr(model.config, "vocab_size", None) is not None and len(tok) != model.config.vocab_size:
+    try:
+        model.resize_token_embeddings(len(tok))
+    except Exception:
+        pass
+# Make sure model knows the pad token id
+if getattr(model.config, "pad_token_id", None) is None:
+    model.config.pad_token_id = tok.pad_token_id
+
+model = model.to(device)
 
 # ── 3) Pipeline
 llm_pipeline = pipeline(
@@ -176,7 +195,7 @@ def chatgpt_llm_from_latent(z, agent) -> str:
         for params in attempts:
             resp = llm_pipeline(
                 prompt,
-                pad_token_id=tok.eos_token_id,
+                pad_token_id=tok.pad_token_id,
                 eos_token_id=tok.eos_token_id,
                 **params,
             )[0].get("generated_text", "")
@@ -263,7 +282,7 @@ def chatgpt_llm_with_bias(z, agent) -> str:
         for params in attempts:
             resp = llm_pipeline(
                 prompt,
-                pad_token_id=tok.eos_token_id,
+                pad_token_id=tok.pad_token_id,
                 eos_token_id=tok.eos_token_id,
                 **proc_kwargs,  # logits processors from bias head
                 **params,
