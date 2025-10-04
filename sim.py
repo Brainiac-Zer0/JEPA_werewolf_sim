@@ -16,7 +16,7 @@ from collections import deque
 from typing import Dict, Tuple, List
 
 import pygame
-import torch
+import torch, yaml
 import torch.nn.functional as F
 
 from agent import BaseAgent
@@ -34,21 +34,33 @@ from encoders import MessageEncoder  # shared instance
 # Judge imports
 from judge import JudgeRubric, score_batch
 
-# ───────────────────────── CONFIG
-NUM_AGENTS, NUM_WEREWOLVES = 6, 1
-SCREEN_W, SCREEN_H = 1200, 600
-FPS, AGENT_R = 1, 30
-MSG_LOG_LIMIT, MSG_BOX_W = 12, 360
-MSG_BOX_X = SCREEN_W - MSG_BOX_W
+# ── Load config
+with open("config.yaml", "r") as f:
+    CFG = yaml.safe_load(f)
 
-# Language toggle (PowerShell example:  $env:USE_LANGUAGE="0")
-USE_LANGUAGE = os.environ.get("USE_LANGUAGE", "1") != "0"
+# Core sim settings
+NUM_AGENTS = int(CFG.get("NUM_AGENTS", 6))
+NUM_WEREWOLVES = int(CFG.get("NUM_WEREWOLVES", 1))
+
+# Screen/display
+SCREEN_W = int(CFG.get("SCREEN_W", 1200))
+SCREEN_H = int(CFG.get("SCREEN_H", 600))
+FPS = int(CFG.get("FPS", 1))
+AGENT_R = int(CFG.get("AGENT_R", 30))
+
+# Message log
+MSG_LOG_LIMIT = int(CFG.get("MSG_LOG_LIMIT", 12))
+MSG_BOX_W = int(CFG.get("MSG_BOX_W", 360))
+MSG_BOX_X = int(CFG.get("MSG_BOX_X", SCREEN_W - MSG_BOX_W))
+
+# Language toggle
+USE_LANGUAGE = bool(CFG.get("USE_LANGUAGE", True))
 
 # Judge settings
-RUBRIC_PATH = os.environ.get("JUDGE_RUBRIC", "judge_rubric.yaml")
-PLANNER_TOPK = int(os.environ.get("PLANNER_TOPK", "3"))
+RUBRIC_PATH = CFG.get("RUBRIC_PATH", "judge_rubric.yaml")
+PLANNER_TOPK = int(CFG.get("PLANNER_TOPK", 3))
 
-# ───────────────────────── runtime globals (populated iff visual=True)
+# ── runtime globals (populated iff visual=True)
 screen = font = font_s = clock = None
 msg_log: deque[tuple[str, str]] = deque(maxlen=200)
 

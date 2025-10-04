@@ -1,15 +1,19 @@
 # speaker.py
-import torch, torch.nn as nn, torch.nn.functional as F
+import yaml, torch, torch.nn as nn, torch.nn.functional as F
 from typing import List, Dict, Any, Tuple, Optional
 
+# ── Load config
+with open("config.yaml", "r") as f:
+    CFG = yaml.safe_load(f)
+
 # Default templates; you can override per-game
-DEFAULT_TEMPLATES = [
+DEFAULT_TEMPLATES = CFG.get("DEFAULT_TEMPLATES", [
     "Accuse {target}",
     "Defend {ally}",
     "Ask {target} a question",
     "Express uncertainty",
     "Propose vote on {target}",
-]
+])
 
 def make_hist_feats(recent_texts: List[str]) -> torch.Tensor:
     if not recent_texts:

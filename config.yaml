@@ -1,41 +1,232 @@
 # config.yaml
-# Central config for JEPA-DGM Werewolf Sim + Judge
-# Adjust values here instead of editing code. Env/CLI can still override.
 
-simulation:
+
+################################################
+# agent.py 
+NUM_AGENTS: 6
+MAX_MEMORY: 5
+USE_LANGUAGE: true   
+SPEAKER_ENABLED: false
+SPEAKER_LR: 0.001
+SPEAKER_HIST_K: 3
+
+
+
+
+
+
+################################################
+################################################
+# encoders.py
+
+INPUT_DIM: 808
+LATENT_DIM: 32
+################################################
+#################################################
+# judge.py
+
+JUDGE_MODEL_ID: "meta-llama/Llama-3.1-8B-Instruct"
+JUDGE_MAX_NEW: 128
+INCLUDE_RATIONALE: true    # was JUDGE_RATIONALE
+ENABLE_PERSONA_STEER: false
+JUDGE_DEBUG: false
+PERSONA_CONFIG_PATH: "configs/persona_vectors.yaml"
+JUDGE_DEBUG_DIR: "logs"
+JUDGE_DEVICE: ""    # options: "", "cpu", "cuda"
+JUDGE_BATCH: 3
+################################################
+################################################
+# llm_script.py
+
+LLM_MODEL_ID: "mistralai/Mistral-7B-Instruct-v0.2"
+LLM_SPEAKER: false            # enable the trainable logit-bias mouthpiece
+LLM_DEVICE: ""                # "", "cpu", or "cuda:0"
+################################################
+################################################
+# roles.py
+
+WEREWOLF: "Werewolf"
+VILLAGER: "Worker"
+ROLE_PRIORS:
+  WEREWOLF: ones   # 32-dim vector of ones
+  VILLAGER: zeros  # 32-dim vector of zeros
+PERSONA_SCALE: 0.2   # magnitude of trait variation
+PERSONA_SEED: null   # set for reproducibility (e.g., "1234")
+################################################
+################################################
+# sim.py
+
+NUM_AGENTS: 6
+NUM_WEREWOLVES: 1
+
+SCREEN_W: 1200
+SCREEN_H: 600
+FPS: 1
+AGENT_R: 30
+MSG_LOG_LIMIT: 12
+MSG_BOX_W: 360
+MSG_BOX_X: 840   # SCREEN_W - MSG_BOX_W
+USE_LANGUAGE: true
+RUBRIC_PATH: "judge_rubric.yaml"
+PLANNER_TOPK: 3
+################################################
+################################################
+# speaker_llm.py
+
+BIAS_CAP: 2.0          # max |bias| per token logit
+BASE_STRENGTH: 1.0
+DEBUG: false
+
+# Seed lexicon for categories (can be extended per game)
+DEFAULT_LEXICON:
+  accuse:   ["accuse", "suspicious", "suspect", "lying", "deceive", "eliminate", "vote"]
+  defend:   ["defend", "innocent", "trust", "ally", "support", "clear"]
+  hedge:    ["maybe", "perhaps", "uncertain", "unsure", "might", "seems", "appears"]
+  question: ["why", "how", "what", "who", "where", "when", "?"]
+  vote:     ["vote", "eliminate", "banish", "target", "lynch"]
+
+CAT_ORDER: ["accuse", "defend", "hedge", "question", "vote"]
+################################################
+################################################
+# speaker.py
+
+DEFAULT_TEMPLATES:
+  - "Accuse {target}"
+  - "Defend {ally}"
+  - "Ask {target} a question"
+  - "Express uncertainty"
+  - "Propose vote on {target}"
+################################################
+################################################
+# train.py
+
+# Hyper-parameters
+N_GAMES: 50            # per-role
+LATENT_DIM: 32
+ACTION_DIM: 8
+NUM_ACTIONS: 6
+
+# Paths
+CHECKPOINT_DIR: "checkpoints"
+
+# Toggles and judge config
+SPEAKER_ENABLED: false
+JUDGE_RUBRIC_PATH: "judge_rubric.yaml"
+
+# Role-conditioned reward weights
+VILLAGER_W:
+  truthfulness: 0.5
+  coherence: 0.3
+  social_safety: 0.2
+WEREWOLF_W:
+  truthfulness: -0.3
+  coherence: 0.5
+  social_safety: 0.2
+################################################
+################################################
+# training_utils.py
+
+LAMBDA_BC: 0.5
+MAX_NORM: 1.0
+################################################
+
+
+seed: 1337
+
+paths:
+  checkpoints: "checkpoints/"
+  logs: "logs/"
+  rubric: "judge_rubric.yaml"
+
+sim:
   num_agents: 6
   num_werewolves: 1
-  use_language: true   # can be overridden by USE_LANGUAGE env var
-  fps: 1               # frames per second for pygame UI
-  screen_w: 1200
-  screen_h: 600
+  planner_topk: 3
+  use_language: true
+  ui:
+    enabled: true
+    screen_w: 1200
+    screen_h: 600
+    fps: 1
+    msg_log_limit: 12
+    msg_box_w: 360
 
-latent:
+model:
   input_dim: 808
   latent_dim: 32
   action_dim: 8
-  max_memory: 5
-
-models:
-  mouthpiece_model: "meta-llama/Llama-3.1-8B-Instruct"
-  judge_model: "meta-llama/Llama-3.1-8B-Instruct"
+  num_actions: 6            # temporary, until phase-aware split
+  encoders:
+    message_model: "sentence-transformers/all-MiniLM-L6-v2"
 
 judge:
-  rubric_path: "rubrics/judge_rubric.yaml"
-  temperature: 0.0
-  top_p: 0.1
-  max_new_tokens: 160
-  rationale: true
+  model_id: "meta-llama/Llama-3.1-8B-Instruct"
+  device: "auto"            # "auto" | "cpu" | "cuda"
+  batch: 3
+  max_new: 128
+  include_rationale: true
+  enable_persona_steer: false
+  debug: false
+  debug_dir: "logs"
 
-training:
-  epochs: 5
-  batch_size: 16
-  learning_rate: 0.001
-  lambda_bc: 0.75
-  predict_delta: true
-  min_rollouts: 64
-  default_n_games: 50
+llm:
+  model_id: "mistralai/Mistral-7B-Instruct-v0.2"
+  speaker_enabled: false    # logit-bias mouthpiece
+  decode_attempts:
+    - {max_new_tokens: 32, temperature: 0.6, top_p: 0.9, repetition_penalty: 1.1, no_repeat_ngram_size: 3}
+    - {max_new_tokens: 28, temperature: 0.5, top_p: 0.9, repetition_penalty: 1.15, no_repeat_ngram_size: 4}
+    - {max_new_tokens: 24, temperature: 0.45, top_p: 0.85, repetition_penalty: 1.2, no_repeat_ngram_size: 5}
+  bans_meta:
+    - "Use" 
+    - "Do not" 
+    - "Don't" 
+    - "No " 
+    - "Keep "
+    - "Reply" 
+    - "Provide" 
+    - "Follow" 
+    - "Instruction" 
+    - "Rule" 
+    - "sentence" 
+    - "third person" 
+    - "grammar" 
+    - "punctuation" 
+    - "No narration"
+
+speaker:
+  enabled: false
+  lr: 1.0e-3
+  hist_k: 3
+  entropy_bonus: 0.01
+  hidden: 128
+  templates:
+    - "Accuse {target}"
+    - "Defend {ally}"
+    - "Ask {target} a question"
+    - "Express uncertainty"
+    - "Propose vote on {target}"
 
 persona:
-  enabled: false
-  config_path: "configs/persona_vectors.yaml"
+  scale: 0.2
+  seed: null
+  effects:
+    accuse_bias_scale: 1.0
+    speaker_temp_scale: 1.0
+    coherence_weight_scale: 1.0
+
+training:
+  n_games: 5
+  epochs: 5
+  batch_size: 64
+  lr: 1.0e-3
+  max_grad_norm: 1.0
+  lambda_bc: 1.0
+  device: "auto"
+
+ablations:
+  judge: true
+  bandit: false
+  personas: true
+  social: false
+  fep_core: true
+  language: true

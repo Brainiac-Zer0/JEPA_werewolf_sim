@@ -14,8 +14,10 @@
 import os
 import sys
 from typing import List, Tuple, Any
+from pathlib import Path
 
-import torch
+
+import torch, yaml
 
 # Make project root importable when train.py is launched directly
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -24,23 +26,32 @@ from roles import WEREWOLF, VILLAGER                            # noqa: E402
 from training_utils import load_role_models, run_sim_and_collect_rollouts, train_jepa  # noqa: E402
 from judge import score_batch, JudgeRubric                      # noqa: E402
 
-# ─────────────────────────────── hyper-params
-N_GAMES: int = int(os.environ.get("N_GAMES", "50"))  # per-role
-LATENT_DIM: int = 32
-ACTION_DIM: int = 8
-NUM_ACTIONS: int = 6
+# ── Load config
+with open("config.yaml", "r") as f:
+    CFG = yaml.safe_load(f) or {}
 
-CHECKPOINT_DIR = "checkpoints"
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+# ── Hyper-parameters
+N_GAMES: int = int(CFG.get("N_GAMES", 50))  # per-role
+LATENT_DIM: int = int(CFG.get("LATENT_DIM", 32))
+ACTION_DIM: int = int(CFG.get("ACTION_DIM", 8))
+NUM_ACTIONS: int = int(CFG.get("NUM_ACTIONS", 6))
 
-# Speaker toggle + judge config
-SPEAKER_ENABLED = os.environ.get("SPEAKER_ENABLED", "0") == "1"
-JUDGE_RUBRIC_PATH = os.environ.get("JUDGE_RUBRIC", "judge_rubric.yaml")
+# ── Paths
+CHECKPOINT_DIR = str(CFG.get("CHECKPOINT_DIR", "checkpoints"))
+Path(CHECKPOINT_DIR).mkdir(parents=True, exist_ok=True)
 
-# Role-conditioned reward weights (tweak as needed)
-VILLAGER_W = {"truthfulness": 0.5, "coherence": 0.3, "social_safety": 0.2}
-WEREWOLF_W = {"truthfulness": -0.3, "coherence": 0.5, "social_safety": 0.2}
+# ── Toggles and judge config
+SPEAKER_ENABLED: bool = bool(CFG.get("SPEAKER_ENABLED", False))
+JUDGE_RUBRIC_PATH: str = str(CFG.get("JUDGE_RUBRIC_PATH", "judge_rubric.yaml"))
 
+# ── Role-conditioned reward weights
+def _weights_from_cfg(section: str, default: dict) -> dict:
+    w = CFG.get(section, default)
+    # Ensure numeric types are floats
+    return {k: float(v) for k, v in w.items()}
+
+VILLAGER_W = _weights_from_cfg("VILLAGER_W", {"truthfulness": 0.5, "coherence": 0.3, "social_safety": 0.2})
+WEREWOLF_W = _weights_from_cfg("WEREWOLF_W", {"truthfulness": -0.3, "coherence": 0.5, "social_safety": 0.2})
 
 # ─────────────────────────────── helpers: speaker reward / training
 def _role_reward(subs: dict, role: str, persona_effects: dict | None = None) -> float:
