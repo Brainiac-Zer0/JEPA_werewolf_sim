@@ -4,20 +4,22 @@ import os, json, math, re
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional, Tuple
 
-import torch
+import torch, yaml
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 
 # ────────────── Env ──────────────
-JUDGE_MODEL_ID   = os.environ.get("JUDGE_MODEL_ID", "meta-llama/Llama-3.1-8B-Instruct")
-JUDGE_MAX_NEW    = int(os.environ.get("JUDGE_MAX_NEW", "128"))
-INCLUDE_RATIONALE = os.environ.get("JUDGE_RATIONALE", "1") != "0"
-ENABLE_PERSONA_STEER = os.environ.get("JUDGE_PERSONA_STEER", "0") == "1"
-PERSONA_CONFIG_PATH  = os.environ.get("PERSONA_CONFIG", "configs/persona_vectors.yaml")
-JUDGE_DEVICE     = os.environ.get("JUDGE_DEVICE", "").lower()  # "", "cpu", "cuda"
-JUDGE_BATCH      = max(1, int(os.environ.get("JUDGE_BATCH", "3")))
-JUDGE_DEBUG      = os.environ.get("JUDGE_DEBUG", "0") == "1"
-JUDGE_DEBUG_DIR  = os.environ.get("JUDGE_DEBUG_DIR", "logs")
+with open("config.yaml", "r") as f:
+    config = yaml.safe_load(f)
 
+JUDGE_MODEL_ID = config.get("JUDGE_MODEL_ID", "meta-llama/Llama-3.1-8B-Instruct")
+JUDGE_MAX_NEW = int(config.get("JUDGE_MAX_NEW", 128))
+INCLUDE_RATIONALE = bool(config.get("INCLUDE_RATIONALE", True))
+ENABLE_PERSONA_STEER = bool(config.get("ENABLE_PERSONA_STEER", False))
+PERSONA_CONFIG_PATH = config.get("PERSONA_CONFIG_PATH", "configs/persona_vectors.yaml")
+JUDGE_DEVICE = config.get("JUDGE_DEVICE", "").lower()
+JUDGE_BATCH = max(1, int(config.get("JUDGE_BATCH", 3)))
+JUDGE_DEBUG = bool(config.get("JUDGE_DEBUG", False))
+JUDGE_DEBUG_DIR = config.get("JUDGE_DEBUG_DIR", "logs")
 # ────────────── Rubric ──────────────
 @dataclass
 class JudgeRubric:

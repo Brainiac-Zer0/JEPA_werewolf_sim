@@ -2,6 +2,7 @@ import os
 import torch
 import torch.nn.functional as F
 from collections import deque
+import yaml
 from encoders import (
     MessageEncoder,
     MLPBeliefEncoder,
@@ -16,12 +17,17 @@ from encoders import (
 # NEW: speaker import
 from speaker import SpeakerBandit, DEFAULT_TEMPLATES  # make_hist_feats not needed here
 
-NUM_AGENTS = 6
-MAX_MEMORY = 5
-USE_LANGUAGE = os.environ.get("USE_LANGUAGE", "1") != "0"  # ablation flag
-SPEAKER_ENABLED = os.environ.get("SPEAKER_ENABLED", "0") == "1"
-SPEAKER_LR = float(os.environ.get("SPEAKER_LR", "1e-3"))
-SPEAKER_HIST_K = int(os.environ.get("SPEAKER_HIST_K", "3"))  # how many recent lines to condition on
+# Load config file once at startup
+with open("config.yaml", "r") as f:
+    config = yaml.safe_load(f)
+
+# Access values
+NUM_AGENTS = config.get("NUM_AGENTS")
+MAX_MEMORY = config.get("MAX_MEMORY")
+USE_LANGUAGE = bool(config.get("USE_LANGUAGE", True))
+SPEAKER_ENABLED = bool(config.get("SPEAKER_ENABLED", False))
+SPEAKER_LR = float(config.get("SPEAKER_LR", 1e-3))
+SPEAKER_HIST_K = int(config.get("SPEAKER_HIST_K", 3))
 
 
 class BaseAgent:

@@ -3,9 +3,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModel
 from functools import lru_cache
+import yaml
 
-INPUT_DIM = 808
-LATENT_DIM = 32
+
+# Load config file once at startup
+with open("config.yaml", "r") as f:
+    config = yaml.safe_load(f)
+# Access values
+INPUT_DIM = config.get("INPUT_DIM", 808)
+LATENT_DIM = config.get("LATENT_DIM", 32)
 
 # ───────────────────────────────────────────────────────────────────────────────
 # TEXT ENCODER MODULE  (shared; includes tiny LRU for single-string calls)

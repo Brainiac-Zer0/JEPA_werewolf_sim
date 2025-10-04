@@ -15,7 +15,7 @@ import os
 from dataclasses import dataclass
 from typing import Dict, List, Iterable, Optional, Tuple
 
-import torch
+import torch, yaml
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import LogitsProcessor, LogitsProcessorList, PreTrainedTokenizerBase
@@ -34,20 +34,25 @@ except Exception:
         return torch.tensor([acc, mean_len], dtype=torch.float32)
 
 # ───────────── config (env-overrideable) ─────────────
-BIAS_CAP: float = float(os.environ.get("LLM_SPK_BIAS_CAP", "2.0"))      # max |bias| per token logit
-BASE_STRENGTH: float = float(os.environ.get("LLM_SPK_BASE_STRENGTH", "1.0"))
-DEBUG: bool = os.environ.get("LLM_SPK_DEBUG", "0") == "1"
+# ── Load config
+with open("config.yaml", "r") as f:
+    CFG = yaml.safe_load(f)
+
+# Config values
+BIAS_CAP: float = float(CFG.get("BIAS_CAP", 2.0))   # max |bias| per token logit
+BASE_STRENGTH: float = float(CFG.get("BASE_STRENGTH", 1.0))
+DEBUG: bool = bool(CFG.get("DEBUG", False))
 
 # Seed lexicon for categories (can be extended per game)
-DEFAULT_LEXICON = {
+DEFAULT_LEXICON = CFG.get("DEFAULT_LEXICON", {
     "accuse":   ["accuse", "suspicious", "suspect", "lying", "deceive", "eliminate", "vote"],
     "defend":   ["defend", "innocent", "trust", "ally", "support", "clear"],
     "hedge":    ["maybe", "perhaps", "uncertain", "unsure", "might", "seems", "appears"],
     "question": ["why", "how", "what", "who", "where", "when", "?"],
-    "vote":     ["vote", "eliminate", "banish", "target", "lynch"],  # keep neutral wording
-}
+    "vote":     ["vote", "eliminate", "banish", "target", "lynch"],
+})
 
-CAT_ORDER = ["accuse", "defend", "hedge", "question", "vote"]
+CAT_ORDER = CFG.get("CAT_ORDER", ["accuse", "defend", "hedge", "question", "vote"])
 
 
 # ───────────── utils ─────────────

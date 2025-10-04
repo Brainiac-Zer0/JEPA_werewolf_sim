@@ -5,7 +5,7 @@ import os
 import random
 from typing import List, Tuple
 
-import torch
+import torch, yaml
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
@@ -16,9 +16,13 @@ CHECKPOINT_DIR = "checkpoints"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ── tunables (env-overrideable)
-LAMBDA_BC: float = float(os.environ.get("LAMBDA_BC", "0.5"))
-MAX_NORM: float = float(os.environ.get("MAX_NORM", "1.0"))
+# ── Load config
+with open("config.yaml", "r") as f:
+    CFG = yaml.safe_load(f) or {}
+
+# Tunables
+LAMBDA_BC: float = float(CFG.get("LAMBDA_BC", 0.5))
+MAX_NORM: float = float(CFG.get("MAX_NORM", 1.0))
 
 def train_jepa(
     rollout_data: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]],

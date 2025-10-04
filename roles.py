@@ -1,22 +1,27 @@
 # roles.py
 import os
 import torch
-import random
+import random, yaml
 from dataclasses import dataclass, asdict
 
-WEREWOLF = "Werewolf"
-VILLAGER = "Worker"
+# ── Load config
+with open("config.yaml", "r") as f:
+    CFG = yaml.safe_load(f)
 
-# Role-conditioned latent goal priors (z_goal)
+# ── Roles
+WEREWOLF = CFG.get("WEREWOLF", "Werewolf")
+VILLAGER = CFG.get("VILLAGER", "Worker")
+
+# ── Role-conditioned latent goal priors
+_ROLE_PRIORS = CFG.get("ROLE_PRIORS", {})
 ROLE_PRIORS = {
-    WEREWOLF: torch.ones(32),   # Disruptive, exploratory
-    VILLAGER: torch.zeros(32),  # Stable, orderly
+    WEREWOLF: torch.ones(32) if _ROLE_PRIORS.get("WEREWOLF", "ones") == "ones" else torch.zeros(32),
+    VILLAGER: torch.ones(32) if _ROLE_PRIORS.get("VILLAGER", "zeros") == "ones" else torch.zeros(32),
 }
 
-# ───────────────────────── Personality config ─────────────────────────
-PERSONA_SCALE = float(os.environ.get("PERSONA_SCALE", "0.2"))  # magnitude of trait variation
-PERSONA_SEED  = os.environ.get("PERSONA_SEED", None)           # set for reproducibility (e.g., "1234")
-
+# ── Personality config
+PERSONA_SCALE = float(CFG.get("PERSONA_SCALE", 0.2))
+PERSONA_SEED = CFG.get("PERSONA_SEED", None)
 @dataclass
 class Persona:
     extraversion: float

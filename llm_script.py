@@ -1,19 +1,34 @@
 from __future__ import annotations
-# llm_script.py  ── single-device safe loader + clean one-liner
+# llm_script.py  — single-device safe loader + clean one-liner
 # (chat template + few-shot + anti-meta bans + safe fallbacks)
 # NEW: optional trainable LLM mouthpiece via logit-bias head (speaker_llm.py)
 
-import os, torch, re
+import os, torch, re, yaml
 from typing import List, Dict, Optional, Any
 from transformers import pipeline, AutoModelForCausalLM, AutoTokenizer
 
-# Override the model via env to try Llama 3.1 8B:
-#   $env:LLM_MODEL_ID="meta-llama/Llama-3.1-8B-Instruct"
-MODEL_ID = os.environ.get("LLM_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2")
-USE_GPU  = torch.cuda.is_available()
+# ── Config loading
+def _load_config(path: str = "config.yaml") -> dict:
+    try:
+        with open(path, "r") as f:
+            data = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        data = {}
+    return data
 
-# Enable/disable logit-bias mouthpiece:
-LLM_SPEAKER = os.environ.get("LLM_SPEAKER", "0") == "1"
+CFG = _load_config()
+
+# ── Config values
+MODEL_ID = CFG.get("LLM_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2")
+LLM_SPEAKER = bool(CFG.get("LLM_SPEAKER", False))
+
+_cfg_device = str(CFG.get("LLM_DEVICE", "") or "").strip().lower()
+if _cfg_device:
+    device = _cfg_device  # "", "cpu", "cuda", "cuda:0"
+else:
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+USE_GPU = device.startswith("cuda")
 
 # ── 1) Tokenizer
 tok = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=True)
@@ -27,9 +42,8 @@ if tok.pad_token_id is None:
 tok.padding_side = "left"
 
 # ── 2) Model
-device      = "cuda:0" if USE_GPU else "cpu"
 torch_dtype = torch.float16 if USE_GPU else torch.float32
-model       = AutoModelForCausalLM.from_pretrained(
+model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
     torch_dtype=torch_dtype,
     low_cpu_mem_usage=False,
@@ -47,14 +61,22 @@ if getattr(model.config, "pad_token_id", None) is None:
 model = model.to(device)
 
 # ── 3) Pipeline
+pipe_device = 0 if device.startswith("cuda") else -1
 llm_pipeline = pipeline(
     "text-generation",
     model=model,
     tokenizer=tok,
-    device=0 if USE_GPU else -1,
+    device=pipe_device,
 )
 
-print(f"[INFO] LLM loaded on {'GPU: '+torch.cuda.get_device_name(0) if USE_GPU else 'CPU'}")
+if USE_GPU:
+    try:
+        gpu_name = torch.cuda.get_device_name(0)
+    except Exception:
+        gpu_name = "CUDA"
+    print(f"[INFO] LLM loaded on {device.upper()}: {gpu_name}")
+else:
+    print(f"[INFO] LLM loaded on {device.upper()}")
 
 # ── Hygiene helpers
 BAD_QUOTES = "“”\"'«»"
@@ -261,7 +283,7 @@ def chatgpt_llm_with_bias(z, agent) -> str:
     persona_effects = getattr(agent, "persona_effects", None)
     proc_kwargs = with_logit_bias_generate_kwargs(
         tokenizer=tok,
-        head=head,
+               head=head,
         z_t=z.detach() if torch.is_tensor(z) else torch.tensor(z),
         role=agent.role,
         recent_texts=_recent_texts(agent, k=3),
@@ -302,6 +324,6 @@ def chatgpt_llm_with_bias(z, agent) -> str:
         print(f"[LLM ERROR-bias] {e}")
         return "..."
 
-# Optional convenience: pick mouthpiece by env
+# Optional convenience: pick mouthpiece by config
 def llm_fn_from_env():
     return chatgpt_llm_with_bias if LLM_SPEAKER else chatgpt_llm_from_latent
