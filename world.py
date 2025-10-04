@@ -1,4 +1,5 @@
 from collections import Counter
+from roles import WEREWOLF  # use the canonical role name from roles/config
 
 def resolve_votes(vote_dict):
     counts = Counter(vote_dict.values())
@@ -14,8 +15,9 @@ def eliminate_player(agent):
 
 def night_kill(agents):
     """Werewolf selects a target to eliminate during night phase."""
-    werewolves = [a for a in agents if a.alive and getattr(a, 'role', None) == "Werewolf"]
-    villagers = [a for a in agents if a.alive and getattr(a, 'role', None) != "Werewolf"]
+    # Use the configured WEREWOLF constant instead of a hardcoded string
+    werewolves = [a for a in agents if a.alive and getattr(a, 'role', None) == WEREWOLF]
+    villagers  = [a for a in agents if a.alive and getattr(a, 'role', None) != WEREWOLF]
 
     if not werewolves or not villagers:
         return None  # No kill possible
@@ -25,7 +27,7 @@ def night_kill(agents):
     target_name = killer.choose_night_target(villagers)
     if target_name:
         for agent in agents:
-            if agent.name == target_name:
+            if agent.name == target_name and agent.alive:
                 eliminate_player(agent)
                 return target_name
     return None
