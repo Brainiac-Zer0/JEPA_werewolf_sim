@@ -1,119 +1,76 @@
-# config.yaml
-
-
-################################################
-# agent.py 
+# ================================================================
+# LEGACY KEYS (kept so existing code paths don't break)
+# ================================================================
 NUM_AGENTS: 6
 MAX_MEMORY: 5
-USE_LANGUAGE: true   
+USE_LANGUAGE: true
 SPEAKER_ENABLED: false
 SPEAKER_LR: 0.001
 SPEAKER_HIST_K: 3
 
-
-
-
-
-
-################################################
-################################################
-# encoders.py
-
 INPUT_DIM: 808
 LATENT_DIM: 32
-################################################
-#################################################
-# judge.py
 
 JUDGE_MODEL_ID: "meta-llama/Llama-3.1-8B-Instruct"
 JUDGE_MAX_NEW: 128
-INCLUDE_RATIONALE: true    # was JUDGE_RATIONALE
+INCLUDE_RATIONALE: true
 ENABLE_PERSONA_STEER: false
 JUDGE_DEBUG: false
 PERSONA_CONFIG_PATH: "configs/persona_vectors.yaml"
 JUDGE_DEBUG_DIR: "logs"
-JUDGE_DEVICE: ""    # options: "", "cpu", "cuda"
+JUDGE_DEVICE: ""
 JUDGE_BATCH: 3
-################################################
-################################################
-# llm_script.py
 
 LLM_MODEL_ID: "mistralai/Mistral-7B-Instruct-v0.2"
-LLM_SPEAKER: false            # enable the trainable logit-bias mouthpiece
-LLM_DEVICE: ""                # "", "cpu", or "cuda:0"
-################################################
-################################################
-# roles.py
+LLM_SPEAKER: false
+LLM_DEVICE: ""
 
 WEREWOLF: "Werewolf"
 VILLAGER: "Worker"
 ROLE_PRIORS:
-  WEREWOLF: ones   # 32-dim vector of ones
-  VILLAGER: zeros  # 32-dim vector of zeros
-PERSONA_SCALE: 0.2   # magnitude of trait variation
-PERSONA_SEED: null   # set for reproducibility (e.g., "1234")
-################################################
-################################################
-# sim.py
+  WEREWOLF: ones
+  VILLAGER: zeros
+PERSONA_SCALE: 0.2
+PERSONA_SEED: null
 
-NUM_AGENTS: 6
+# sim.py legacy knobs
 NUM_WEREWOLVES: 1
-
 SCREEN_W: 1200
 SCREEN_H: 600
 FPS: 1
 AGENT_R: 30
 MSG_LOG_LIMIT: 12
 MSG_BOX_W: 360
-MSG_BOX_X: 840   # SCREEN_W - MSG_BOX_W
-USE_LANGUAGE: true
+MSG_BOX_X: 840
 RUBRIC_PATH: "judge_rubric.yaml"
 PLANNER_TOPK: 3
-################################################
-################################################
-# speaker_llm.py
 
-BIAS_CAP: 2.0          # max |bias| per token logit
+# speaker_llm.py
+BIAS_CAP: 2.0
 BASE_STRENGTH: 1.0
 DEBUG: false
-
-# Seed lexicon for categories (can be extended per game)
 DEFAULT_LEXICON:
   accuse:   ["accuse", "suspicious", "suspect", "lying", "deceive", "eliminate", "vote"]
   defend:   ["defend", "innocent", "trust", "ally", "support", "clear"]
   hedge:    ["maybe", "perhaps", "uncertain", "unsure", "might", "seems", "appears"]
   question: ["why", "how", "what", "who", "where", "when", "?"]
   vote:     ["vote", "eliminate", "banish", "target", "lynch"]
-
 CAT_ORDER: ["accuse", "defend", "hedge", "question", "vote"]
-################################################
-################################################
-# speaker.py
 
+# speaker.py templates (for bandit mouthpiece)
 DEFAULT_TEMPLATES:
   - "Accuse {target}"
   - "Defend {ally}"
   - "Ask {target} a question"
   - "Express uncertainty"
   - "Propose vote on {target}"
-################################################
-################################################
-# train.py
 
-# Hyper-parameters
-N_GAMES: 50            # per-role
-LATENT_DIM: 32
+# train.py
+N_GAMES: 50
 ACTION_DIM: 8
 NUM_ACTIONS: 6
-
-# Paths
 CHECKPOINT_DIR: "checkpoints"
-
-# Toggles and judge config
-SPEAKER_ENABLED: false
 JUDGE_RUBRIC_PATH: "judge_rubric.yaml"
-
-# Role-conditioned reward weights
 VILLAGER_W:
   truthfulness: 0.5
   coherence: 0.3
@@ -122,15 +79,14 @@ WEREWOLF_W:
   truthfulness: -0.3
   coherence: 0.5
   social_safety: 0.2
-################################################
-################################################
-# training_utils.py
 
+# training_utils.py
 LAMBDA_BC: 0.5
 MAX_NORM: 1.0
-################################################
 
-
+# ================================================================
+# MODERN STRUCTURED KEYS (existing, kept)
+# ================================================================
 seed: 1337
 
 paths:
@@ -155,7 +111,7 @@ model:
   input_dim: 808
   latent_dim: 32
   action_dim: 8
-  num_actions: 6            # temporary, until phase-aware split
+  num_actions: 6            # until phase-aware split
   encoders:
     message_model: "sentence-transformers/all-MiniLM-L6-v2"
 
@@ -171,7 +127,7 @@ judge:
 
 llm:
   model_id: "mistralai/Mistral-7B-Instruct-v0.2"
-  speaker_enabled: false    # logit-bias mouthpiece
+  speaker_enabled: false
   decode_attempts:
     - {max_new_tokens: 32, temperature: 0.6, top_p: 0.9, repetition_penalty: 1.1, no_repeat_ngram_size: 3}
     - {max_new_tokens: 28, temperature: 0.5, top_p: 0.9, repetition_penalty: 1.15, no_repeat_ngram_size: 4}
@@ -180,7 +136,7 @@ llm:
     - "Use" 
     - "Do not" 
     - "Don't" 
-    - "No " 
+    - "No "
     - "Keep "
     - "Reply" 
     - "Provide" 
@@ -230,3 +186,28 @@ ablations:
   social: false
   fep_core: true
   language: true
+
+# ================================================================
+# NEW (Phase-1) — STABILIZATION + LOGGING
+# ================================================================
+determinism:
+  enabled: true          # if true, sim.py sets all seeds and torch flags
+  seed: 1337             # run-level seed
+  torch_deterministic: true
+  cudnn_benchmark: false # keep kernels deterministic
+
+telemetry:
+  enabled: true
+  out_dir: "logs"
+  csv_name: "telemetry.csv"          # one CSV per run (sim.py will prefix with run_id)
+  judge_jsonl_name: "judge_calls.jsonl"
+  snapshot_config: true              # write config snapshot to logs/run-<id>/config.snapshot.yaml
+  print_summary: true                # tiny integrity line at end (row counts, Δz stats)
+  flush_every: 1                     # write CSV row immediately (safer for SLURM)
+
+phases:
+  talk_categories: ["accuse", "defend", "hedge", "question", "vote"]  # canonical labels
+  # Reserved for future split:
+  # discuss_id: 0
+  # vote_id: 1
+  # night_id: 2

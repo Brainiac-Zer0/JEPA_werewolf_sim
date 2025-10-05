@@ -20,6 +20,71 @@ JUDGE_DEVICE = config.get("JUDGE_DEVICE", "").lower()
 JUDGE_BATCH = max(1, int(config.get("JUDGE_BATCH", 3)))
 JUDGE_DEBUG = bool(config.get("JUDGE_DEBUG", False))
 JUDGE_DEBUG_DIR = config.get("JUDGE_DEBUG_DIR", "logs")
+
+# ────────────── NEW: audit logging routed by config.logging (add-only) ──────────────
+_LOGGING = config.get("logging", {}) if isinstance(config.get("logging", {}), dict) else {}
+JUDGE_AUDIT_JSONL = _LOGGING.get("judge_jsonl", os.path.join(JUDGE_DEBUG_DIR, "judge_calls.jsonl"))
+JUDGE_AUDIT_DEBUG = bool(_LOGGING.get("debug", JUDGE_DEBUG))  # prefer config.logging.debug, fallback to JUDGE_DEBUG
+
+def judge_logging_enabled() -> bool:
+    """
+    Unified check to decide whether to write rich JSONL audit traces.
+    Honors config.logging.debug (preferred) and falls back to JUDGE_DEBUG.
+    """
+    return bool(JUDGE_AUDIT_DEBUG or JUDGE_DEBUG)
+
+def _ensure_parent_dir(path: str):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except Exception:
+        pass
+
+def audit_judge_calls(
+    *,
+    run_id: str,
+    round_num: int,
+    phase: str,
+    agent: str,
+    items: List[Dict[str, str]],
+    results: List[Dict[str, Any]],
+    jsonl_path: Optional[str] = None,
+) -> None:
+    """
+    ADD-ONLY helper: write one JSON line per (item, result) pair.
+    Call this AFTER score_batch(...) returns; no changes inside score_batch.
+
+    Each line includes keys that line up with the sim CSV:
+      run_id, round, phase, agent, context, role, candidate, subscores, score.
+    """
+    if not judge_logging_enabled():
+        return
+    if not items or not results:
+        return
+    path = jsonl_path or JUDGE_AUDIT_JSONL
+    _ensure_parent_dir(path)
+
+    n = min(len(items), len(results))
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            for i in range(n):
+                it  = items[i] or {}
+                out = results[i] or {}
+                rec = {
+                    "run_id": run_id,
+                    "round": int(round_num),
+                    "phase": str(phase),
+                    "agent": str(agent),
+                    "context": it.get("context", ""),
+                    "role": it.get("role", ""),
+                    "candidate": it.get("candidate", ""),
+                    "subscores": out.get("subscores", {}),
+                    "score": float(out.get("score", 0.0)),
+                }
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:
+        # Never crash the caller on audit failures
+        print("[JUDGE-DBG] audit_judge_calls write failed:", e)
+
 # ────────────── Rubric ──────────────
 @dataclass
 class JudgeRubric:

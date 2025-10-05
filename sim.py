@@ -6,6 +6,11 @@
 # - Calls LLM-as-Judge on planner top-k vote targets, picks final vote, logs subscores
 # - Returns agents in meta so train.py can run speaker learning
 # - Applies personality randomization per agent
+# - NEW (Phase 1: Stabilization & Logging)
+#   * Deterministic seeds + run metadata snapshot
+#   * Phase-aware + mask-aware telemetry
+#   * Per-decision CSV rows (TALK / VOTE / KILL) with Δz for votes
+#   * Optional judge debug JSONL is handled in judge.py (not here)
 # -----------------------------------------------------------------------------
 
 import sys
@@ -18,6 +23,10 @@ from typing import Dict, Tuple, List
 import pygame
 import torch, yaml
 import torch.nn.functional as F
+
+# NEW: logging & determinism helpers
+import uuid, time, json, csv, pathlib
+import numpy as np
 
 from agent import BaseAgent
 from roles import WEREWOLF, VILLAGER, assign_roles
@@ -60,9 +69,49 @@ USE_LANGUAGE = bool(CFG.get("USE_LANGUAGE", True))
 RUBRIC_PATH = CFG.get("RUBRIC_PATH", "judge_rubric.yaml")
 PLANNER_TOPK = int(CFG.get("PLANNER_TOPK", 3))
 
+# NEW: logging & seeds
+LOG_CFG = CFG.get("logging", {}) if isinstance(CFG.get("logging", {}), dict) else {}
+LOG_DIR       = LOG_CFG.get("dir", "logs")
+METRICS_CSV   = LOG_CFG.get("metrics_csv", f"{LOG_DIR}/metrics.csv")
+RUN_CFG_PATH  = LOG_CFG.get("run_config", f"{LOG_DIR}/run_config.yaml")
+RUN_META_PATH = LOG_CFG.get("run_meta",   f"{LOG_DIR}/run_meta.json")
+SAVE_CFG_SNAPSHOT = bool(CFG.get("runtime", {}).get("save_config_snapshot", True))
+SEEDS = CFG.get("seeds", {}) if isinstance(CFG.get("seeds", {}), dict) else {}
+SEED_GLOBAL = int(SEEDS.get("global", 123))
+
 # ── runtime globals (populated iff visual=True)
 screen = font = font_s = clock = None
 msg_log: deque[tuple[str, str]] = deque(maxlen=200)
+
+# ╭────────────────────────── NEW: UTILITIES ───────────────────────────╮
+def set_seed(seed: int):
+    """Deterministic-ish seeding across python/numpy/torch."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+def ensure_dir(path: str):
+    pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+def write_config_snapshot(cfg: dict, path: str):
+    ensure_dir(path)
+    with open(path, "w") as f:
+        yaml.safe_dump(cfg, f)
+
+def append_csv_rows(path: str, rows: list[dict]):
+    if not rows:
+        return
+    ensure_dir(path)
+    header = list(rows[0].keys())
+    new_file = not pathlib.Path(path).exists()
+    with open(path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=header)
+        if new_file:
+            w.writeheader()
+        for r in rows:
+            w.writerow(r)
 
 # ╭────────────────────────── UI HELPERS ───────────────────────────╮
 def _wrap(text: str, fnt: pygame.font.Font, width: int) -> list[str]:
@@ -146,6 +195,20 @@ def _candidate_text(target_name: str) -> str:
 
 # ╭────────────────────────── MAIN LOOP ─────────────────────────────╮
 def simulate_game(visual: bool = True):
+    # NEW: run id + determinism + log dirs + config snapshot
+    run_id = f"run_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+    set_seed(SEED_GLOBAL)
+    pathlib.Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+    if SAVE_CFG_SNAPSHOT:
+        write_config_snapshot(CFG, RUN_CFG_PATH)
+    with open(RUN_META_PATH, "w") as f:
+        json.dump({
+            "run_id": run_id,
+            "seed": SEED_GLOBAL,
+            "timestamp": int(time.time()),
+            "device": str(torch.device("cuda:0" if torch.cuda.is_available() else "cpu")),
+        }, f)
+
     # ───── Pygame initialisation (only when visual) ─────
     if visual:
         pygame.init()
@@ -195,6 +258,11 @@ def simulate_game(visual: bool = True):
     rollout = []
     round_num = 0
 
+    # NEW: collectors for Phase-1 logging
+    metrics_rows: list[dict] = []   # one row per talk/vote/kill
+    phase_log: list[dict] = []      # [{"round":i,"phase":"..."}]
+    mask_logs: list[dict] = []      # [{"round":i,"phase":"...","actor":"Agent_k","mask":[...]}]
+
     # ───── main day/night loop ─────
     while True:
         if visual:
@@ -213,6 +281,24 @@ def simulate_game(visual: bool = True):
                 print(f"{ag.name}: {msg}")
                 if visual:
                     msg_log.append((ag.name, msg))
+
+                # NEW: log TALK row (phase-aware)
+                phase_log.append({"round": round_num, "phase": "DAY_DISCUSS"})
+                metrics_rows.append({
+                    "run_id": run_id,
+                    "round": round_num,
+                    "phase": "DAY_DISCUSS",
+                    "agent": ag.name,
+                    "role": ag.role,
+                    "choice_type": "TALK_INTENT",
+                    "choice_payload": getattr(ag, "talk_category_last", "") or "",
+                    "mask_size": "",
+                    "judge_score": "", "coh": "", "truth": "", "role_score": "", "safety": "",
+                    "dz_l2": "", "dz_1mcos": "",
+                    "speaker_mode": getattr(ag, "speaker_mode", "") or "",
+                    "persona_norm": getattr(ag, "persona_norm", 0.0),
+                })
+
             if visual:
                 draw_agents(agents)
                 clock.tick(FPS)
@@ -235,6 +321,11 @@ def simulate_game(visual: bool = True):
             topk = _planner_topk_for_agent(ag, z_t, living, PLANNER_TOPK)
             if not topk:
                 continue
+
+            # NEW: record legal vote mask (names) + phase tick
+            alive_names = [x.name for x in living if x.name != ag.name]
+            mask_logs.append({"round": round_num, "phase": "DAY_VOTE", "actor": ag.name, "mask": alive_names})
+            phase_log.append({"round": round_num, "phase": "DAY_VOTE"})
 
             # Build judge items for this agent (same context, different candidate strings)
             context_block = _agent_context_block(ag, max_lines=3)
@@ -272,6 +363,26 @@ def simulate_game(visual: bool = True):
             if visual:
                 msg_log.append(("Judge", log_line))
 
+            # NEW: append VOTE row (Δz filled post-act)
+            metrics_rows.append({
+                "run_id": run_id,
+                "round": round_num,
+                "phase": "DAY_VOTE",
+                "agent": ag.name,
+                "role": ag.role,
+                "choice_type": "VOTE_TARGET",
+                "choice_payload": target.name if target else "",
+                "mask_size": len(alive_names),
+                "judge_score": f"{s:.4f}",
+                "coh": f"{subs.get('coherence',0.0):.4f}",
+                "truth": f"{subs.get('truthfulness',0.0):.4f}",
+                "role_score": f"{subs.get('role_alignment',0.0):.4f}",
+                "safety": f"{subs.get('social_safety',0.0):.4f}",
+                "dz_l2": "", "dz_1mcos": "",
+                "speaker_mode": getattr(ag, "speaker_mode", "") or "",
+                "persona_norm": getattr(ag, "persona_norm", 0.0),
+            })
+
         if vote_map:
             print("✉ Votes (judge-selected):", ", ".join(f"{k.name}->{v.name}" for k, v in vote_map.items()))
         else:
@@ -291,28 +402,67 @@ def simulate_game(visual: bool = True):
         # night kill
         wolves = [a for a in agents if a.alive and a.role == WEREWOLF]
         if wolves:
-            victim = choose_night_target(wolves[0], agents)
+            # NEW: record night kill legal mask + phase tick
+            phase_log.append({"round": round_num, "phase": "NIGHT_KILL"})
+            wolf = wolves[0]
+            legal_targets = [a.name for a in agents if a.alive and a.name != wolf.name and a.role != WEREWOLF]
+            mask_logs.append({"round": round_num, "phase": "NIGHT_KILL", "actor": wolf.name, "mask": legal_targets})
+
+            victim = choose_night_target(wolf, agents)
             if victim:
                 eliminate_player(victim)
                 print(f"🌙 Night kill: {victim.name}")
                 if visual:
                     msg_log.append(("Night", f"{victim.name} slain."))
+                # NEW: append KILL row
+                metrics_rows.append({
+                    "run_id": run_id,
+                    "round": round_num,
+                    "phase": "NIGHT_KILL",
+                    "agent": wolf.name,
+                    "role": wolf.role,
+                    "choice_type": "KILL_TARGET",
+                    "choice_payload": victim.name,
+                    "mask_size": len(legal_targets),
+                    "judge_score": "", "coh": "", "truth": "", "role_score": "", "safety": "",
+                    "dz_l2": "", "dz_1mcos": "",
+                    "speaker_mode": getattr(wolf, "speaker_mode", "") or "",
+                    "persona_norm": getattr(wolf, "persona_norm", 0.0),
+                })
 
         # ─── POST-ACT: re-encode to get z_{t+1} and append rollouts ───
         z_deltas = []
         cos_deltas = []
+        # NEW: per-agent Δz to fill back into their most recent vote row
+        dz_by_agent: Dict[str, float] = {}
+        cos_by_agent: Dict[str, float] = {}
+
         for ag in agents:
             if ag.name in pending:
                 z_next = ag.encode_current_belief(round_num + 1, agents).detach()
                 z_t, a_idx, role = pending[ag.name]
                 rollout.append((z_t, a_idx, z_next, role))
-                z_deltas.append(torch.norm(z_next - z_t).item())
+                l2 = torch.norm(z_next - z_t).item()
+                z_deltas.append(l2)
                 cos_val = F.cosine_similarity(z_next.unsqueeze(0), z_t.unsqueeze(0)).item()
                 cos_deltas.append(1.0 - cos_val)
+                dz_by_agent[ag.name] = l2
+                cos_by_agent[ag.name] = 1.0 - cos_val
+
         if z_deltas:
             mean_l2 = sum(z_deltas) / len(z_deltas)
             mean_1mcos = (sum(cos_deltas) / len(cos_deltas)) if cos_deltas else 0.0
             print(f"[Δz] L2={mean_l2:.4f}  (1-cos)={mean_1mcos:.4f}")
+
+            # NEW: fill Δz columns for the vote rows of this round
+            for row in reversed(metrics_rows):
+                if row["round"] != round_num:
+                    break  # earlier rounds
+                if row["phase"] == "DAY_VOTE":
+                    ag_name = row["agent"]
+                    if ag_name in dz_by_agent:
+                        row["dz_l2"] = f"{dz_by_agent[ag_name]:.6f}"
+                        row["dz_1mcos"] = f"{cos_by_agent[ag_name]:.6f}"
 
         # win check
         wolves_alive = [a for a in agents if a.alive and a.role == WEREWOLF]
@@ -321,9 +471,24 @@ def simulate_game(visual: bool = True):
             break
 
     print("\n== Game over ==")
+
+    # NEW: write metrics and print tiny summary
+    append_csv_rows(METRICS_CSV, metrics_rows)
+    by_phase: Dict[str, int] = {}
+    for r in metrics_rows:
+        by_phase[r["phase"]] = by_phase.get(r["phase"], 0) + 1
+    print("[SUMMARY] rows:", len(metrics_rows), "by_phase:", by_phase)
+
     executor.shutdown(wait=True)
-    # include agents in meta so train.py can run speaker learning after each game
-    return rollout, {"rounds": round_num, "agents": agents}
+    # include agents + phase/mask logs in meta for verifiers / downstream
+    meta_out = {
+        "rounds": round_num,
+        "agents": agents,
+        "run_id": run_id,
+        "phases": phase_log,
+        "mask_logs": mask_logs,
+    }
+    return rollout, meta_out
 
 
 # ───────────────────────── CLI ─────────────────────────

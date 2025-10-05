@@ -8,7 +8,6 @@
 #     * length-bias index (Pearson r between token length and score) per item and overall
 #     * optional agreement with gold labels (MSE / Spearman, if "gold" present)
 # - Saves results to logs/judge_eval_report.json and logs/judge_eval_records.csv
-
 from __future__ import annotations
 
 import os
@@ -24,6 +23,18 @@ import numpy as np
 
 from judge import JudgeRubric, score_batch
 
+# ------------------------------- config-aware logs dir ---------------------
+
+try:
+    import yaml
+    with open("config.yaml", "r") as _f:
+        _CFG = yaml.safe_load(_f)
+except Exception:
+    _CFG = {}
+
+def _logs_dir_from_cfg(default: str = "logs") -> str:
+    lg = _CFG.get("logging", {}) if isinstance(_CFG.get("logging", {}), dict) else {}
+    return lg.get("dir", default)
 
 # ------------------------------- I/O utils --------------------------------
 
@@ -41,10 +52,9 @@ def _read_jsonl(path: str) -> List[Dict[str, Any]]:
     return items
 
 def _ensure_logs_dir() -> str:
-    out_dir = os.path.join("logs")
+    out_dir = _logs_dir_from_cfg("logs")
     os.makedirs(out_dir, exist_ok=True)
     return out_dir
-
 
 # ---------------------------- Perturbation suite --------------------------
 
@@ -83,7 +93,6 @@ def _pad_candidate(cand: str, pad_reps: int = 1) -> str:
         return cand
     return cand + " " + ("." * pad_reps)
 
-
 @dataclass
 class Perturbed:
     kind: str
@@ -105,7 +114,6 @@ def make_perturbations(base: EvalItem, seeds: List[int]) -> List[Perturbed]:
         # Padding (candidate length)
         outs.append(Perturbed("pad_cand", s, base.context, base.role, _pad_candidate(base.candidate, pad_reps=3)))
     return outs
-
 
 # ------------------------------- Metrics ----------------------------------
 
@@ -129,7 +137,6 @@ def _mse(a: List[float], b: List[float]) -> float:
         return 0.0
     diff = np.array(a) - np.array(b)
     return float(np.mean(diff * diff))
-
 
 # --------------------------- Scoring & Evaluation -------------------------
 
@@ -240,12 +247,9 @@ def evaluate_set(
         for p in perts:
             if p.kind == "pad_ctx" or p.kind == "pad_cand" or p.kind.startswith("truncate"):
                 lens.append(_len_tokens(p.context + " " + p.candidate))
-                # find the corresponding score in order (mirror above loop)
-                # we will reconstruct by scanning all_records of this bi with tag == p.kind in the same sequence
-                # simpler approach: recompute from meta_index segment
-        # Rebuild perts in the order we appended
-        # meta_index order is base, then perts in make_perturbations order; we'll reassemble here
-        # -> we stored all_records already; filter for item bi
+                # we'll rebuild score alignment below
+
+        # Rebuild aligned lens/scrs arrays
         item_records = [r for r in all_records if r["item_idx"] == bi]
         # base first
         item_base_score = [r["score"] for r in item_records if r["tag"] == "base"][0]
@@ -256,7 +260,6 @@ def evaluate_set(
                 continue
             tag_to_scores.setdefault(r["tag"], []).append(r["score"])
 
-        # rebuild aligned lens/scrs arrays
         lens = [_len_tokens(base.context + " " + base.candidate)]
         scrs = [item_base_score]
         for kind in ("order", "truncate_75", "truncate_50", "pad_ctx", "pad_cand"):
@@ -321,7 +324,6 @@ def evaluate_set(
         },
     }
 
-
 # ------------------------------- CLI entry --------------------------------
 
 def main():
@@ -335,6 +337,8 @@ def main():
     ap.add_argument("--seeds", type=int, default=3, help="Seeds per item for perturbations")
     ap.add_argument("--eps", type=float, default=0.05, help="Consistency epsilon")
     ap.add_argument("--out_prefix", default="judge_eval", help="Output file prefix in logs/")
+    ap.add_argument("--audit_jsonl", action="store_true",
+                    help="If set, write per-call judge audit JSONL alongside report.")
     args = ap.parse_args()
 
     rubric = JudgeRubric.load(args.rubric)
@@ -366,6 +370,7 @@ def main():
         ]
         items = [EvalItem(**x) for x in fallback]
 
+    # Build and score
     report = evaluate_set(
         rubric=rubric,
         items=items,
@@ -385,6 +390,40 @@ def main():
         w.writeheader()
         for r in report["all_records"]:
             w.writerow(r)
+
+    # NEW: optional audit jsonl for calibration runs (reuse judge.audit_judge_calls)
+    if args.audit_jsonl:
+        from datetime import datetime
+        run_id = f"judge_eval_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}"
+        audit_path = os.path.join(logs_dir, "judge_eval_calls.jsonl")
+        try:
+            # Re-score in chunks to capture inputs+outputs with shared helper
+            from judge import audit_judge_calls
+            # Recreate the flat batch used inside evaluate_set
+            flat_inputs: List[Dict[str, str]] = []
+            rng = random.Random(1337)
+            for it in items:
+                seeds = [rng.randint(0, 1_000_000) for _ in range(args.seeds)]
+                perts = make_perturbations(it, seeds)
+                flat_inputs.append({"context": it.context, "role": it.role, "candidate": it.candidate})
+                for p in perts:
+                    flat_inputs.append({"context": p.context, "role": p.role, "candidate": p.candidate})
+
+            # Score again (deterministic judge) to align lengths safely
+            scores = score_batch(flat_inputs, rubric)
+            CHUNK = 256
+            for i in range(0, len(flat_inputs), CHUNK):
+                audit_judge_calls(
+                    run_id=run_id,
+                    round_num=-1,       # not a sim round; mark as -1
+                    phase="EVAL",
+                    agent="__eval__",
+                    items=flat_inputs[i:i+CHUNK],
+                    results=scores[i:i+CHUNK],
+                    jsonl_path=audit_path,
+                )
+        except Exception as e:
+            print("[judge_eval] audit_jsonl failed:", e)
 
     # Console summary
     s = report["summary"]

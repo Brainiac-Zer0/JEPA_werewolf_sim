@@ -1,264 +1,269 @@
-# speaker_llm.py
-# Trainable LLM mouthpiece via logit-bias steering.
-# - LogitBiasHead(z, role_bit, hist_feats) -> weights over a small set of speech-act categories
-# - BiasLexicon maps categories -> token id sets (built from tokenizer + seed words)
-# - JudgeRewardBiasProcessor adds a sparse bias vector to next-token logits each step
-# - Use with generate(..., logits_processor=processor_list)
-#
-# Notes:
-# * This is lightweight and safe: we DO NOT modify the LLM weights.
-# * Learning: you can do REINFORCE on the head using judge rewards (we’ll wire in train.py next).
-# * If you already use template SpeakerBandit, enable this instead with LLM_SPEAKER=1 (one mouthpiece at a time).
-
+# speaker.py
+# Deterministic, mask-aware template speaker with logging + REINFORCE.
 from __future__ import annotations
-import os
+import os, json, math, random, hashlib
 from dataclasses import dataclass
-from typing import Dict, List, Iterable, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple
 
 import torch, yaml
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import LogitsProcessor, LogitsProcessorList, PreTrainedTokenizerBase
 
-# Reuse history features from the template speaker (short, stable)
-try:
-    from speaker import make_hist_feats
-except Exception:
-    # Fallback if speaker.py isn't available yet
-    def make_hist_feats(recent_texts: List[str]) -> torch.Tensor:
-        if not recent_texts:
-            return torch.tensor([0.0, 0.0])
-        n = len(recent_texts)
-        acc = sum(int(("accuse" in t.lower()) or ("vote" in t.lower())) for t in recent_texts) / n
-        mean_len = min(1.5, sum(len(t) for t in recent_texts) / max(1, n) / 100.0)
-        return torch.tensor([acc, mean_len], dtype=torch.float32)
-
-# ───────────── config (env-overrideable) ─────────────
-# ── Load config
+# ── Config
 with open("config.yaml", "r") as f:
-    CFG = yaml.safe_load(f)
+    CFG = yaml.safe_load(f) or {}
 
-# Config values
-BIAS_CAP: float = float(CFG.get("BIAS_CAP", 2.0))   # max |bias| per token logit
-BASE_STRENGTH: float = float(CFG.get("BASE_STRENGTH", 1.0))
-DEBUG: bool = bool(CFG.get("DEBUG", False))
+SPEAKER_SEED: Optional[int] = CFG.get("SPEAKER_SEED", None)
+SPEAKER_DEBUG: bool = bool(CFG.get("SPEAKER_DEBUG", False))
+SPEAKER_LOG_DIR: str = CFG.get("SPEAKER_LOG_DIR", "logs")
+SPEAKER_TEMP: float = float(CFG.get("SPEAKER_TEMP", 1.0))
+SPEAKER_EPS: float = float(CFG.get("SPEAKER_EPS", 0.05))       # ε-greedy on top of softmax
+SPEAKER_HIST_K: int = int(CFG.get("SPEAKER_HIST_K", 3))        # recent lines to featurize
+SPEAKER_ENTROPY_BONUS: float = float(CFG.get("SPEAKER_ENTROPY_BONUS", 0.01))
+SPEAKER_LR: float = float(CFG.get("SPEAKER_LR", 1e-3))
 
-# Seed lexicon for categories (can be extended per game)
-DEFAULT_LEXICON = CFG.get("DEFAULT_LEXICON", {
-    "accuse":   ["accuse", "suspicious", "suspect", "lying", "deceive", "eliminate", "vote"],
-    "defend":   ["defend", "innocent", "trust", "ally", "support", "clear"],
-    "hedge":    ["maybe", "perhaps", "uncertain", "unsure", "might", "seems", "appears"],
-    "question": ["why", "how", "what", "who", "where", "when", "?"],
-    "vote":     ["vote", "eliminate", "banish", "target", "lynch"],
-})
+# ── Stable, shared historical features (also imported by speaker_llm.py)
+def make_hist_feats(recent_texts: List[str]) -> torch.Tensor:
+    """
+    Short, stable features from last K messages:
+      [accuse_rate, mean_len_100]
+    """
+    if not recent_texts:
+        return torch.tensor([0.0, 0.0], dtype=torch.float32)
+    n = len(recent_texts)
+    accuse_like = ("accuse", "suspect", "vote", "eliminate", "target", "lynch")
+    acc = sum(any(w in t.lower() for w in accuse_like) for t in recent_texts) / max(1, n)
+    mean_len = sum(len(t) for t in recent_texts) / max(1, n)
+    return torch.tensor([acc, min(1.5, mean_len / 100.0)], dtype=torch.float32)
 
-CAT_ORDER = CFG.get("CAT_ORDER", ["accuse", "defend", "hedge", "question", "vote"])
+# ── Default templates (can be overridden in config)
+DEFAULT_TEMPLATES: List[str] = CFG.get("DEFAULT_TEMPLATES", [
+    "Accuse {target}",
+    "Defend {ally}",
+    "Ask {target} a question",
+    "Express uncertainty",
+    "Propose vote on {target}",
+])
 
+# Optional explicit mapping to coarse categories (helps logging/analytics)
+TEMPLATE_CATS: List[str] = CFG.get("TEMPLATE_CATS", [
+    "accuse", "defend", "question", "hedge", "vote"
+])
 
-# ───────────── utils ─────────────
 def _role_to_bit(role: Optional[str]) -> float:
     r = (role or "").lower()
-    return 1.0 if r.startswith("were") else 0.0  # 1=werewolf, 0=villager/worker
+    return 1.0 if r.startswith("were") else 0.0  # 1 = werewolf, 0 = villager/worker
 
-
-def _words_to_token_ids(tok: PreTrainedTokenizerBase, words: Iterable[str]) -> List[int]:
-    ids: List[int] = []
-    for w in words:
-        # Take the first non-special token id of the wordpiece sequence as a proxy
-        enc = tok.encode(w, add_special_tokens=False)
-        if enc:
-            ids.append(enc[0])
-    # Deduplicate and drop pad/eos if present
-    ids = list({i for i in ids if i not in (getattr(tok, "pad_token_id", None), getattr(tok, "eos_token_id", None))})
-    return ids
-
-
-@dataclass
-class BiasLexicon:
-    by_cat: Dict[str, List[int]]
-
-    @classmethod
-    def build(cls, tok: PreTrainedTokenizerBase, lexicon: Dict[str, List[str]]) -> "BiasLexicon":
-        by_cat = {k: _words_to_token_ids(tok, v) for k, v in lexicon.items()}
-        return cls(by_cat=by_cat)
-
-
-# ───────────── model: logit-bias head ─────────────
-class LogitBiasHead(nn.Module):
+def _rng_for_agent(agent_name: str, fallback_seed: Optional[int]) -> random.Random:
     """
-    Tiny MLP that maps context features → category weights.
-    Inputs: [ z_t (d) , role_bit (1) , hist_feats (2) ] → R^{|CAT_ORDER|}
-    Output is in [-1, 1] via tanh; caller scales to bias magnitude.
+    Per-agent reproducible RNG: hash(agent_name) mixed with SPEAKER_SEED.
+    Ensures: same config + same roster ⇒ same speaker choices.
     """
-    def __init__(self, latent_dim: int, hidden: int = 256, num_cats: int = len(CAT_ORDER)):
+    base = 0 if fallback_seed is None else int(fallback_seed)
+    h = int(hashlib.sha256(agent_name.encode("utf-8")).hexdigest(), 16) & 0xFFFFFFFF
+    return random.Random((base ^ h) & 0xFFFFFFFF)
+
+def _safe_choice(rng: random.Random, seq: List[str]) -> Optional[str]:
+    if not seq:
+        return None
+    return seq[rng.randrange(len(seq))]
+
+def _mask_targets(candidate_targets: List[str], self_name: str, alive_names: Optional[List[str]]) -> List[str]:
+    alive = set(alive_names) if alive_names else set(candidate_targets)
+    return [t for t in candidate_targets if t in alive and t != self_name]
+
+def _softmax_sample(rng: random.Random, logits: torch.Tensor, eps: float = 0.0, temp: float = 1.0) -> int:
+    if logits.numel() == 1:
+        return 0
+    x = logits / max(1e-6, float(temp))
+    probs = torch.softmax(x, dim=-1)
+    if rng.random() < eps:
+        return rng.randrange(len(probs))
+    # Gumbel trick with external RNG for determinism
+    u = torch.tensor([max(1e-9, min(1.0-1e-9, rng.random())) for _ in range(len(probs))], dtype=probs.dtype)
+    g = -torch.log(-torch.log(u))
+    return int(torch.argmax(torch.log(probs + 1e-9) + g).item())
+
+def _fill_template(
+    tmpl: str,
+    *,
+    rng: random.Random,
+    self_name: str,
+    candidate_targets: List[str],
+    alive_names: Optional[List[str]] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    """Fill placeholders conservatively; never select self; prefer alive targets."""
+    targets = _mask_targets(candidate_targets, self_name, alive_names)
+    ally = _safe_choice(rng, targets) or _safe_choice(rng, candidate_targets) or self_name
+    target = _safe_choice(rng, targets) or ally
+
+    text = tmpl
+    text = text.replace("{self}", self_name)
+    text = text.replace("{target}", target if target else self_name)
+    text = text.replace("{ally}", ally if ally else self_name)
+    return text, {"target": target, "ally": ally}
+
+# ───────────────────────── SpeakerBandit ─────────────────────────
+
+class SpeakerBandit(nn.Module):
+    """
+    Tiny template selector conditioned on z, role_bit and short history features.
+    - Deterministic per-agent RNG
+    - Returns (text, meta) where meta holds tensors your train loop expects
+    - learn_step: simple REINFORCE over template logits using judge rewards
+    """
+    def __init__(self, latent_dim: int, num_templates: int, hidden: int = 128):
         super().__init__()
+        self.latent_dim = int(latent_dim)
+        self.num_templates = int(num_templates)
         self.net = nn.Sequential(
             nn.Linear(latent_dim + 1 + 2, hidden),
             nn.Tanh(),
-            nn.Linear(hidden, num_cats),
-            nn.Tanh(),  # keep bounded
+            nn.Linear(hidden, num_templates)
         )
+        self.temperature: float = SPEAKER_TEMP
 
     def forward(self, z_t: torch.Tensor, role_bit: torch.Tensor, hist_feats: torch.Tensor) -> torch.Tensor:
         x = torch.cat([z_t, role_bit, hist_feats], dim=-1)
-        return self.net(x)  # [-1,1] per category
+        return self.net(x)  # unnormalized logits over templates
 
     @torch.no_grad()
-    def predict_weights(
-        self, z_t: torch.Tensor, role: Optional[str], recent_texts: List[str]
-    ) -> Dict[str, float]:
+    def generate(
+        self,
+        *,
+        z_t: torch.Tensor,
+        role: Optional[str],
+        recent_texts: List[str],
+        templates: List[str],
+        candidate_targets: List[str],
+        self_name: str,
+        persona_effects: Optional[Dict[str, float]] = None,
+        alive_names: Optional[List[str]] = None,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """
+        Returns:
+          text: filled utterance
+          meta: {
+             "template_id": int,
+             "role_bit": Tensor[1],
+             "hist_feats": Tensor[2],
+             "choice_probs": Tensor[num_templates],
+             "temperature": float,
+             "eps": float,
+             "persona_effects": dict,
+             "cat": str,
+          }
+        """
+        device = next(self.parameters()).device
         if z_t.dim() == 1:
             z_t = z_t.unsqueeze(0)
-        device = next(self.parameters()).device
         z_t = z_t.to(device)
-        role_bit = torch.tensor([[ _role_to_bit(role) ]], dtype=z_t.dtype, device=device)
-        hist_feats = make_hist_feats(recent_texts).to(device).unsqueeze(0)
-        w = self.forward(z_t, role_bit, hist_feats).squeeze(0)  # [C]
-        return {cat: float(w[i].item()) for i, cat in enumerate(CAT_ORDER)}
 
+        rb = torch.tensor([[ _role_to_bit(role) ]], dtype=z_t.dtype, device=device)         # [1,1]
+        h  = make_hist_feats(recent_texts).to(device).unsqueeze(0)                           # [1,2]
 
-# ───────────── logits processor ─────────────
-class JudgeRewardBiasProcessor(LogitsProcessor):
-    """
-    Adds a sparse bias to token logits each step, based on category weights from LogitBiasHead.
-    bias_map: dict[token_id] -> float (already scaled/clipped)
-    """
-    def __init__(self, bias_map: Dict[int, float], cap: float = BIAS_CAP):
-        self.bias_map = bias_map
-        self.cap = float(cap)
+        logits = self.forward(z_t, rb, h).squeeze(0)                                         # [T]
+        temp = max(0.2, float(self.temperature))
+        eps  = max(0.0, min(0.5, SPEAKER_EPS))
 
-    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-        if not self.bias_map:
-            return scores
-        # scores: [batch, vocab]; we operate per batch item with the same sparse bias
-        with torch.no_grad():
-            for tid, b in self.bias_map.items():
-                if 0 <= tid < scores.size(-1):
-                    scores[:, tid] += torch.tensor(max(-self.cap, min(self.cap, b)), device=scores.device)
-        return scores
+        # Persona nudges (subtle; keeps behavior stable)
+        bias = 0.0
+        if persona_effects:
+            bias = float(persona_effects.get("accuse_bias", 0.0))  # in [-0.2, +0.2]
+        # If we know categories, add a tiny bias to the matching template ids
+        if TEMPLATE_CATS and len(TEMPLATE_CATS) == len(templates):
+            for i, cat in enumerate(TEMPLATE_CATS):
+                if cat == "accuse":
+                    logits[i] = logits[i] + bias
 
+        rng = _rng_for_agent(self_name, SPEAKER_SEED)
+        idx = _softmax_sample(rng, logits, eps=eps, temp=temp)
 
-# ───────────── glue: build bias map for a single decision ─────────────
-def build_bias_processor(
-    tokenizer: PreTrainedTokenizerBase,
-    head: LogitBiasHead,
-    *,
-    z_t: torch.Tensor,
-    role: Optional[str],
-    recent_texts: List[str],
-    lexicon: Dict[str, List[str]] = DEFAULT_LEXICON,
-    strength: float = BASE_STRENGTH,
-    persona_scale: Optional[float] = None,
-) -> Tuple[LogitsProcessorList, Dict[str, float]]:
-    """
-    Compute a sparse bias map from head weights and lexicon, and return a LogitsProcessorList.
-    Returns (processor_list, weights_by_category).
-    """
-    # 1) category weights from head
-    w = head.predict_weights(z_t=z_t, role=role, recent_texts=recent_texts)  # [-1,1]
-    if persona_scale is not None:
-        strength = float(strength) * float(persona_scale)
+        # fill the chosen template
+        tmpl = templates[idx] if 0 <= idx < len(templates) else templates[0]
+        text, fill_meta = _fill_template(
+            tmpl, rng=rng, self_name=self_name,
+            candidate_targets=candidate_targets, alive_names=alive_names
+        )
 
-    # 2) tokenize seeds -> token id sets
-    lex = BiasLexicon.build(tokenizer, lexicon)
+        probs = torch.softmax(logits / temp, dim=-1)
 
-    # 3) aggregate: token_bias = strength * sum_c( w_c * 1_{token in cat c} / |cat_c| )
-    token_bias: Dict[int, float] = {}
-    for cat, tok_ids in lex.by_cat.items():
-        if not tok_ids:
-            continue
-        w_c = float(w.get(cat, 0.0))
-        if abs(w_c) < 1e-6:
-            continue
-        per_token = (strength * w_c) / float(len(tok_ids))
-        for tid in tok_ids:
-            token_bias[tid] = token_bias.get(tid, 0.0) + per_token
+        cat = TEMPLATE_CATS[idx] if 0 <= idx < len(TEMPLATE_CATS) else "other"
+        meta = {
+            "template_id": int(idx),
+            "role_bit": rb.squeeze(0).detach().cpu(),     # Tensor[1]
+            "hist_feats": h.squeeze(0).detach().cpu(),    # Tensor[2]
+            "choice_probs": probs.detach().cpu(),         # Tensor[T]
+            "temperature": temp,
+            "eps": eps,
+            "persona_effects": dict(persona_effects or {}),
+            "cat": cat,
+            **fill_meta
+        }
 
-    if DEBUG:
-        top = sorted(token_bias.items(), key=lambda kv: abs(kv[1]), reverse=True)[:10]
-        print(f"[LLM-SPK] bias strength={strength:.2f} cats={w} top_ids={top}")
+        if SPEAKER_DEBUG:
+            try:
+                os.makedirs(SPEAKER_LOG_DIR, exist_ok=True)
+                with open(os.path.join(SPEAKER_LOG_DIR, "speaker_decisions.jsonl"), "a", encoding="utf-8") as f:
+                    row = {
+                        "agent": self_name,
+                        "role": role,
+                        "template": tmpl,
+                        "filled": text,
+                        "cat": cat,
+                        "target": fill_meta.get("target"),
+                        "ally": fill_meta.get("ally"),
+                        "temp": temp,
+                        "eps": eps,
+                        "probs": [float(x) for x in probs.tolist()],
+                    }
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            except Exception as e:
+                print("[SPEAKER-DBG] log write failed:", e)
 
-    processor = LogitsProcessorList([JudgeRewardBiasProcessor(token_bias, cap=BIAS_CAP)])
-    return processor, w
+        return text, meta
 
-
-# ───────────── convenience wrapper for generation ─────────────
-@torch.no_grad()
-def with_logit_bias_generate_kwargs(
-    tokenizer: PreTrainedTokenizerBase,
-    head: LogitBiasHead,
-    *,
-    z_t: torch.Tensor,
-    role: Optional[str],
-    recent_texts: List[str],
-    persona_effects: Optional[Dict[str, float]] = None,
-    lexicon: Dict[str, List[str]] = DEFAULT_LEXICON,
-    base_strength: float = BASE_STRENGTH,
-) -> Dict:
-    """
-    Build kwargs to pass into model.generate(...). Merge this with your usual generation kwargs.
-    Example:
-        proc_kwargs = with_logit_bias_generate_kwargs(tok, head, z_t=z, role=agent.role, recent_texts=recent)
-        out = model.generate(input_ids=..., **proc_kwargs, **your_other_kwargs)
-    """
-    scale = float(persona_effects.get("logit_bias_scale", 1.0)) if persona_effects else 1.0
-    processors, _ = build_bias_processor(
-        tokenizer, head, z_t=z_t, role=role, recent_texts=recent_texts,
-        lexicon=lexicon, strength=base_strength, persona_scale=scale,
-    )
-    return {"logits_processor": processors}
-
-
-# ───────────── simple REINFORCE learner (optional) ─────────────
-class BiasHeadLearner:
-    """
-    Optional helper to update the LogitBiasHead with REINFORCE-style updates
-    using a pseudo-logprob signal derived from category activations.
-    This is a heuristic; for rigorous credit assignment you'd capture token logprobs
-    and importance weights. Good enough for first experiments.
-    """
-    def __init__(self, head: LogitBiasHead, lr: float = 1e-3, entropy_bonus: float = 0.005):
-        self.head = head
-        self.opt = torch.optim.Adam(head.parameters(), lr=lr)
-        self.entropy_bonus = float(entropy_bonus)
-
-    def step(
+    def learn_step(
         self,
-        batch: List[Dict[str, torch.Tensor]],
+        batch: List[Dict[str, Any]],
+        opt: Optional[torch.optim.Optimizer] = None,
+        *,
+        entropy_bonus: float = SPEAKER_ENTROPY_BONUS,
         baseline: float = 0.0,
     ) -> Dict[str, float]:
         """
-        batch items need:
-          {
-            "z": Tensor[d],
-            "role_bit": Tensor[1],
-            "hist_feats": Tensor[2],
-            "reward": float,
-          }
+        batch[i]:
+        {
+          "z": Tensor[d],
+          "role_bit": Tensor[1],
+          "hist_feats": Tensor[2],
+          "template_id": int,
+          "reward": float,
+        }
         """
         if not batch:
-            return {"loss": 0.0, "ent": 0.0, "R_mean": 0.0}
-        device = next(self.head.parameters()).device
+            return {"loss": 0.0, "entropy": 0.0, "R_mean": 0.0}
 
-        zs         = torch.stack([b["z"] for b in batch]).to(device)
-        role_bits  = torch.stack([b["role_bit"] for b in batch]).to(device)
-        hfs        = torch.stack([b["hist_feats"] for b in batch]).to(device)
-        rewards    = torch.tensor([float(b["reward"]) for b in batch], device=device)
+        device = next(self.parameters()).device
+        zs   = torch.stack([b["z"] for b in batch]).to(device)                              # [B,d]
+        rbit = torch.stack([b["role_bit"] for b in batch]).to(device)                       # [B,1]
+        hfs  = torch.stack([b["hist_feats"] for b in batch]).to(device)                     # [B,2]
+        acts = torch.tensor([int(b["template_id"]) for b in batch], device=device)          # [B]
+        R    = torch.tensor([float(b["reward"]) for b in batch], device=device)             # [B]
 
-        # forward: bounded activations in [-1,1]
-        w = self.head(zs, role_bits, hfs)  # [B, C]
-        # Proxy categorical over "positive/negative activation" magnitude
-        probs = torch.softmax(torch.abs(w), dim=-1)  # [B, C]
-        ent = -(probs * torch.log(probs + 1e-8)).sum(dim=-1).mean()
+        logits = self.forward(zs, rbit, hfs)                                                # [B,T]
+        logp = F.log_softmax(logits, dim=-1).gather(1, acts.view(-1,1)).squeeze(1)          # [B]
+        ent = -(F.softmax(logits, dim=-1) * F.log_softmax(logits, dim=-1)).sum(dim=-1).mean()
 
-        # Surrogate policy gradient: encourage larger magnitude where reward is positive (and vice versa)
-        # Note: we detach rewards to avoid leaking gradients
-        loss_pg = - (rewards - baseline).unsqueeze(1) * torch.log(probs + 1e-8)
-        loss = loss_pg.mean() - self.entropy_bonus * ent
+        # REINFORCE objective
+        loss = -( (R - baseline) * logp ).mean() - float(entropy_bonus) * ent
 
-        self.opt.zero_grad()
+        if opt is None:
+            opt = torch.optim.Adam(self.parameters(), lr=SPEAKER_LR)
+
+        opt.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.head.parameters(), 1.0)
-        self.opt.step()
+        torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
+        opt.step()
 
-        return {"loss": float(loss.item()), "ent": float(ent.item()), "R_mean": float(rewards.mean().item())}
+        return {"loss": float(loss.item()), "entropy": float(ent.item()), "R_mean": float(R.mean().item())}
