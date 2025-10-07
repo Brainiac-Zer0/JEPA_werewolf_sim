@@ -38,7 +38,12 @@ except Exception:
 
 from world import resolve_votes, eliminate_player
 from training_utils import load_role_models
-from encoders import MessageEncoder  # shared instance
+# NEW: bring in SocialInfluence (falls back cleanly if not present yet)
+try:
+    from encoders import MessageEncoder, SocialInfluence  # shared instance + social coupling
+except Exception:
+    from encoders import MessageEncoder
+    SocialInfluence = None  # will skip δ_social if encoders.py not patched yet
 
 # Judge imports
 from judge import JudgeRubric, score_batch
@@ -112,6 +117,31 @@ def append_csv_rows(path: str, rows: list[dict]):
             w.writeheader()
         for r in rows:
             w.writerow(r)
+
+# NEW: uniform event logger (adds phase_code + numeric payloads)
+def emit_event(rows, *, run_id, round_num, phase_code, phase_str, agent, role,
+               choice_type, payload_idx, mask_names=None, judge=None,
+               dz=None, speaker_mode="", persona_norm=0.0):
+    rows.append({
+        "run_id": run_id,
+        "round": round_num,
+        "phase": phase_str,
+        "phase_code": phase_code,                         # NEW
+        "agent": agent,
+        "role": role,
+        "choice_type": choice_type,
+        "choice_payload": payload_idx,                    # numeric id (cat_id or agent_idx)
+        "mask_size": (len(mask_names) if mask_names is not None else ""),
+        "judge_score": "" if not judge else f"{judge.get('score', 0):.4f}",
+        "coh": "" if not judge else f"{judge.get('coherence', 0):.4f}",
+        "truth": "" if not judge else f"{judge.get('truthfulness', 0):.4f}",
+        "role_score": "" if not judge else f"{judge.get('role_alignment', 0):.4f}",
+        "safety": "" if not judge else f"{judge.get('social_safety', 0):.4f}",
+        "dz_l2": "" if not dz else f"{dz.get('l2',0):.6f}",
+        "dz_1mcos": "" if not dz else f"{dz.get('1mcos',0):.6f}",
+        "speaker_mode": speaker_mode,
+        "persona_norm": persona_norm,
+    })
 
 # ╭────────────────────────── UI HELPERS ───────────────────────────╮
 def _wrap(text: str, fnt: pygame.font.Font, width: int) -> list[str]:
@@ -233,6 +263,14 @@ def simulate_game(visual: bool = True):
     for ag in agents:
         ag.message_encoder = shared_msg_encoder
 
+    # NEW: instantiate social influence (if module available)
+    social = None
+    if SocialInfluence is not None and hasattr(shared_msg_encoder, "output_dim"):
+        try:
+            social = SocialInfluence(text_dim=shared_msg_encoder.output_dim)
+        except Exception:
+            social = None  # fail-safe: proceed without δ_social
+
     # Attach JEPA sub-modules
     for ag in agents:
         wm, ae, planner = load_role_models(ag.role)
@@ -282,22 +320,18 @@ def simulate_game(visual: bool = True):
                 if visual:
                     msg_log.append((ag.name, msg))
 
-                # NEW: log TALK row (phase-aware)
+                # NEW: log TALK row (phase-aware + numeric payload)
                 phase_log.append({"round": round_num, "phase": "DAY_DISCUSS"})
-                metrics_rows.append({
-                    "run_id": run_id,
-                    "round": round_num,
-                    "phase": "DAY_DISCUSS",
-                    "agent": ag.name,
-                    "role": ag.role,
-                    "choice_type": "TALK_INTENT",
-                    "choice_payload": getattr(ag, "talk_category_last", "") or "",
-                    "mask_size": "",
-                    "judge_score": "", "coh": "", "truth": "", "role_score": "", "safety": "",
-                    "dz_l2": "", "dz_1mcos": "",
-                    "speaker_mode": getattr(ag, "speaker_mode", "") or "",
-                    "persona_norm": getattr(ag, "persona_norm", 0.0),
-                })
+                emit_event(
+                    metrics_rows,
+                    run_id=run_id, round_num=round_num,
+                    phase_code=0, phase_str="DAY_DISCUSS",
+                    agent=ag.name, role=ag.role,
+                    choice_type="TALK_INTENT",
+                    payload_idx=int(getattr(ag, "talk_category_last", -1)),
+                    speaker_mode=getattr(ag, "speaker_mode", "") or "",
+                    persona_norm=getattr(ag, "persona_norm", 0.0),
+                )
 
             if visual:
                 draw_agents(agents)
@@ -307,12 +341,26 @@ def simulate_game(visual: bool = True):
                         pygame.quit()
                         sys.exit()
 
-        # ─── PRE-ACT: (z_t cache), LLM Judge over planner top-k, final vote choice ───
+        # ─── PRE-ACT: (z_t cache), social coupling, LLM Judge over planner top-k, final vote choice ───
         pending: Dict[str, Tuple[torch.Tensor, torch.Tensor, str]] = {}
         vote_map: Dict[BaseAgent, BaseAgent] = {}
 
         # First compute z_t for all living
         z_map: Dict[BaseAgent, torch.Tensor] = {ag: ag.encode_current_belief(round_num, agents) for ag in living}
+
+        # NEW: Apply language→state coupling once per agent (between Discuss and Vote)
+        if social is not None:
+            for ag in living:
+                # collect recent neighbor utterances (exclude self)
+                neighbors = [(n, m) for (n, m) in list(ag.message_memory)[-6:]
+                             if n != ag.name and m and m.strip()]
+                if not neighbors:
+                    continue
+                texts = [m for (_n, m) in neighbors]
+                with torch.no_grad():
+                    t_embed = shared_msg_encoder(texts).mean(dim=0)   # (D_text,)
+                    delta = social(t_embed)                           # (LATENT_DIM,)
+                    z_map[ag] = (z_map[ag] + delta).detach()
 
         for ag in living:
             z_t = z_map[ag]
@@ -363,25 +411,25 @@ def simulate_game(visual: bool = True):
             if visual:
                 msg_log.append(("Judge", log_line))
 
-            # NEW: append VOTE row (Δz filled post-act)
-            metrics_rows.append({
-                "run_id": run_id,
-                "round": round_num,
-                "phase": "DAY_VOTE",
-                "agent": ag.name,
-                "role": ag.role,
-                "choice_type": "VOTE_TARGET",
-                "choice_payload": target.name if target else "",
-                "mask_size": len(alive_names),
-                "judge_score": f"{s:.4f}",
-                "coh": f"{subs.get('coherence',0.0):.4f}",
-                "truth": f"{subs.get('truthfulness',0.0):.4f}",
-                "role_score": f"{subs.get('role_alignment',0.0):.4f}",
-                "safety": f"{subs.get('social_safety',0.0):.4f}",
-                "dz_l2": "", "dz_1mcos": "",
-                "speaker_mode": getattr(ag, "speaker_mode", "") or "",
-                "persona_norm": getattr(ag, "persona_norm", 0.0),
-            })
+            # NEW: append VOTE row (Δz filled post-act) with numeric payload + phase_code
+            emit_event(
+                metrics_rows,
+                run_id=run_id, round_num=round_num,
+                phase_code=1, phase_str="DAY_VOTE",
+                agent=ag.name, role=ag.role,
+                choice_type="VOTE_TARGET",
+                payload_idx=int(target.name.split("_")[1]) if target else -1,
+                mask_names=alive_names,
+                judge={
+                    "score": s,
+                    "coherence": subs.get("coherence", 0.0),
+                    "truthfulness": subs.get("truthfulness", 0.0),
+                    "role_alignment": subs.get("role_alignment", 0.0),
+                    "social_safety": subs.get("social_safety", 0.0),
+                },
+                speaker_mode=getattr(ag, "speaker_mode", "") or "",
+                persona_norm=getattr(ag, "persona_norm", 0.0),
+            )
 
         if vote_map:
             print("✉ Votes (judge-selected):", ", ".join(f"{k.name}->{v.name}" for k, v in vote_map.items()))
@@ -414,21 +462,18 @@ def simulate_game(visual: bool = True):
                 print(f"🌙 Night kill: {victim.name}")
                 if visual:
                     msg_log.append(("Night", f"{victim.name} slain."))
-                # NEW: append KILL row
-                metrics_rows.append({
-                    "run_id": run_id,
-                    "round": round_num,
-                    "phase": "NIGHT_KILL",
-                    "agent": wolf.name,
-                    "role": wolf.role,
-                    "choice_type": "KILL_TARGET",
-                    "choice_payload": victim.name,
-                    "mask_size": len(legal_targets),
-                    "judge_score": "", "coh": "", "truth": "", "role_score": "", "safety": "",
-                    "dz_l2": "", "dz_1mcos": "",
-                    "speaker_mode": getattr(wolf, "speaker_mode", "") or "",
-                    "persona_norm": getattr(wolf, "persona_norm", 0.0),
-                })
+                # NEW: append KILL row with numeric payload + phase_code
+                emit_event(
+                    metrics_rows,
+                    run_id=run_id, round_num=round_num,
+                    phase_code=2, phase_str="NIGHT_KILL",
+                    agent=wolf.name, role=wolf.role,
+                    choice_type="KILL_TARGET",
+                    payload_idx=int(victim.name.split("_")[1]),
+                    mask_names=legal_targets,
+                    speaker_mode=getattr(wolf, "speaker_mode", "") or "",
+                    persona_norm=getattr(wolf, "persona_norm", 0.0),
+                )
 
         # ─── POST-ACT: re-encode to get z_{t+1} and append rollouts ───
         z_deltas = []

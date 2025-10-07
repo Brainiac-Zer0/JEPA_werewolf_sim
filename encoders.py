@@ -72,6 +72,31 @@ class MessageEncoder(nn.Module):
         return (token_embeddings * input_mask_expanded).sum(1) / denom  # (B,D)
 
 # ───────────────────────────────────────────────────────────────────────────────
+# Social influence: text → bounded latent delta  (NEW)
+# ───────────────────────────────────────────────────────────────────────────────
+class SocialInfluence(nn.Module):
+    """
+    Projects a mean-pooled neighbor text embedding into a bounded latent delta δ_social.
+    Accepts (D_text,) or (B, D_text) and returns (LATENT_DIM,) or (B, LATENT_DIM).
+    Uses tanh(+scale) to keep coupling stable.
+    """
+    def __init__(self, text_dim: int, latent_dim: int = LATENT_DIM, hidden: int = 64, scale: float = 0.2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(text_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, latent_dim)
+        )
+        self.scale = float(scale)
+
+    def forward(self, mean_text_embed: torch.Tensor) -> torch.Tensor:
+        x = mean_text_embed
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        delta = self.net(x)
+        delta = torch.tanh(delta) * self.scale
+        return delta.squeeze(0) if delta.size(0) == 1 else delta
+
+# ───────────────────────────────────────────────────────────────────────────────
 # Latent/state encoders & world model (unchanged APIs for compatibility)
 # ───────────────────────────────────────────────────────────────────────────────
 class MLPBeliefEncoder(nn.Module):
@@ -139,8 +164,11 @@ class TalkHead(nn.Module):
             nn.Tanh(),
             nn.Linear(64, num_cats)
         )
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        return self.net(z)
+    def forward(self, z: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        logits = self.net(z)
+        if mask is not None:
+            logits = logits.masked_fill(~mask, float("-inf"))
+        return logits
 
 class VoteHead(nn.Module):
     """Logits over agent indices (mask self/dead outside before softmax)."""
@@ -151,8 +179,11 @@ class VoteHead(nn.Module):
             nn.Tanh(),
             nn.Linear(64, num_agents)
         )
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        return self.net(z)
+    def forward(self, z: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        logits = self.net(z)
+        if mask is not None:
+            logits = logits.masked_fill(~mask, float("-inf"))
+        return logits
 
 class KillHead(VoteHead):
     """Identical shape to VoteHead; semantics differ (wolves only)."""

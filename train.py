@@ -6,6 +6,7 @@
 #   • Per-epoch CSV logging: logs/metrics_train.csv (MSE/BC/|grad|/lr/role/epoch)
 #   • Integrity summary JSON: logs/<RUN_ID>/run_summary.json
 #   • Console integrity print: rollout counts + Δz stats per role
+#   • (NEW, minimal) Accept both legacy (index-action) and phase-aware rollout schemas
 # -----------------------------------------------------------------------------
 
 import os
@@ -47,6 +48,10 @@ Path(LOGS_DIR).mkdir(parents=True, exist_ok=True)
 # ── Toggles and judge config
 SPEAKER_ENABLED: bool = bool(CFG.get("SPEAKER_ENABLED", False))
 JUDGE_RUBRIC_PATH: str = str(CFG.get("JUDGE_RUBRIC_PATH", "judge_rubric.yaml"))
+
+# (NEW) Future-proof toggles (kept no-op here to avoid behavior change)
+PHASE_AWARE_JEPA: bool = bool(CFG.get("PHASE_AWARE_JEPA", False))
+TRAIN_PHASE_HEADS: bool = bool(CFG.get("TRAIN_PHASE_HEADS", False))
 
 # ── Seed / determinism
 RUN_SEED: int = int(CFG.get("RUN_SEED", 1337))
@@ -109,7 +114,7 @@ def _train_speakers_from_agents(agents: List[Any], rubric: JudgeRubric) -> None:
         ag.msg_buffer.clear()
         print(f"[SPEAKER] {ag.name} loss={stats['loss']:.4f} ent={stats['entropy']:.3f} R={stats['R_mean']:.3f}")
 
-# ─────────────────────────────── rollout collection (unchanged API)
+# ─────────────────────────────── rollout collection (schema-aware, minimal change)
 def collect_rollouts_for_role(
     role: str,
     n_games: int,
@@ -118,6 +123,10 @@ def collect_rollouts_for_role(
     """
     Run `n_games` simulations and grab only the rollout tuples whose *actor*
     has `role == role`. If the simulator returns agents in meta, also trains speakers.
+
+    Supports both schemas:
+      • legacy: (z_t, a_idx, z_next, role)
+      • phase:  (z_t, phase_code, payload_idx, z_next, role)
     """
     all_rollouts: list = []
 
@@ -134,26 +143,74 @@ def collect_rollouts_for_role(
             if agents:
                 _train_speakers_from_agents(agents, rubric)
 
-        all_rollouts.extend(r for r in rollouts if r[3] == role)
+        # Keep both formats, filter by role robustly
+        for r in rollouts:
+            try:
+                if len(r) == 4:
+                    if r[3] == role:
+                        all_rollouts.append(r)
+                elif len(r) == 5:
+                    if r[4] == role:
+                        all_rollouts.append(r)
+                # else ignore malformed rows silently
+            except Exception:
+                continue
 
     return all_rollouts
 
-# ─────────────────────────────── integrity helpers
+# ─────────────────────────────── integrity helpers (schema-aware)
 def _delta_stats(rollouts: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]]) -> dict:
     if not rollouts:
         return {"count": 0, "mean_L2": 0.0, "mean_1mcos": 0.0}
     import torch.nn.functional as F
     l2s, one_minus_cos = [], []
-    for z_t, _a, z_next, _role in rollouts:
+    for r in rollouts:
+        # legacy: (z_t, a_idx, z_next, role) ; phase: (z_t, phase, payload, z_next, role)
+        if len(r) == 4:
+            z_t, _a, z_next, _role = r
+        elif len(r) == 5:
+            z_t, _ph, _pay, z_next, _role = r
+        else:
+            continue
         d = (z_next - z_t).norm().item()
         l2s.append(d)
         c = float(1.0 - F.cosine_similarity(z_next.unsqueeze(0), z_t.unsqueeze(0)).item())
         one_minus_cos.append(c)
     return {
-        "count": len(rollouts),
+        "count": len(l2s),
         "mean_L2": float(sum(l2s) / max(1, len(l2s))),
         "mean_1mcos": float(sum(one_minus_cos) / max(1, len(one_minus_cos))),
     }
+
+def _delta_stats_by_phase(rollouts) -> dict:
+    """
+    Optional integrity: when phase-format is present, report per-phase Δz.
+    Returns {phase_code_int: {'count':..., 'mean_L2':..., 'mean_1mcos':...}, ...}
+    """
+    import torch.nn.functional as F
+    buckets: dict[int, list] = {}
+    for r in rollouts:
+        if len(r) == 5:
+            z_t, ph, _pay, z_next, _role = r
+            try:
+                key = int(ph)
+            except Exception:
+                continue
+            buckets.setdefault(key, []).append((z_t, z_next))
+    out = {}
+    for k, pairs in buckets.items():
+        if not pairs:
+            continue
+        l2s, one_minus_cos = [], []
+        for z_t, z_next in pairs:
+            l2s.append((z_next - z_t).norm().item())
+            one_minus_cos.append(float(1.0 - F.cosine_similarity(z_next.unsqueeze(0), z_t.unsqueeze(0)).item()))
+        out[k] = {
+            "count": len(pairs),
+            "mean_L2": float(sum(l2s) / max(1, len(l2s))),
+            "mean_1mcos": float(sum(one_minus_cos) / max(1, len(one_minus_cos))),
+        }
+    return out
 
 # ─────────────────────────────── main training routine
 def main() -> None:
@@ -184,7 +241,21 @@ def main() -> None:
         print(f"[JEPA] Collected {stats['count']} roll-outs for {role_name} | "
               f"Δz L2={stats['mean_L2']:.4f}  (1-cos)={stats['mean_1mcos']:.4f}")
 
+        # Optional integrity: per-phase stats if available (no behavior change)
+        ph_stats = _delta_stats_by_phase(role_rollouts)
+        if ph_stats:
+            try:
+                pretty = ", ".join(
+                    f"phase={k}: n={v['count']} L2={v['mean_L2']:.4f} (1-cos)={v['mean_1mcos']:.4f}"
+                    for k, v in sorted(ph_stats.items())
+                )
+                print(f"[JEPA] Per-phase Δz stats for {role_name} → {pretty}")
+            except Exception:
+                pass
+
         print(f"[JEPA] Training JEPA modules for role: {role_name}")
+        # NOTE: keep the training call identical to avoid behavior change / signature drift.
+        # Phase-aware action embeddings can be enabled inside training_utils based on config if desired.
         train_jepa(
             rollout_data=role_rollouts,
             world_model=world_model,

@@ -1,4 +1,5 @@
 import os
+import re
 import torch
 import torch.nn.functional as F
 from collections import deque
@@ -33,6 +34,22 @@ SPEAKER_HIST_K = int(config.get("SPEAKER_HIST_K", 3))
 # Phase-1 logging toggle (read by sim.py)
 TELEMETRY_ENABLED = bool(config.get("TELEMETRY_ENABLED", True))
 
+# ───────────────────────── TALK CATEGORY MAPPING (deterministic) ─────────────────────────
+# Index convention for TALK_CATEGORIES: ["accuse", "defend", "hedge", "question", "vote"]
+ACCuse_CAT_ID   = 0
+DEFEND_CAT_ID   = 1
+HEDGE_CAT_ID    = 2
+QUESTION_CAT_ID = 3
+VOTE_CAT_ID     = 4
+
+# Map SpeakerBandit template ids → talk category ids (truncate/clip to templates length)
+TEMPLATE_TO_CAT_ID = [ACCuse_CAT_ID, DEFEND_CAT_ID, HEDGE_CAT_ID, QUESTION_CAT_ID, VOTE_CAT_ID]
+if len(TEMPLATE_TO_CAT_ID) < len(DEFAULT_TEMPLATES):
+    # Extend with hedge for any extra templates to be safe
+    TEMPLATE_TO_CAT_ID = TEMPLATE_TO_CAT_ID + [HEDGE_CAT_ID] * (len(DEFAULT_TEMPLATES) - len(TEMPLATE_TO_CAT_ID))
+else:
+    TEMPLATE_TO_CAT_ID = TEMPLATE_TO_CAT_ID[:len(DEFAULT_TEMPLATES)]
+
 
 class BaseAgent:
     """Single Werewolf/Villager agent driven by JEPA components + a mouthpiece (LLM or trainable Speaker)."""
@@ -50,6 +67,11 @@ class BaseAgent:
         self.alive: bool = True
         self.last_message: str = ""
         self.llm_fn = None  # (z, self) -> str  • attached from llm_script
+
+        # NEW: phase-aware speech bookkeeping (read by sim.py)
+        self.talk_category_last: int = -1
+        self.speaker_mode: str = "none"   # {"bandit","llm","none"}
+        self.persona_norm: float = 0.0
 
         # JEPA sub-modules
         self.message_encoder = MessageEncoder()  # may be overwritten with shared instance by sim
@@ -93,6 +115,43 @@ class BaseAgent:
 
     def _alive_indices(self, agents: list["BaseAgent"]) -> list[int]:
         return [int(a.name.split("_")[1]) for a in self._alive_others(agents)]
+
+    def _update_persona_norm_if_present(self):
+        """Recompute persona vector norm if a persona has been attached."""
+        if hasattr(self, "persona_vec"):
+            try:
+                pv = torch.as_tensor(self.persona_vec, dtype=torch.float32)
+                self.persona_norm = float(pv.norm().item())
+            except Exception:
+                self.persona_norm = 0.0
+        else:
+            self.persona_norm = 0.0
+
+    def _infer_talk_category(self, text: str) -> int:
+        """
+        Frozen, rule-based mapping from free text to category id.
+        Keeps LLM path deterministic for clean ablations.
+        """
+        t = (text or "").lower().strip()
+
+        # Strong vote cues
+        if any(kw in t for kw in ["we should vote", "vote to", "vote out", "vote ", "eliminate ", "lynch "]):
+            return VOTE_CAT_ID
+
+        # Interrogatives / requests for justification
+        if any(kw in t for kw in ["why", "how", "what about", "explain", "because?"]):
+            return QUESTION_CAT_ID
+
+        # Clear defense cues
+        if any(kw in t for kw in ["i trust", "not a wolf", "innocent", "seems fine", "defend"]):
+            return DEFEND_CAT_ID
+
+        # Accusation / suspicion cues
+        if any(kw in t for kw in ["is a wolf", "suspect", "guilty", "looks bad", "suspicious"]):
+            return ACCuse_CAT_ID
+
+        # Default: hedge
+        return HEDGE_CAT_ID
 
     # ───────────────────────── Perception ─────────────────────────
     def observe(self, agents: list["BaseAgent"]):
@@ -244,6 +303,12 @@ class BaseAgent:
         # Always encode z first (also updates message_memory via observe)
         z = self.encode_current_belief(round_num, agents)
 
+        # Refresh persona norm if a persona vector has been attached
+        self._update_persona_norm_if_present()
+
+        # Reset talk category for this utterance
+        self.talk_category_last = -1
+
         if self.speaker is not None:
             # Persona-driven exploration tweak (light)
             if hasattr(self, "persona_effects"):
@@ -273,24 +338,54 @@ class BaseAgent:
                 "reward": None,
             })
             self.last_message = text
+            self.speaker_mode = "bandit"
+
+            # Map to talk category id (prefer meta, else template mapping, else hedge)
+            cat_from_meta = meta.get("category_id", None)
+            if isinstance(cat_from_meta, int):
+                self.talk_category_last = int(cat_from_meta)
+            else:
+                tid = int(meta.get("template_id", -1)) if meta.get("template_id", None) is not None else -1
+                if 0 <= tid < len(TEMPLATE_TO_CAT_ID):
+                    self.talk_category_last = int(TEMPLATE_TO_CAT_ID[tid])
+                else:
+                    self.talk_category_last = HEDGE_CAT_ID
 
             # Telemetry
             if TELEMETRY_ENABLED:
                 self.telemetry.update({
                     "speak_template_id": int(meta.get("template_id", -1)),
                     "speak_text_len": len(text or ""),
+                    "talk_category_last": int(self.talk_category_last),
+                    "speaker_mode": self.speaker_mode,
+                    "persona_norm": float(self.persona_norm),
                 })
             return text
 
         # Fallback: frozen mouthpiece
         if not self.llm_fn:
             self.last_message = "…"
+            self.speaker_mode = "none"
             if TELEMETRY_ENABLED:
-                self.telemetry.update({"speak_text_len": 1})
+                self.telemetry.update({
+                    "speak_text_len": 1,
+                    "talk_category_last": HEDGE_CAT_ID,
+                    "speaker_mode": self.speaker_mode,
+                    "persona_norm": float(self.persona_norm),
+                })
+            self.talk_category_last = HEDGE_CAT_ID
             return "…"
 
         response = self.llm_fn(z, self)
         self.last_message = response
+        self.speaker_mode = "llm"
+        self.talk_category_last = self._infer_talk_category(response)
+
         if TELEMETRY_ENABLED:
-            self.telemetry.update({"speak_text_len": len(response or "")})
+            self.telemetry.update({
+                "speak_text_len": len(response or ""),
+                "talk_category_last": int(self.talk_category_last),
+                "speaker_mode": self.speaker_mode,
+                "persona_norm": float(self.persona_norm),
+            })
         return response

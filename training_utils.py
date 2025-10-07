@@ -15,6 +15,8 @@ import torch.optim as optim
 import torch.nn.functional as F
 
 from encoders import ActionEncoder, PlannerHead, WorldModelMLP
+# NEW: import learnable phase-aware encoder
+from encoders import PhaseActionEncoder  # noqa: E402
 
 CHECKPOINT_DIR = "checkpoints"
 LOGS_DIR = "logs"
@@ -291,23 +293,34 @@ def train_jepa_phaseaware(
     learning_rate: float = 1e-3,
     run_id: str = "run",
     epoch_logger: Optional[TrainingEpochLogger] = None,
+    phase_action_encoder: Optional[PhaseActionEncoder] = None,  # NEW: learnable encoder
 ) -> None:
     rows = normalize_rollouts(rollout_data_phaseaware)
     if not rows:
         print(f"[{role_name}] No rollout data; skipping JEPA (phase-aware) update.")
         return
 
+    # NEW: create or use provided PhaseActionEncoder (learnable, persisted)
+    pae = phase_action_encoder or PhaseActionEncoder(
+        action_dim=ACTION_EMBED_DIM,
+        num_agents=NUM_AGENTS_CFG,
+        num_talk=NUM_TALK_CATS,
+    )
+
     world_model.to(DEVICE)
     planner.to(DEVICE)
+    pae.to(DEVICE)
 
     optimizer = optim.Adam(
-        list(world_model.parameters()) + list(planner.parameters()),
+        list(world_model.parameters()) +
+        list(planner.parameters()) +
+        list(pae.parameters()),
         lr=learning_rate,
     )
     mse_loss = nn.MSELoss()
     ce_loss  = nn.CrossEntropyLoss()
 
-    world_model.train(), planner.train()
+    world_model.train(), planner.train(), pae.train()
 
     for ep in range(1, epochs + 1):
         random.shuffle(rows)
@@ -325,13 +338,23 @@ def train_jepa_phaseaware(
             payload = torch.tensor([r.payload_idx if r.payload_idx is not None else 0 for r in batch], device=DEVICE, dtype=torch.long)
             choice_types = [r.choice_type for r in batch]
 
-            a_embed = build_action_embed_phaseaware(
-                phase, payload,
-                num_agents=NUM_AGENTS_CFG,
-                num_talk_cats=NUM_TALK_CATS,
-                action_dim=ACTION_EMBED_DIM,
-                choice_type=None if all(ct is None for ct in choice_types) else choice_types[0]
-            ).to(DEVICE)
+            # NEW: learnable phase-aware action embedding
+            # Decide is_talk per item; pack through pae in two passes for simplicity
+            is_talk_mask = torch.tensor([ct == "TALK_INTENT" for ct in choice_types], device=DEVICE, dtype=torch.bool)
+            a_embed = torch.zeros(z_t_tensor.size(0), ACTION_EMBED_DIM, device=DEVICE)
+
+            if is_talk_mask.any():
+                a_embed[is_talk_mask] = pae(
+                    phase_code=phase[is_talk_mask],
+                    payload_idx=payload[is_talk_mask],
+                    is_talk=True,
+                )
+            if (~is_talk_mask).any():
+                a_embed[~is_talk_mask] = pae(
+                    phase_code=phase[~is_talk_mask],
+                    payload_idx=payload[~is_talk_mask],
+                    is_talk=False,
+                )
 
             z_pred = world_model(z_t_tensor, a_embed)
             L_mse = mse_loss(z_pred, z_next_tensor)
@@ -351,7 +374,7 @@ def train_jepa_phaseaware(
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
 
-            params = list(world_model.parameters()) + list(planner.parameters())
+            params = list(world_model.parameters()) + list(planner.parameters()) + list(pae.parameters())
             for p in params:
                 if p.grad is not None and torch.isnan(p.grad).any():
                     raise RuntimeError("NaN in gradients!")
@@ -387,6 +410,7 @@ def train_jepa_phaseaware(
         {
             "world_model": world_model.state_dict(),
             "planner": planner.state_dict(),
+            "phase_action_encoder": pae.state_dict(),  # NEW
         },
         save_path,
     )
@@ -397,6 +421,9 @@ def train_jepa_phaseaware(
 # =============================================================================
 
 def load_role_models(role: str) -> Tuple[WorldModelMLP, ActionEncoder, PlannerHead]:
+    """
+    Legacy loader: returns (WM, ActionEncoder, PlannerHead) and loads {role}_jepa.pt if present.
+    """
     wm = WorldModelMLP(latent_dim=LATENT_DIM, action_dim=ACTION_EMBED_DIM)
     ae = ActionEncoder(num_actions=NUM_AGENTS_CFG, action_dim=ACTION_EMBED_DIM)
     planner = PlannerHead(latent_dim=LATENT_DIM, num_agents=NUM_AGENTS_CFG)
@@ -412,6 +439,32 @@ def load_role_models(role: str) -> Tuple[WorldModelMLP, ActionEncoder, PlannerHe
         print(f"[INIT] No checkpoint for {role}. Starting fresh.")
 
     return wm, ae, planner
+
+# NEW: phase-aware loader (separate to keep legacy API unchanged)
+def load_role_models_phase(role: str) -> Tuple[WorldModelMLP, PhaseActionEncoder, PlannerHead]:
+    """
+    Phase-aware loader: returns (WM, PhaseActionEncoder, PlannerHead) and loads {role}_jepa_phase.pt if present.
+    """
+    wm = WorldModelMLP(latent_dim=LATENT_DIM, action_dim=ACTION_EMBED_DIM)
+    pae = PhaseActionEncoder(action_dim=ACTION_EMBED_DIM, num_agents=NUM_AGENTS_CFG, num_talk=NUM_TALK_CATS)
+    planner = PlannerHead(latent_dim=LATENT_DIM, num_agents=NUM_AGENTS_CFG)
+
+    ckpt_path = os.path.join(CHECKPOINT_DIR, f"{role.lower()}_jepa_phase.pt")
+    if os.path.exists(ckpt_path):
+        print(f"[LOAD] {role} phase checkpoint ← {ckpt_path}")
+        state = torch.load(ckpt_path, map_location="cpu")
+        wm.load_state_dict(state["world_model"])
+        if "phase_action_encoder" in state:
+            pae.load_state_dict(state["phase_action_encoder"])
+        else:
+            print(f"[WARN] Phase checkpoint missing 'phase_action_encoder'; starting it fresh.")
+        # Planner present for optional BC
+        if "planner" in state:
+            planner.load_state_dict(state["planner"])
+    else:
+        print(f"[INIT] No phase checkpoint for {role}. Starting fresh.")
+
+    return wm, pae, planner
 
 # =============================================================================
 # Sim runner shim (unchanged)
