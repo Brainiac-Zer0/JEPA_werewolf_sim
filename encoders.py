@@ -153,7 +153,38 @@ class PlannerHead(nn.Module):
         return self.net(z)
 
 # ───────────────────────────────────────────────────────────────────────────────
-# Phase-aware optional heads (added, not used by old code until you switch)
+# Mask utilities (shared by all heads)
+# ───────────────────────────────────────────────────────────────────────────────
+def mask_logits(logits: torch.Tensor, legal_mask: torch.Tensor | None) -> torch.Tensor:
+    """
+    legal_mask: boolean tensor, same trailing shape as logits.
+    Returns logits with illegal positions = -inf (broadcast-safe).
+    """
+    if legal_mask is None:
+        return logits
+    if legal_mask.dtype != torch.bool:
+        legal_mask = legal_mask.bool()
+    if logits.dim() == 2 and legal_mask.dim() == 1:
+        legal_mask = legal_mask.unsqueeze(0).expand(logits.size(0), -1)
+    return logits.masked_fill(~legal_mask, float("-inf"))
+
+@torch.no_grad()
+def illegal_softmax_mass(logits: torch.Tensor, legal_mask: torch.Tensor | None) -> float:
+    """
+    Compute softmax mass that would fall on illegal indices (diagnostic).
+    If you correctly call mask_logits BEFORE softmax during inference, this
+    should be near zero on masked logits.
+    """
+    if legal_mask is None:
+        return 0.0
+    probs = torch.softmax(logits, dim=-1)
+    if probs.dim() == 2 and legal_mask.dim() == 1:
+        legal_mask = legal_mask.unsqueeze(0).expand_as(probs)
+    illegal = ~legal_mask.bool()
+    return float(probs.masked_select(illegal).sum().item())
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Phase-aware heads (factorized)
 # ───────────────────────────────────────────────────────────────────────────────
 class TalkHead(nn.Module):
     """Logits over talk categories (NUM_TALK_CATS)."""
@@ -164,11 +195,17 @@ class TalkHead(nn.Module):
             nn.Tanh(),
             nn.Linear(64, num_cats)
         )
+        self._init()
+
+    def _init(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
+
     def forward(self, z: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         logits = self.net(z)
-        if mask is not None:
-            logits = logits.masked_fill(~mask, float("-inf"))
-        return logits
+        return mask_logits(logits, mask)
 
 class VoteHead(nn.Module):
     """Logits over agent indices (mask self/dead outside before softmax)."""
@@ -179,17 +216,160 @@ class VoteHead(nn.Module):
             nn.Tanh(),
             nn.Linear(64, num_agents)
         )
+        self._init()
+
+    def _init(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
+
     def forward(self, z: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         logits = self.net(z)
-        if mask is not None:
-            logits = logits.masked_fill(~mask, float("-inf"))
-        return logits
+        return mask_logits(logits, mask)
 
 class KillHead(VoteHead):
     """Identical shape to VoteHead; semantics differ (wolves only)."""
     pass
 
+# ───────────────────────────────────────────────────────────────────────────────
+# Multi-head containers
+# ───────────────────────────────────────────────────────────────────────────────
+class FactorizedPlanner(nn.Module):
+    """
+    Back-compat simple factorized planner: one Talk, one Vote, one Kill.
+    Temperature scales all head logits uniformly.
+    """
+    def __init__(
+        self,
+        latent_dim: int = LATENT_DIM,
+        num_agents: int = NUM_AGENTS,
+        num_talk_cats: int = NUM_TALK_CATS,
+        temperature: float = 1.0,
+    ):
+        super().__init__()
+        self.talk = TalkHead(latent_dim, num_cats=num_talk_cats)
+        self.vote = VoteHead(latent_dim, num_agents=num_agents)
+        self.kill = KillHead(latent_dim, num_agents=num_agents)
+        self.temperature = float(temperature)
+
+    def _apply_temp(self, logits: torch.Tensor) -> torch.Tensor:
+        if self.temperature and self.temperature != 1.0:
+            return logits * (1.0 / max(1e-6, self.temperature))
+        return logits
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        *,
+        talk_mask: torch.Tensor | None = None,
+        vote_mask: torch.Tensor | None = None,
+        kill_mask: torch.Tensor | None = None,
+    ) -> dict:
+        t_logits = self._apply_temp(self.talk(z))
+        v_logits = self._apply_temp(self.vote(z))
+        k_logits = self._apply_temp(self.kill(z))
+
+        t_logits = mask_logits(t_logits, talk_mask)
+        v_logits = mask_logits(v_logits, vote_mask)
+        k_logits = mask_logits(k_logits, kill_mask)
+
+        return {"talk": t_logits, "vote": v_logits, "kill": k_logits}
+
+class PlannerHeads(nn.Module):
+    """
+    Talk/Vote + Kill (shared or independent coalition).
+    .forward(...) returns dict of masked logits: {'talk', 'vote', 'kill'}.
+    """
+    def __init__(
+        self,
+        latent_dim: int = LATENT_DIM,
+        num_agents: int = NUM_AGENTS,
+        num_talk_cats: int = NUM_TALK_CATS,
+        coalition_mode: str = "shared",     # 'shared' | 'independent'
+        temperature: float = 1.0,
+    ):
+        super().__init__()
+        self.talk = TalkHead(latent_dim, num_cats=num_talk_cats)
+        self.vote = VoteHead(latent_dim, num_agents=num_agents)
+        self.temperature = float(temperature)
+        coalition_mode = (coalition_mode or "shared").lower()
+        assert coalition_mode in ("shared", "independent")
+        self.coalition_mode = coalition_mode
+        self.num_agents = int(num_agents)
+        self._latent_dim = int(latent_dim)
+
+        if coalition_mode == "shared":
+            self.kill_shared = KillHead(latent_dim, num_agents=num_agents)
+            self.kill_independent = None
+        else:
+            self.kill_shared = None
+            self.kill_independent = nn.ModuleDict()  # keyed by wolf agent name/id
+
+    def ensure_wolf_head(self, wolf_key: str):
+        """For 'independent' coalition mode, make sure a per-wolf KillHead exists."""
+        if self.coalition_mode != "independent":
+            return
+        if wolf_key not in self.kill_independent:
+            self.kill_independent[wolf_key] = KillHead(self._latent_dim, num_agents=self.num_agents)
+
+    def _apply_temp(self, logits: torch.Tensor) -> torch.Tensor:
+        if self.temperature and self.temperature != 1.0:
+            return logits * (1.0 / max(1e-6, self.temperature))
+        return logits
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        *,
+        talk_mask: torch.Tensor | None = None,
+        vote_mask: torch.Tensor | None = None,
+        kill_mask: torch.Tensor | None = None,
+        wolf_key: str | None = None,   # required if coalition_mode='independent'
+    ) -> dict[str, torch.Tensor]:
+        t = self._apply_temp(self.talk(z))
+        v = self._apply_temp(self.vote(z))
+        t = mask_logits(t, talk_mask)
+        v = mask_logits(v, vote_mask)
+
+        if self.coalition_mode == "shared":
+            k_raw = self._apply_temp(self.kill_shared(z))
+        else:
+            if wolf_key is None:
+                raise ValueError("wolf_key must be provided for coalition_mode='independent'")
+            self.ensure_wolf_head(wolf_key)
+            k_raw = self._apply_temp(self.kill_independent[wolf_key](z))
+
+        k = mask_logits(k_raw, kill_mask)
+        return {"talk": t, "vote": v, "kill": k}
+
+    @classmethod
+    def from_config(cls, cfg: dict) -> "PlannerHeads":
+        """
+        Build from unified config:
+          model.latent_dim / .num_actions or .num_agents / .num_talk_cats
+          planner.coalitions ('shared'|'independent')
+          planner.temperature
+        """
+        mcfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+        pconf = cfg.get("planner", {}) if isinstance(cfg, dict) else {}
+        latent = int(mcfg.get("latent_dim", LATENT_DIM))
+        # prefer explicit num_agents; else fall back to num_actions; else global NUM_AGENTS
+        num_agents = int(mcfg.get("num_agents", mcfg.get("num_actions", NUM_AGENTS)))
+        num_talk  = int(mcfg.get("num_talk_cats", NUM_TALK_CATS))
+        coalitions = (pconf.get("coalitions", "shared") or "shared").lower()
+        temp = float(pconf.get("temperature", 1.0))
+        return cls(
+            latent_dim=latent,
+            num_agents=num_agents,
+            num_talk_cats=num_talk,
+            coalition_mode=coalitions,
+            temperature=temp,
+        )
+
+# ───────────────────────────────────────────────────────────────────────────────
 # (Optional) Phase-aware action embedding builder — not wired into old code yet.
+# ───────────────────────────────────────────────────────────────────────────────
 class PhaseActionEncoder(nn.Module):
     """
     Map (phase_onehot, payload_onehot) → ACTION_DIM via small MLP.
@@ -205,6 +385,10 @@ class PhaseActionEncoder(nn.Module):
             nn.ReLU(),
             nn.Linear(64, action_dim),
         )
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
 
     def forward(self, phase_code: torch.Tensor, payload_idx: torch.Tensor, *, is_talk: bool) -> torch.Tensor:
         """

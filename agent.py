@@ -1,8 +1,10 @@
 import os
 import re
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from collections import deque
+from typing import List, Dict, Optional, Set
 import yaml
 
 from encoders import (
@@ -13,7 +15,13 @@ from encoders import (
     package_features,
     INPUT_DIM,
     LATENT_DIM,
-    PlannerHead,
+    ACTION_DIM,
+    PlannerHead,            # legacy single-head (kept for back-compat)
+    PhaseActionEncoder,     # used in training; stored on agent for later
+    TalkHead,
+    VoteHead,
+    KillHead,
+    FactorizedPlanner,      # ✅ real multi-head wrapper from encoders
 )
 
 # NEW: speaker import
@@ -24,26 +32,30 @@ with open("config.yaml", "r") as f:
     config = yaml.safe_load(f) or {}
 
 # Config values
-NUM_AGENTS     = int(config.get("NUM_AGENTS", 6))
-MAX_MEMORY     = int(config.get("MAX_MEMORY", 20))
-USE_LANGUAGE   = bool(config.get("USE_LANGUAGE", True))
-SPEAKER_ENABLED= bool(config.get("SPEAKER_ENABLED", False))
-SPEAKER_LR     = float(config.get("SPEAKER_LR", 1e-3))
-SPEAKER_HIST_K = int(config.get("SPEAKER_HIST_K", 3))
+NUM_AGENTS       = int(config.get("NUM_AGENTS", 6))
+MAX_MEMORY       = int(config.get("MAX_MEMORY", 20))
+USE_LANGUAGE     = bool(config.get("USE_LANGUAGE", True))
+SPEAKER_ENABLED  = bool(config.get("SPEAKER_ENABLED", False))
+SPEAKER_LR       = float(config.get("SPEAKER_LR", 1e-3))
+SPEAKER_HIST_K   = int(config.get("SPEAKER_HIST_K", 3))
+NUM_TALK_CATS    = int(config.get("NUM_TALK_CATS", 5))
+
+# Phases
+PHASES = {"DISCUSS": 0, "VOTE": 1, "NIGHT": 2}
 
 # Phase-1 logging toggle (read by sim.py)
 TELEMETRY_ENABLED = bool(config.get("TELEMETRY_ENABLED", True))
 
 # ───────────────────────── TALK CATEGORY MAPPING (deterministic) ─────────────────────────
 # Index convention for TALK_CATEGORIES: ["accuse", "defend", "hedge", "question", "vote"]
-ACCuse_CAT_ID   = 0
-DEFEND_CAT_ID   = 1
-HEDGE_CAT_ID    = 2
-QUESTION_CAT_ID = 3
-VOTE_CAT_ID     = 4
+ACCUSE_CAT_ID    = 0
+DEFEND_CAT_ID    = 1
+HEDGE_CAT_ID     = 2
+QUESTION_CAT_ID  = 3
+VOTE_CAT_ID      = 4
 
 # Map SpeakerBandit template ids → talk category ids (truncate/clip to templates length)
-TEMPLATE_TO_CAT_ID = [ACCuse_CAT_ID, DEFEND_CAT_ID, HEDGE_CAT_ID, QUESTION_CAT_ID, VOTE_CAT_ID]
+TEMPLATE_TO_CAT_ID = [ACCUSE_CAT_ID, DEFEND_CAT_ID, HEDGE_CAT_ID, QUESTION_CAT_ID, VOTE_CAT_ID]
 if len(TEMPLATE_TO_CAT_ID) < len(DEFAULT_TEMPLATES):
     # Extend with hedge for any extra templates to be safe
     TEMPLATE_TO_CAT_ID = TEMPLATE_TO_CAT_ID + [HEDGE_CAT_ID] * (len(DEFAULT_TEMPLATES) - len(TEMPLATE_TO_CAT_ID))
@@ -57,13 +69,15 @@ class BaseAgent:
     def __init__(
         self,
         name: str,
-        encoder: MLPBeliefEncoder | None = None,
-        world_model: WorldModelMLP | None = None,
-        action_encoder: ActionEncoder | None = None,
-        planner: PlannerHead | None = None,
+        encoder: Optional[MLPBeliefEncoder] = None,
+        world_model: Optional[WorldModelMLP] = None,
+        action_encoder: Optional[ActionEncoder] = None,
+        planner: Optional[PlannerHead] = None,                  # legacy single-head (vote only)
+        planner_factorized: Optional[FactorizedPlanner] = None, # NEW: multi-head (talk/vote/kill)
+        phase_action_encoder: Optional[PhaseActionEncoder] = None, # NEW: stored for training
     ) -> None:
         self.name = name
-        self.role: str | None = None
+        self.role: Optional[str] = None
         self.alive: bool = True
         self.last_message: str = ""
         self.llm_fn = None  # (z, self) -> str  • attached from llm_script
@@ -76,26 +90,59 @@ class BaseAgent:
         # JEPA sub-modules
         self.message_encoder = MessageEncoder()  # may be overwritten with shared instance by sim
         self.encoder        = encoder or MLPBeliefEncoder(input_dim=INPUT_DIM, latent_dim=LATENT_DIM)
-        self.world_model    = world_model or WorldModelMLP(latent_dim=LATENT_DIM, action_dim=8)
-        self.action_encoder = action_encoder or ActionEncoder(num_actions=NUM_AGENTS, action_dim=8)
+        self.world_model    = world_model or WorldModelMLP(latent_dim=LATENT_DIM, action_dim=ACTION_DIM)
+        self.action_encoder = action_encoder or ActionEncoder(num_actions=NUM_AGENTS, action_dim=ACTION_DIM)
+
+        # Legacy single-head planner (kept for back-compat paths)
         self.planner        = planner or PlannerHead(latent_dim=LATENT_DIM, num_agents=NUM_AGENTS)
+        # NEW: factorized heads (preferred path)
+        self.planner_factorized = planner_factorized or FactorizedPlanner(
+            latent_dim=LATENT_DIM, num_agents=NUM_AGENTS, num_talk_cats=NUM_TALK_CATS
+        )
+        # NEW: stored for future use in training (not consumed by agent logic)
+        self.phase_action_encoder = phase_action_encoder
 
         # Memories
-        self.vote_history: list[str] = []
-        self.latent_history: list[torch.Tensor] = []
-        self.heard_messages: dict[str, str] = {}
+        self.vote_history: List[str] = []
+        self.latent_history: List[torch.Tensor] = []
+        self.heard_messages: Dict[str, str] = {}
         self.message_memory: deque[tuple[str, str]] = deque(maxlen=MAX_MEMORY)
 
         # Speaker (optional) + buffer for training
         self.speaker = None
         self.speaker_opt = None
-        self.msg_buffer: list[dict] = []  # {z, role_bit, hist_feats, template_id, text, round, reward}
+        self.msg_buffer: List[dict] = []  # {z, role_bit, hist_feats, template_id, text, round, reward}
 
         # NEW: minimal per-step telemetry container (sim reads this to write CSV)
-        self.telemetry: dict = {}
+        self.telemetry: Dict = {}
+
+        # NEW: pack awareness
+        self.is_wolf: bool = False
+        self.wolf_ids: Set[int] = set()   # indices of known packmates (incl. self if you want)
 
         if SPEAKER_ENABLED:
             self._init_speaker()
+
+    # ───────────────────────── pack/role helpers ─────────────────────────
+    def set_role(self, role: str) -> None:
+        self.role = role
+        r = (role or "").lower()
+        self.is_wolf = (r in ("werewolf", "wolf", "traitor"))
+
+    def set_packmates(self, names: List[str]) -> None:
+        ids: Set[int] = set()
+        for n in names or []:
+            try:
+                ids.add(int(n.split("_")[1]))
+            except Exception:
+                continue
+        self.wolf_ids = ids
+
+    def _self_idx(self) -> int:
+        try:
+            return int(self.name.split("_")[1])
+        except Exception:
+            return 0
 
     # ───────────────────────── internal helpers ─────────────────────────
     def _init_speaker(self):
@@ -104,16 +151,16 @@ class BaseAgent:
         self.speaker.to(device)
         self.speaker_opt = torch.optim.Adam(self.speaker.parameters(), lr=SPEAKER_LR)
 
-    def _recent_texts(self) -> list[str]:
+    def _recent_texts(self) -> List[str]:
         """Last K observed lines for conditioning the speaker."""
         if not self.message_memory:
             return []
         return [m for (_, m) in list(self.message_memory)[-SPEAKER_HIST_K:] if m]
 
-    def _alive_others(self, agents: list["BaseAgent"]) -> list["BaseAgent"]:
+    def _alive_others(self, agents: List["BaseAgent"]) -> List["BaseAgent"]:
         return [a for a in agents if a.alive and a.name != self.name]
 
-    def _alive_indices(self, agents: list["BaseAgent"]) -> list[int]:
+    def _alive_indices(self, agents: List["BaseAgent"]) -> List[int]:
         return [int(a.name.split("_")[1]) for a in self._alive_others(agents)]
 
     def _update_persona_norm_if_present(self):
@@ -148,15 +195,15 @@ class BaseAgent:
 
         # Accusation / suspicion cues
         if any(kw in t for kw in ["is a wolf", "suspect", "guilty", "looks bad", "suspicious"]):
-            return ACCuse_CAT_ID
+            return ACCUSE_CAT_ID
 
         # Default: hedge
         return HEDGE_CAT_ID
 
     # ───────────────────────── Perception ─────────────────────────
-    def observe(self, agents: list["BaseAgent"]):
+    def observe(self, agents: List["BaseAgent"]):
         """Pull others' latest messages into short-term memory."""
-        observed: list[tuple[str, str]] = []
+        observed: List[tuple[str, str]] = []
         for a in agents:
             if a.alive and a.name != self.name:
                 observed.append((a.name, a.last_message))
@@ -164,35 +211,135 @@ class BaseAgent:
                 self.message_memory.append((a.name, a.last_message))
         return observed
 
-    # ───────────────────────── Action selection ─────────────────────────
+    # ───────────────────────── Mask builders ─────────────────────────
+    def build_talk_mask(self) -> torch.Tensor:
+        """Allow all talk categories for now (override if you want to ban some)."""
+        return torch.ones(NUM_TALK_CATS, dtype=torch.bool)
+
+    def build_vote_mask(self, agents: List["BaseAgent"]) -> torch.Tensor:
+        """Legal = alive & not self."""
+        mask = torch.zeros(NUM_AGENTS, dtype=torch.bool)
+        for a in agents:
+            if a.alive and a.name != self.name:
+                try:
+                    mask[int(a.name.split("_")[1])] = True
+                except Exception:
+                    continue
+        return mask
+
+    def build_kill_mask(self, agents: List["BaseAgent"]) -> torch.Tensor:
+        """
+        Wolves can kill only alive non-wolves, non-self.
+        Villagers produce an all-False mask (no-op at night).
+        """
+        mask = torch.zeros(NUM_AGENTS, dtype=torch.bool)
+        if not self.is_wolf:
+            return mask  # villagers don't issue kills
+
+        for a in agents:
+            try:
+                idx = int(a.name.split("_")[1])
+            except Exception:
+                continue
+            legal = a.alive and a.name != self.name and (idx not in self.wolf_ids)
+            mask[idx] = bool(legal)
+        return mask
+
+    # ───────────────────────── Action selection (phase-aware) ─────────────────────────
     @torch.no_grad()
-    def plan_vote(self, z: torch.Tensor, agents: list["BaseAgent"]):
+    def choose_action_by_phase(self, phase_code: int, round_num: int, agents: List["BaseAgent"]):
         """
-        Mask-aware, deterministic vote selection:
-        - compute logits over all NUM_AGENTS
-        - set illegal targets (self/dead) to -inf
-        - argmax among remaining (deterministic)
-        - store telemetry (mask indices + probs over legal set)
+        Returns (payload_idx, choice_type) where:
+          - DISCUSS: payload_idx ∈ [0..NUM_TALK_CATS-1], choice_type="TALK_INTENT"
+          - VOTE:    payload_idx ∈ [0..NUM_AGENTS-1], choice_type="VOTE_TARGET"
+          - NIGHT:   payload_idx ∈ [0..NUM_AGENTS-1], choice_type="KILL_TARGET" (wolves only)
         """
-        alive = self._alive_others(agents)
-        if not alive:
-            return self  # fallback to self if alone
+        z = self.encode_current_belief(round_num, agents)
 
-        logits = self.planner(z)                     # [NUM_AGENTS]
-        device = logits.device
-        alive_idx = self._alive_indices(agents)
+        # DISCUSS → TalkHead
+        if phase_code == PHASES["DISCUSS"]:
+            logits = self.planner_factorized.talk(z)           # [C] or [1,C]
+            if logits.dim() > 1:
+                logits = logits.squeeze(0)
+            mask = self.build_talk_mask().to(logits.device)    # [C]
+            masked = torch.full_like(logits, float("-inf"))
+            masked[mask] = logits[mask]
+            choice = int(torch.argmax(masked).item())
+            # Telemetry (softmax over legal set)
+            probs = torch.softmax(logits[mask], dim=-1).detach().cpu().tolist()
+            if TELEMETRY_ENABLED:
+                self.telemetry.update({
+                    "talk_mask_idx": torch.where(mask)[0].tolist(),
+                    "talk_choice_id": choice,
+                    "talk_probs": probs,
+                })
+            self.talk_category_last = choice
+            return choice, "TALK_INTENT"
 
+        # VOTE → VoteHead (masked to alive non-self)
+        if phase_code == PHASES["VOTE"]:
+            logits = self.planner_factorized.vote(z)           # [N]
+            if logits.dim() > 1:
+                logits = logits.squeeze(0)
+            mask = self.build_vote_mask(agents).to(logits.device)
+            masked = torch.full_like(logits, float("-inf"))
+            masked[mask] = logits[mask]
+            target = int(torch.argmax(masked).item())
+            probs = torch.softmax(logits[mask], dim=-1).detach().cpu().tolist()
+            if TELEMETRY_ENABLED:
+                self.telemetry.update({
+                    "vote_mask_idx": torch.where(mask)[0].tolist(),
+                    "vote_choice_idx": target,
+                    "vote_probs": probs,
+                })
+            # compact history
+            self.vote_history.append(f"Agent_{target}")
+            if len(self.vote_history) > MAX_MEMORY:
+                self.vote_history.pop(0)
+            return target, "VOTE_TARGET"
+
+        # NIGHT → KillHead (wolves only)
+        if phase_code == PHASES["NIGHT"]:
+            logits = self.planner_factorized.kill(z)           # [N]
+            if logits.dim() > 1:
+                logits = logits.squeeze(0)
+            mask = self.build_kill_mask(agents).to(logits.device)
+            masked = torch.full_like(logits, float("-inf"))
+            masked[mask] = logits[mask]
+            target = int(torch.argmax(masked).item())
+            probs = torch.softmax(logits[mask], dim=-1).detach().cpu().tolist()
+            if TELEMETRY_ENABLED:
+                self.telemetry.update({
+                    "kill_mask_idx": torch.where(mask)[0].tolist(),
+                    "kill_choice_idx": target,
+                    "kill_probs": probs,
+                })
+            return target, "KILL_TARGET"
+
+        # Unknown phase
+        return None, None
+
+    # Legacy vote helper (kept; internally routes through factorized head)
+    @torch.no_grad()
+    def plan_vote(self, z: torch.Tensor, agents: List["BaseAgent"]):
+        """
+        Back-compat wrapper. Uses factorized VoteHead with proper masks.
+        """
+        logits = self.planner_factorized.vote(z)               # [N]
+        if logits.dim() > 1:
+            logits = logits.squeeze(0)
+        mask = self.build_vote_mask(agents).to(logits.device)
         masked = torch.full_like(logits, float("-inf"))
-        masked[alive_idx] = logits[alive_idx]
-        # deterministic pick among legal targets
+        masked[mask] = logits[mask]
         chosen_idx = int(torch.argmax(masked).item())
-        chosen = next(a for a in alive if a.name == f"Agent_{chosen_idx}")
+        alive = self._alive_others(agents)
+        chosen = next((a for a in alive if a.name == f"Agent_{chosen_idx}"), alive[0] if alive else self)
 
         # Telemetry (softmax only over legal set)
-        probs = torch.softmax(logits[alive_idx], dim=-1).detach().cpu().tolist()
+        probs = torch.softmax(logits[mask], dim=-1).detach().cpu().tolist()
         if TELEMETRY_ENABLED:
             self.telemetry.update({
-                "vote_alive_idx": alive_idx,
+                "vote_alive_idx": torch.where(mask)[0].tolist(),
                 "vote_probs": probs,
                 "vote_choice_idx": chosen_idx,
             })
@@ -204,16 +351,15 @@ class BaseAgent:
 
         return chosen
 
-    def choose_night_target(self, agents: list["BaseAgent"]):
+    def choose_night_target(self, agents: List["BaseAgent"]):
         """
-        Night kill policy (kept simple/deterministic for Phase-1):
-        pick the *lowest index* legal non-self, non-wolf target among living.
+        Night kill policy (legacy fallback). Prefer factorized head via choose_action_by_phase.
         """
         candidates = [a for a in agents if a.alive and a.name != self.name]
         return candidates[0].name if candidates else None
 
     # ───────────────────────── Latent belief encoding ─────────────────────────
-    def encode_current_belief(self, round_num: int, agents: list["BaseAgent"]):
+    def encode_current_belief(self, round_num: int, agents: List["BaseAgent"]):
         """
         Encode the current belief state z_t from internal + social features.
         Phase-1 fixes:
@@ -285,6 +431,22 @@ class BaseAgent:
 
         return z
 
+    # ───────────────────────── Rollout aux snapshot ─────────────────────────
+    def make_aux(self, agents: List["BaseAgent"]) -> Dict:
+        alive = [bool(a.alive) for a in agents]
+        # Try to build wolves vector if roles are attached; else fall back to self.wolf_ids
+        wolves_attached = [getattr(a, "is_wolf", False) for a in agents]
+        if any(wolves_attached):
+            wolves = wolves_attached
+        else:
+            wset = self.wolf_ids
+            wolves = [(int(a.name.split("_")[1]) in wset) for a in agents]
+        return {
+            "alive": alive,
+            "self_idx": self._self_idx(),
+            "wolves": wolves,
+        }
+
     # ───────────────────────── Human-readable decode (optional) ─────────────────────────
     def decode_z(self, z: torch.Tensor) -> str:
         mean, std = z.mean().item(), z.std().item()
@@ -295,7 +457,7 @@ class BaseAgent:
         return f"The group seems {mood} I am {confidence}"
 
     # ───────────────────────── Speak ─────────────────────────
-    def speak(self, round_num: int, agents: list["BaseAgent"]):
+    def speak(self, round_num: int, agents: List["BaseAgent"]):
         """
         If SPEAKER_ENABLED=1, use trainable Speaker (template bandit).
         Otherwise fall back to llm_script mouthpiece (frozen).

@@ -1,12 +1,12 @@
-# train.py ── offline JEPA + optional speaker learning (Phase-1 stabilization/logging)
+# train.py ── offline JEPA + optional speaker learning (Phase-1→3: stabilization → multi-head)
 # -----------------------------------------------------------------------------
-# What this adds (no behavior change):
+# Adds/keeps:
 #   • Determinism: set_global_determinism(seed) at start
 #   • Run ID + config snapshot: logs/<RUN_ID>/config.snapshot.yaml
 #   • Per-epoch CSV logging: logs/metrics_train.csv (MSE/BC/|grad|/lr/role/epoch)
 #   • Integrity summary JSON: logs/<RUN_ID>/run_summary.json
-#   • Console integrity print: rollout counts + Δz stats per role
-#   • (NEW, minimal) Accept both legacy (index-action) and phase-aware rollout schemas
+#   • Accept both rollout schemas (legacy & phase-aware)
+#   • Phase-3: routeable training modes → legacy | phase | factorized (multi-head)
 # -----------------------------------------------------------------------------
 
 import os
@@ -24,8 +24,12 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from roles import WEREWOLF, VILLAGER  # noqa: E402
 from training_utils import (         # noqa: E402
     load_role_models,
+    load_role_models_phase,
+    load_role_models_factorized,   # NEW
     run_sim_and_collect_rollouts,
     train_jepa,
+    train_jepa_phaseaware,
+    train_jepa_factorized,         # NEW
     TrainingEpochLogger,
     set_global_determinism,
     save_run_config,
@@ -39,6 +43,19 @@ with open("config.yaml", "r") as f:
 # ── Hyper-parameters
 N_GAMES: int = int(CFG.get("N_GAMES", 50))  # per-role
 
+# Training mode & knobs (Phase-3)
+TR_CFG = CFG.get("training", {}) if isinstance(CFG.get("training"), dict) else {}
+# default to "phase" if PHASE_AWARE_JEPA legacy knob is on; else "legacy"
+MODE = (TR_CFG.get("mode") or ("phase" if CFG.get("PHASE_AWARE_JEPA", False) else "legacy")).lower()
+EPOCHS = int(TR_CFG.get("epochs", 5))
+BATCH_SIZE = int(TR_CFG.get("batch_size", 64))
+LR = float(TR_CFG.get("lr", 1.0e-3))
+
+# Optional coalitions knobs (for future shared vs independent kill comparisons)
+COAL = CFG.get("coalitions", {}) or {}
+COAL_COMPARE = bool(COAL.get("compare", False))
+COAL_SHARED_KILL = bool(COAL.get("shared_kill", True))  # baseline = shared
+
 # ── Paths
 CHECKPOINT_DIR = str(CFG.get("CHECKPOINT_DIR", "checkpoints"))
 Path(CHECKPOINT_DIR).mkdir(parents=True, exist_ok=True)
@@ -49,9 +66,9 @@ Path(LOGS_DIR).mkdir(parents=True, exist_ok=True)
 SPEAKER_ENABLED: bool = bool(CFG.get("SPEAKER_ENABLED", False))
 JUDGE_RUBRIC_PATH: str = str(CFG.get("JUDGE_RUBRIC_PATH", "judge_rubric.yaml"))
 
-# (NEW) Future-proof toggles (kept no-op here to avoid behavior change)
+# (legacy flags kept for BC; MODE overrides routing)
 PHASE_AWARE_JEPA: bool = bool(CFG.get("PHASE_AWARE_JEPA", False))
-TRAIN_PHASE_HEADS: bool = bool(CFG.get("TRAIN_PHASE_HEADS", False))
+TRAIN_PHASE_HEADS: bool = bool(CFG.get("TRAIN_PHASE_HEADS", False))  # placeholder (no-op here)
 
 # ── Seed / determinism
 RUN_SEED: int = int(CFG.get("RUN_SEED", 1337))
@@ -126,7 +143,7 @@ def collect_rollouts_for_role(
 
     Supports both schemas:
       • legacy: (z_t, a_idx, z_next, role)
-      • phase:  (z_t, phase_code, payload_idx, z_next, role)
+      • phase:  (z_t, phase_code, payload_idx, z_next, role[, choice_type[, aux]])
     """
     all_rollouts: list = []
 
@@ -149,7 +166,7 @@ def collect_rollouts_for_role(
                 if len(r) == 4:
                     if r[3] == role:
                         all_rollouts.append(r)
-                elif len(r) == 5:
+                elif len(r) >= 5:
                     if r[4] == role:
                         all_rollouts.append(r)
                 # else ignore malformed rows silently
@@ -165,11 +182,11 @@ def _delta_stats(rollouts: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, 
     import torch.nn.functional as F
     l2s, one_minus_cos = [], []
     for r in rollouts:
-        # legacy: (z_t, a_idx, z_next, role) ; phase: (z_t, phase, payload, z_next, role)
+        # legacy: (z_t, a_idx, z_next, role) ; phase: (z_t, phase, payload, z_next, role[, ...])
         if len(r) == 4:
             z_t, _a, z_next, _role = r
-        elif len(r) == 5:
-            z_t, _ph, _pay, z_next, _role = r
+        elif len(r) >= 5:
+            z_t, _ph, _pay, z_next, _role = r[:5]
         else:
             continue
         d = (z_next - z_t).norm().item()
@@ -190,8 +207,8 @@ def _delta_stats_by_phase(rollouts) -> dict:
     import torch.nn.functional as F
     buckets: dict[int, list] = {}
     for r in rollouts:
-        if len(r) == 5:
-            z_t, ph, _pay, z_next, _role = r
+        if len(r) >= 5:
+            z_t, ph, _pay, z_next, _role = r[:5]
             try:
                 key = int(ph)
             except Exception:
@@ -227,21 +244,20 @@ def main() -> None:
             rubric = JudgeRubric.load(JUDGE_RUBRIC_PATH)
             print(f"[SPEAKER] Loaded judge rubric: {JUDGE_RUBRIC_PATH}")
         except Exception as e:
-            print(f"[SPEAKER] WARNING: failed to load rubric ({e}); speaker learning will be skipped.")
+            print(f"[SPEAKER] WARNING: failed to load rubric ({e}); speaker learning will be skipped).")
             rubric = None
 
     # 2) Train per role with integrity prints and epoch CSV logging
     run_summary = {"run_id": run_id, "seed": RUN_SEED, "roles": {}}
     for role_name in (WEREWOLF, VILLAGER):
-        world_model, action_encoder, planner = load_role_models(role_name)
-
         print(f"[JEPA] Simulating {N_GAMES} games for role: {role_name}")
         role_rollouts = collect_rollouts_for_role(role_name, N_GAMES, rubric=rubric)
+
         stats = _delta_stats(role_rollouts)
         print(f"[JEPA] Collected {stats['count']} roll-outs for {role_name} | "
               f"Δz L2={stats['mean_L2']:.4f}  (1-cos)={stats['mean_1mcos']:.4f}")
 
-        # Optional integrity: per-phase stats if available (no behavior change)
+        # Optional integrity: per-phase stats if available
         ph_stats = _delta_stats_by_phase(role_rollouts)
         if ph_stats:
             try:
@@ -253,22 +269,93 @@ def main() -> None:
             except Exception:
                 pass
 
-        print(f"[JEPA] Training JEPA modules for role: {role_name}")
-        # NOTE: keep the training call identical to avoid behavior change / signature drift.
-        # Phase-aware action embeddings can be enabled inside training_utils based on config if desired.
-        train_jepa(
-            rollout_data=role_rollouts,
-            world_model=world_model,
-            action_encoder=action_encoder,
-            planner=planner,
-            role_name=role_name,
-            run_id=run_id,
-            epoch_logger=epoch_logger,
-        )
+        # 3) Choose training path based on config & observed schema
+        has_phase_rows = any(len(r) >= 5 for r in role_rollouts)
+        effective_mode = MODE
+        if MODE == "legacy" and has_phase_rows:
+            # Auto-upgrade to phase if richer data exists
+            effective_mode = "phase"
 
-        run_summary["roles"][role_name] = stats
+        print(f"[JEPA] Training JEPA modules for role: {role_name} (mode={effective_mode})")
 
-    # 3) Persist integrity summary
+        if effective_mode == "legacy":
+            world_model, action_encoder, planner = load_role_models(role_name)
+            train_jepa(
+                rollout_data=role_rollouts,
+                world_model=world_model,
+                action_encoder=action_encoder,
+                planner=planner,
+                role_name=role_name,
+                run_id=run_id,
+                epoch_logger=epoch_logger,
+                epochs=EPOCHS, batch_size=BATCH_SIZE, learning_rate=LR,
+            )
+
+        elif effective_mode == "phase":
+            world_model, phase_action_encoder, planner = load_role_models_phase(role_name)
+            train_jepa_phaseaware(
+                rollout_data_phaseaware=role_rollouts,
+                world_model=world_model,
+                planner=planner,
+                role_name=role_name,
+                run_id=run_id,
+                epoch_logger=epoch_logger,
+                phase_action_encoder=phase_action_encoder,
+                epochs=EPOCHS, batch_size=BATCH_SIZE, learning_rate=LR,
+            )
+
+        elif effective_mode == "factorized":
+            world_model, phase_action_encoder, fplanner = load_role_models_factorized(role_name)
+            # Baseline: shared heads (FactorizedPlanner). Training includes TALK/VOTE/KILL CE with masks.
+            train_jepa_factorized(
+                rollout_data_phaseaware=role_rollouts,
+                world_model=world_model,
+                phase_action_encoder=phase_action_encoder,
+                planner_factorized=fplanner,
+                role_name=role_name,
+                run_id=run_id,
+                epoch_logger=epoch_logger,
+                epochs=EPOCHS, batch_size=BATCH_SIZE, learning_rate=LR,
+            )
+
+            # (Optional) Coalition probe — independent specialists vs shared, Werewolf only.
+            if role_name == WEREWOLF and COAL_COMPARE:
+                print("[COAL] Probe: IndependentKillHeads vs SharedKillHead (see console/CSV for loss trends)")
+                # Minimal probe: split rows per actor if aux.self_idx present and train tiny specialists.
+                from collections import defaultdict
+                groups = defaultdict(list)
+                for r in role_rollouts:
+                    if len(r) >= 7 and isinstance(r[6], dict) and "self_idx" in r[6]:
+                        groups[int(r[6]["self_idx"])].append(r)
+                if not groups:
+                    print("[COAL] No self_idx in aux; skipping independent probe.")
+                else:
+                    for wolf_id, rows in groups.items():
+                        wm_i, pae_i, fplanner_i = load_role_models_factorized(role_name)  # fresh init
+                        train_jepa_factorized(
+                            rollout_data_phaseaware=rows,
+                            world_model=wm_i,
+                            phase_action_encoder=pae_i,
+                            planner_factorized=fplanner_i,
+                            role_name=f"{role_name}-wolf{wolf_id}",
+                            run_id=run_id,
+                            epoch_logger=None,
+                            epochs=max(1, EPOCHS // 5),
+                            batch_size=min(16, BATCH_SIZE),
+                            learning_rate=LR,
+                        )
+                # Shared already trained above. Use logs to compare.
+
+        else:
+            raise ValueError(f"Unknown training mode: {MODE}")
+
+        # record summary
+        role_entry = {"overall": stats}
+        if ph_stats:
+            role_entry["per_phase"] = ph_stats
+        run_summary["roles"][role_name] = role_entry
+
+    # 4) Persist integrity summary
     run_dir = os.path.join(LOGS_DIR, run_id)
     os.makedirs(run_dir, exist_ok=True)
     with open(os.path.join(run_dir, "run_summary.json"), "w", encoding="utf-8") as f:

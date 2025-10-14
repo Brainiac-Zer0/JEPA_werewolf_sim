@@ -3,7 +3,7 @@
 # - Keeps the rollout tuples using the *true* post-act z_{t+1}
 # - Prints acceptance metric: mean ||Δz|| per day
 # - Shares a single MessageEncoder across agents to save VRAM/CPU
-# - Calls LLM-as-Judge on planner top-k vote targets, picks final vote, logs subscores
+# - Calls LLL-as-Judge on planner top-k vote targets, picks final vote, logs subscores
 # - Returns agents in meta so train.py can run speaker learning
 # - Applies personality randomization per agent
 # - NEW (Phase 1: Stabilization & Logging)
@@ -11,6 +11,11 @@
 #   * Phase-aware + mask-aware telemetry
 #   * Per-decision CSV rows (TALK / VOTE / KILL) with Δz for votes
 #   * Optional judge debug JSONL is handled in judge.py (not here)
+# - NEW (Phase 3: Multi-head)
+#   * Use TalkHead / VoteHead / KillHead when available
+#   * Proper boolean masks (self/dead/wolves)
+#   * Judge re-ranking over VoteHead top-k
+#   * Phase-aware rollout tuples: (z_t, phase_code, payload_idx, z_{t+1}, role)
 # -----------------------------------------------------------------------------
 
 import sys
@@ -182,33 +187,75 @@ def draw_agents(agents: list[BaseAgent]) -> None:
     _draw_log()
     pygame.display.flip()
 
-# ╭───────────────────────── GAME HELPERS ───────────────────────────╮
-def choose_night_target(wolf: BaseAgent, agents: list[BaseAgent]):
-    non_wolves = [a for a in agents if a.alive and a.role != WEREWOLF]
-    return random.choice(non_wolves) if non_wolves else None
+# ╭───────────────────────── MULTI-HEAD HELPERS ─────────────────────────╮
+def _get_heads(ag: BaseAgent):
+    """
+    Prefer the agent's factorized planner if present; otherwise return the legacy planner.
+    """
+    if hasattr(ag, "planner_factorized") and ag.planner_factorized is not None:
+        return ag.planner_factorized
+    return ag.planner
 
-def _planner_topk_for_agent(ag: BaseAgent, z_t: torch.Tensor, agents: list[BaseAgent], k: int) -> List[tuple[str, float]]:
-    """Returns top-k (target_name, prob) among currently alive opponents for agent ag."""
-    with torch.no_grad():
-        logits = ag.planner(z_t.unsqueeze(0)).squeeze(0)  # [num_agents]
-        probs  = torch.softmax(logits, dim=-1)
+def _vote_mask_for(ag: BaseAgent, agents: list[BaseAgent], num_agents: int) -> torch.Tensor:
+    """True where legal to vote: alive and not self."""
+    mask = torch.zeros(num_agents, dtype=torch.bool)
+    for x in agents:
+        if x.alive and x.name != ag.name:
+            idx = int(x.name.split("_")[1])
+            if 0 <= idx < num_agents:
+                mask[idx] = True
+    return mask
 
+def _kill_mask_for(wolf: BaseAgent, agents: list[BaseAgent], num_agents: int) -> torch.Tensor:
+    """True where legal to kill: alive, not self, not a werewolf."""
+    mask = torch.zeros(num_agents, dtype=torch.bool)
+    for x in agents:
+        if x.alive and x.name != wolf.name and x.role != WEREWOLF:
+            idx = int(x.name.split("_")[1])
+            if 0 <= idx < num_agents:
+                mask[idx] = True
+    return mask
+
+def _talk_mask(num_cats: int) -> torch.Tensor:
+    """All talk categories are currently legal."""
+    return torch.ones(num_cats, dtype=torch.bool)
+
+def _vote_topk_for_agent(ag: BaseAgent, z_t: torch.Tensor, agents: list[BaseAgent], k: int) -> List[tuple[str, float]]:
+    """Top-k (target_name, prob) using VoteHead when available, else legacy planner."""
     alive = [x for x in agents if x.alive and x.name != ag.name]
     if not alive:
         return []
     alive_idx = [int(x.name.split("_")[1]) for x in alive]
 
-    # mask dead/self in the logits, then top-k
-    masked = torch.full_like(logits, float("-inf"))
-    masked[alive_idx] = logits[alive_idx]
-    k_eff = min(k, len(alive_idx))
-    _, topi = torch.topk(masked, k=k_eff)
+    with torch.no_grad():
+        fp = _get_heads(ag)
+        if hasattr(fp, "vote"):
+            # Try to infer num_agents from the head; else fall back to config
+            try:
+                num_agents = int(fp.vote.net[-1].out_features)  # type: ignore[attr-defined]
+            except Exception:
+                num_agents = NUM_AGENTS
+            vmask = _vote_mask_for(ag, agents, num_agents).unsqueeze(0)  # (1, N)
+            logits = fp.vote(z_t.unsqueeze(0), mask=vmask).squeeze(0)    # (N,)
+        else:
+            logits = ag.planner(z_t.unsqueeze(0)).squeeze(0)             # legacy over N
 
-    out: List[tuple[str, float]] = []
-    for idx in topi.tolist():
-        name = f"Agent_{idx}"
-        out.append((name, float(probs[idx].item())))
-    return out
+        probs  = torch.softmax(logits, dim=-1)
+
+        # top-k over masked alive indices
+        masked = torch.full_like(logits, float("-inf"))
+        for idx in alive_idx:
+            if 0 <= idx < logits.numel():
+                masked[idx] = logits[idx]
+
+        k_eff = min(k, len(alive_idx))
+        _, topi = torch.topk(masked, k=k_eff)
+
+        out: List[tuple[str, float]] = []
+        for idx in topi.tolist():
+            name = f"Agent_{idx}"
+            out.append((name, float(probs[idx].item())))
+        return out
 
 def _agent_context_block(ag: BaseAgent, max_lines: int = 6) -> str:
     """Build a compact context string from the agent's recent heard messages."""
@@ -271,7 +318,7 @@ def simulate_game(visual: bool = True):
         except Exception:
             social = None  # fail-safe: proceed without δ_social
 
-    # Attach JEPA sub-modules
+    # Attach JEPA sub-modules (legacy loader; agents also carry factorized in agent.py init)
     for ag in agents:
         wm, ae, planner = load_role_models(ag.role)
         ag.world_model, ag.action_encoder, ag.planner = wm, ae, planner
@@ -320,6 +367,25 @@ def simulate_game(visual: bool = True):
                 if visual:
                     msg_log.append((ag.name, msg))
 
+                # If TalkHead is available, infer a talk category for logging/telemetry
+                try:
+                    fp = _get_heads(ag)
+                    if hasattr(fp, "talk"):
+                        with torch.no_grad():
+                            z_t_talk = ag.encode_current_belief(round_num, agents)
+                            # infer number of categories from TalkHead final layer
+                            try:
+                                num_cats = int(fp.talk.net[-1].out_features)  # type: ignore[attr-defined]
+                            except Exception:
+                                num_cats = 5  # fallback default
+                            tmask = _talk_mask(num_cats).unsqueeze(0)  # (1, C)
+                            t_logits = fp.talk(z_t_talk.unsqueeze(0), mask=tmask).squeeze(0)
+                            ag.talk_category_last = int(torch.argmax(t_logits).item())
+                    else:
+                        ag.talk_category_last = int(getattr(ag, "talk_category_last", -1))
+                except Exception:
+                    ag.talk_category_last = int(getattr(ag, "talk_category_last", -1))
+
                 # NEW: log TALK row (phase-aware + numeric payload)
                 phase_log.append({"round": round_num, "phase": "DAY_DISCUSS"})
                 emit_event(
@@ -342,7 +408,8 @@ def simulate_game(visual: bool = True):
                         sys.exit()
 
         # ─── PRE-ACT: (z_t cache), social coupling, LLM Judge over planner top-k, final vote choice ───
-        pending: Dict[str, Tuple[torch.Tensor, torch.Tensor, str]] = {}
+        # Always use phase-aware pending: name -> (z_t, phase_code, payload_idx, role)
+        pending: Dict[str, Tuple[torch.Tensor, int, torch.Tensor, str]] = {}
         vote_map: Dict[BaseAgent, BaseAgent] = {}
 
         # First compute z_t for all living
@@ -365,8 +432,8 @@ def simulate_game(visual: bool = True):
         for ag in living:
             z_t = z_map[ag]
 
-            # planner top-k candidates (names + probs)
-            topk = _planner_topk_for_agent(ag, z_t, living, PLANNER_TOPK)
+            # planner top-k candidates (names + probs) — use VoteHead if present
+            topk = _vote_topk_for_agent(ag, z_t, living, PLANNER_TOPK)
             if not topk:
                 continue
 
@@ -392,12 +459,14 @@ def simulate_game(visual: bool = True):
             # map to actual agent object
             target = next((x for x in living if x.name == best_name), None)
             if target is None:
-                # fallback: original planner argmax among alive
+                # fallback: first alive that's not self
                 target = next((x for x in living if x.name != ag.name), living[0])
 
             vote_map[ag] = target
-            a_idx = torch.tensor([int(target.name.split('_')[1])])
-            pending[ag.name] = (z_t.detach(), a_idx, ag.role)
+            tgt_idx = int(target.name.split('_')[1])
+            a_idx = torch.tensor(int(tgt_idx))  # scalar tensor
+            # PHASE-AWARE: code 1 for DAY_VOTE
+            pending[ag.name] = (z_t.detach(), 1, a_idx, ag.role)
 
             # Log judge decision + subscores
             subs = judged[best_idx].get("subscores", {})
@@ -450,13 +519,42 @@ def simulate_game(visual: bool = True):
         # night kill
         wolves = [a for a in agents if a.alive and a.role == WEREWOLF]
         if wolves:
-            # NEW: record night kill legal mask + phase tick
-            phase_log.append({"round": round_num, "phase": "NIGHT_KILL"})
+            # simple coalition: pick first wolf to act (extend here for sequential/coalitions)
             wolf = wolves[0]
             legal_targets = [a.name for a in agents if a.alive and a.name != wolf.name and a.role != WEREWOLF]
+            # keep mask logging (useful even if no kill occurs later)
             mask_logs.append({"round": round_num, "phase": "NIGHT_KILL", "actor": wolf.name, "mask": legal_targets})
 
-            victim = choose_night_target(wolf, agents)
+            # Prefer KillHead when available; fallback to random target
+            victim = None
+            fp_w = _get_heads(wolf)
+            if hasattr(fp_w, "kill"):
+                try:
+                    with torch.no_grad():
+                        z_t_w = z_map.get(wolf, wolf.encode_current_belief(round_num, agents))
+                        try:
+                            nA = int(fp_w.kill.net[-1].out_features)  # type: ignore[attr-defined]
+                        except Exception:
+                            nA = NUM_AGENTS
+                        kmask = _kill_mask_for(wolf, agents, nA).unsqueeze(0)  # (1,N)
+                        k_logits = fp_w.kill(z_t_w.unsqueeze(0), mask=kmask).squeeze(0)  # (N,)
+                        tgt_idx = int(torch.argmax(k_logits).item())
+                        victim = next((a for a in agents if a.name == f"Agent_{tgt_idx}" and a.alive), None)
+                        if victim is not None:
+                            # phase-aware pending for NIGHT_KILL (2)
+                            pending[wolf.name] = (z_t_w.detach(), 2, torch.tensor(int(tgt_idx)), wolf.role)
+                except Exception:
+                    victim = None
+
+            if victim is None:
+                # Fallback random non-wolf
+                non_wolves = [a for a in agents if a.alive and a.role != WEREWOLF]
+                victim = random.choice(non_wolves) if non_wolves else None
+                if victim is not None:
+                    # still record a phase-aware pending tuple (simulate a chosen idx)
+                    z_t_w = z_map.get(wolf, wolf.encode_current_belief(round_num, agents)).detach()
+                    pending[wolf.name] = (z_t_w, 2, torch.tensor(int(victim.name.split('_')[1])), wolf.role)
+
             if victim:
                 eliminate_player(victim)
                 print(f"🌙 Night kill: {victim.name}")
@@ -474,6 +572,13 @@ def simulate_game(visual: bool = True):
                     speaker_mode=getattr(wolf, "speaker_mode", "") or "",
                     persona_norm=getattr(wolf, "persona_norm", 0.0),
                 )
+                # NEW: explicit actor/target trace for NIGHT_KILL (single authoritative entry)
+                phase_log.append({
+                    "round": round_num,
+                    "phase": "NIGHT_KILL",
+                    "actor": wolf.name,
+                    "target": victim.name
+                })
 
         # ─── POST-ACT: re-encode to get z_{t+1} and append rollouts ───
         z_deltas = []
@@ -485,8 +590,9 @@ def simulate_game(visual: bool = True):
         for ag in agents:
             if ag.name in pending:
                 z_next = ag.encode_current_belief(round_num + 1, agents).detach()
-                z_t, a_idx, role = pending[ag.name]
-                rollout.append((z_t, a_idx, z_next, role))
+                z_t, ph_code, payload_idx, role = pending[ag.name]
+                # Phase-aware rollout tuple (ensure scalars for phase & payload)
+                rollout.append((z_t, torch.tensor(int(ph_code)), torch.tensor(int(payload_idx)), z_next, role))
                 l2 = torch.norm(z_next - z_t).item()
                 z_deltas.append(l2)
                 cos_val = F.cosine_similarity(z_next.unsqueeze(0), z_t.unsqueeze(0)).item()

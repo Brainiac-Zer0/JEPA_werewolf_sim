@@ -10,6 +10,8 @@ SPEAKER_HIST_K: 3
 
 INPUT_DIM: 808
 LATENT_DIM: 32
+ACTION_DIM: 8
+NUM_ACTIONS: 6
 
 JUDGE_MODEL_ID: "meta-llama/Llama-3.1-8B-Instruct"
 JUDGE_MAX_NEW: 128
@@ -65,10 +67,8 @@ DEFAULT_TEMPLATES:
   - "Express uncertainty"
   - "Propose vote on {target}"
 
-# train.py
+# train.py (legacy mirrors still read in code)
 N_GAMES: 50
-ACTION_DIM: 8
-NUM_ACTIONS: 6
 CHECKPOINT_DIR: "checkpoints"
 JUDGE_RUBRIC_PATH: "judge_rubric.yaml"
 VILLAGER_W:
@@ -80,8 +80,9 @@ WEREWOLF_W:
   coherence: 0.5
   social_safety: 0.2
 
-# training_utils.py
-LAMBDA_BC: 0.5
+# training_utils.py (legacy knobs still honored)
+LAMBDA_BC: 0.5         # shared by vote/kill heads; used by legacy trainer too
+LAMBDA_TALK: 0.5       # new: CE weight for TalkHead
 MAX_NORM: 1.0
 
 # ================================================================
@@ -106,14 +107,37 @@ sim:
     fps: 1
     msg_log_limit: 12
     msg_box_w: 360
+  # Social influence (text → latent delta)
+  social:
+    enabled: true
+    hidden: 64
+    scale: 0.2           # matches encoders.SocialInfluence(scale)
+    window: 6            # recent neighbor messages used
+    apply_between: "discuss_vote"  # insertion point
 
 model:
   input_dim: 808
   latent_dim: 32
   action_dim: 8
-  num_actions: 6            # until phase-aware split
+  num_actions: 6            # until phase-aware split fully replaces
   encoders:
     message_model: "sentence-transformers/all-MiniLM-L6-v2"
+  phases:
+    count: 3                # DISCUSS(0) / VOTE(1) / NIGHT(2)
+    talk_categories: ["accuse", "defend", "hedge", "question", "vote"]
+    num_talk_cats: 5
+  factorized_planner:
+    temperature: 1.0        # scales logits of talk/vote/kill heads
+    masks:
+      mask_self: true
+      mask_dead: true
+      kill_wolves_only: true
+    # Coalition study toggles (read by train.py & tests)
+    coalitions:
+      compare: false        # if true, run shared vs independent kill-head probe for wolves
+      shared_kill: true     # default shared-parameters KillHead
+    # (Optional) head widths if you want to deviate from default 64 MLPs
+    hidden: 64
 
 judge:
   model_id: "meta-llama/Llama-3.1-8B-Instruct"
@@ -133,20 +157,20 @@ llm:
     - {max_new_tokens: 28, temperature: 0.5, top_p: 0.9, repetition_penalty: 1.15, no_repeat_ngram_size: 4}
     - {max_new_tokens: 24, temperature: 0.45, top_p: 0.85, repetition_penalty: 1.2, no_repeat_ngram_size: 5}
   bans_meta:
-    - "Use" 
-    - "Do not" 
-    - "Don't" 
+    - "Use"
+    - "Do not"
+    - "Don't"
     - "No "
     - "Keep "
-    - "Reply" 
-    - "Provide" 
-    - "Follow" 
-    - "Instruction" 
-    - "Rule" 
-    - "sentence" 
-    - "third person" 
-    - "grammar" 
-    - "punctuation" 
+    - "Reply"
+    - "Provide"
+    - "Follow"
+    - "Instruction"
+    - "Rule"
+    - "sentence"
+    - "third person"
+    - "grammar"
+    - "punctuation"
     - "No narration"
 
 speaker:
@@ -171,19 +195,23 @@ persona:
     coherence_weight_scale: 1.0
 
 training:
+  # Phase-3 switch: "legacy" | "phase" | "factorized"
+  mode: "factorized"
   n_games: 5
   epochs: 5
   batch_size: 64
   lr: 1.0e-3
   max_grad_norm: 1.0
-  lambda_bc: 1.0
+  # Per-head weights (mirrored in legacy keys above)
+  lambda_bc: 0.5       # used for Vote/Kill and legacy BC
+  lambda_talk: 0.5
   device: "auto"
 
 ablations:
   judge: true
   bandit: false
   personas: true
-  social: false
+  social: true           # enable to apply SocialInfluence deltas
   fep_core: true
   language: true
 
@@ -206,8 +234,37 @@ telemetry:
   flush_every: 1                     # write CSV row immediately (safer for SLURM)
 
 phases:
-  talk_categories: ["accuse", "defend", "hedge", "question", "vote"]  # canonical labels
-  # Reserved for future split:
+  talk_categories: ["accuse", "defend", "hedge", "question", "vote"]
   # discuss_id: 0
   # vote_id: 1
   # night_id: 2
+
+# ================================================================
+# NEW (Phase-1) — RUNTIME & LOGGING KNOBS FOR PATCHED CODE
+# ================================================================
+logging:
+  dir: "logs"
+  metrics_csv: "logs/metrics.csv"      # sim.py per-decision rows (TALK/VOTE/KILL)
+  run_config: "logs/run_config.yaml"   # config snapshot written by sim.py
+  run_meta: "logs/run_meta.json"       # run metadata (seed, device, ts)
+
+runtime:
+  save_config_snapshot: true
+
+seeds:
+  global: 123
+
+# ================================================================
+# NEW (Phase-1) — TRAINING TOGGLES & LEGACY-FRIENDLY MIRRORS
+# ================================================================
+PHASE_AWARE_JEPA: false         # legacy switch; MODE takes precedence
+TRAIN_PHASE_HEADS: false        # reserved for split-head training (Talk/Vote/Kill)
+TELEMETRY_ENABLED: true         # direct top-level flag used by agent.py
+
+# Phase taxonomy mirrors for legacy readers
+TALK_CATEGORIES: ["accuse", "defend", "hedge", "question", "vote"]
+NUM_TALK_CATS: 5
+PHASE_COUNT: 3                  # DISCUSS/VOTE/NIGHT
+
+# Shared dims for action embeddings (aligns with model.action_dim)
+ACTION_EMBED_DIM: 8
