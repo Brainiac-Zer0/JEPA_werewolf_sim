@@ -31,20 +31,42 @@ from speaker import SpeakerBandit, DEFAULT_TEMPLATES  # make_hist_feats not need
 with open("config.yaml", "r") as f:
     config = yaml.safe_load(f) or {}
 
-# Config values
-NUM_AGENTS       = int(config.get("NUM_AGENTS", 6))
-MAX_MEMORY       = int(config.get("MAX_MEMORY", 20))
-USE_LANGUAGE     = bool(config.get("USE_LANGUAGE", True))
-SPEAKER_ENABLED  = bool(config.get("SPEAKER_ENABLED", False))
-SPEAKER_LR       = float(config.get("SPEAKER_LR", 1e-3))
-SPEAKER_HIST_K   = int(config.get("SPEAKER_HIST_K", 3))
-NUM_TALK_CATS    = int(config.get("NUM_TALK_CATS", 5))
+# ---------- OS ENV SHIM HELPERS ----------
+def _env_bool(key: str, default: bool) -> bool:
+    val = os.getenv(key)
+    if val is None:
+        return default
+    return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
+
+def _env_int(key: str, default: int) -> int:
+    val = os.getenv(key)
+    try:
+        return int(val) if val is not None else default
+    except Exception:
+        return default
+
+def _env_float(key: str, default: float) -> float:
+    val = os.getenv(key)
+    try:
+        return float(val) if val is not None else default
+    except Exception:
+        return default
+# -----------------------------------------
+
+# Config values (env overrides take precedence; YAML is the fallback)
+NUM_AGENTS       = _env_int("NUM_AGENTS", int(config.get("NUM_AGENTS", 6)))
+MAX_MEMORY       = _env_int("MAX_MEMORY", int(config.get("MAX_MEMORY", 20)))
+USE_LANGUAGE     = _env_bool("USE_LANGUAGE", bool(config.get("USE_LANGUAGE", True)))
+SPEAKER_ENABLED  = _env_bool("SPEAKER_ENABLED", bool(config.get("SPEAKER_ENABLED", False)))
+SPEAKER_LR       = _env_float("SPEAKER_LR", float(config.get("SPEAKER_LR", 1e-3)))
+SPEAKER_HIST_K   = _env_int("SPEAKER_HIST_K", int(config.get("SPEAKER_HIST_K", 3)))
+NUM_TALK_CATS    = _env_int("NUM_TALK_CATS", int(config.get("NUM_TALK_CATS", 5)))
 
 # Phases
 PHASES = {"DISCUSS": 0, "VOTE": 1, "NIGHT": 2}
 
 # Phase-1 logging toggle (read by sim.py)
-TELEMETRY_ENABLED = bool(config.get("TELEMETRY_ENABLED", True))
+TELEMETRY_ENABLED = _env_bool("TELEMETRY_ENABLED", bool(config.get("TELEMETRY_ENABLED", True)))
 
 # ───────────────────────── TALK CATEGORY MAPPING (deterministic) ─────────────────────────
 # Index convention for TALK_CATEGORIES: ["accuse", "defend", "hedge", "question", "vote"]
@@ -119,6 +141,9 @@ class BaseAgent:
         # NEW: pack awareness
         self.is_wolf: bool = False
         self.wolf_ids: Set[int] = set()   # indices of known packmates (incl. self if you want)
+
+        # NEW: per-step cache for Phase-4 rollout construction
+        self._step_cache: Dict = {}
 
         if SPEAKER_ENABLED:
             self._init_speaker()
@@ -253,8 +278,26 @@ class BaseAgent:
           - DISCUSS: payload_idx ∈ [0..NUM_TALK_CATS-1], choice_type="TALK_INTENT"
           - VOTE:    payload_idx ∈ [0..NUM_AGENTS-1], choice_type="VOTE_TARGET"
           - NIGHT:   payload_idx ∈ [0..NUM_AGENTS-1], choice_type="KILL_TARGET" (wolves only)
+        When no legal action exists, returns (None, None).
         """
         z = self.encode_current_belief(round_num, agents)
+
+        def _masked_argmax(logits_1d: torch.Tensor, legal_mask_1d: torch.Tensor, head: str):
+            if legal_mask_1d is None:
+                # If mask missing, treat as all-true with same shape
+                legal_mask_1d = torch.ones_like(logits_1d, dtype=torch.bool)
+            elif legal_mask_1d.dtype != torch.bool:
+                legal_mask_1d = legal_mask_1d.bool()
+            if not legal_mask_1d.any():
+                if TELEMETRY_ENABLED:
+                    self.telemetry[f"{head}_no_legal"] = True
+                return None, None, []
+            masked = torch.full_like(logits_1d, float("-inf"))
+            masked[legal_mask_1d] = logits_1d[legal_mask_1d]
+            choice = int(torch.argmax(masked).item())
+            probs = torch.softmax(logits_1d[legal_mask_1d], dim=-1).detach().cpu().tolist()
+            legal_idx = torch.where(legal_mask_1d)[0].tolist()
+            return choice, legal_idx, probs
 
         # DISCUSS → TalkHead
         if phase_code == PHASES["DISCUSS"]:
@@ -262,14 +305,12 @@ class BaseAgent:
             if logits.dim() > 1:
                 logits = logits.squeeze(0)
             mask = self.build_talk_mask().to(logits.device)    # [C]
-            masked = torch.full_like(logits, float("-inf"))
-            masked[mask] = logits[mask]
-            choice = int(torch.argmax(masked).item())
-            # Telemetry (softmax over legal set)
-            probs = torch.softmax(logits[mask], dim=-1).detach().cpu().tolist()
+            choice, legal_idx, probs = _masked_argmax(logits, mask, head="talk")
+            if choice is None:
+                return None, None
             if TELEMETRY_ENABLED:
                 self.telemetry.update({
-                    "talk_mask_idx": torch.where(mask)[0].tolist(),
+                    "talk_mask_idx": legal_idx,
                     "talk_choice_id": choice,
                     "talk_probs": probs,
                 })
@@ -282,21 +323,20 @@ class BaseAgent:
             if logits.dim() > 1:
                 logits = logits.squeeze(0)
             mask = self.build_vote_mask(agents).to(logits.device)
-            masked = torch.full_like(logits, float("-inf"))
-            masked[mask] = logits[mask]
-            target = int(torch.argmax(masked).item())
-            probs = torch.softmax(logits[mask], dim=-1).detach().cpu().tolist()
+            choice, legal_idx, probs = _masked_argmax(logits, mask, head="vote")
+            if choice is None:
+                return None, None
             if TELEMETRY_ENABLED:
                 self.telemetry.update({
-                    "vote_mask_idx": torch.where(mask)[0].tolist(),
-                    "vote_choice_idx": target,
+                    "vote_mask_idx": legal_idx,
+                    "vote_choice_idx": choice,
                     "vote_probs": probs,
                 })
             # compact history
-            self.vote_history.append(f"Agent_{target}")
+            self.vote_history.append(f"Agent_{choice}")
             if len(self.vote_history) > MAX_MEMORY:
                 self.vote_history.pop(0)
-            return target, "VOTE_TARGET"
+            return choice, "VOTE_TARGET"
 
         # NIGHT → KillHead (wolves only)
         if phase_code == PHASES["NIGHT"]:
@@ -304,17 +344,16 @@ class BaseAgent:
             if logits.dim() > 1:
                 logits = logits.squeeze(0)
             mask = self.build_kill_mask(agents).to(logits.device)
-            masked = torch.full_like(logits, float("-inf"))
-            masked[mask] = logits[mask]
-            target = int(torch.argmax(masked).item())
-            probs = torch.softmax(logits[mask], dim=-1).detach().cpu().tolist()
+            choice, legal_idx, probs = _masked_argmax(logits, mask, head="kill")
+            if choice is None:
+                return None, None
             if TELEMETRY_ENABLED:
                 self.telemetry.update({
-                    "kill_mask_idx": torch.where(mask)[0].tolist(),
-                    "kill_choice_idx": target,
+                    "kill_mask_idx": legal_idx,
+                    "kill_choice_idx": choice,
                     "kill_probs": probs,
                 })
-            return target, "KILL_TARGET"
+            return choice, "KILL_TARGET"
 
         # Unknown phase
         return None, None
@@ -551,3 +590,92 @@ class BaseAgent:
                 "persona_norm": float(self.persona_norm),
             })
         return response
+
+    # ───────────────────────── NEW: Phase-4 rollout helpers ─────────────────────────
+    def reset_for_new_game(self):
+        """Clear state between games."""
+        self.alive = True
+        self.last_message = ""
+        self.talk_category_last = -1
+        self.vote_history.clear()
+        self.latent_history.clear()
+        self.heard_messages.clear()
+        self.message_memory.clear()
+        self.telemetry.clear()
+        self._step_cache = {}
+
+    def reset_step_cache(self):
+        """Clear per-step cached values (z_t, phase, payload, choice_type, aux, round)."""
+        self._step_cache = {}
+
+    @torch.no_grad()
+    def begin_step(self, phase_code: int, round_num: int, agents: List["BaseAgent"]) -> torch.Tensor:
+        """
+        Capture z_t and aux at the start of a sim phase-step.
+        Returns z_t for convenience (some sims like to log it).
+        """
+        self.reset_step_cache()
+        z_t = self.encode_current_belief(round_num, agents)
+        self._step_cache = {
+            "z_t": z_t.detach().clone(),
+            "phase": int(phase_code),
+            "round": int(round_num),
+            "aux": self.make_aux(agents),
+            "payload": None,
+            "choice_type": None,
+        }
+        return z_t
+
+    @torch.no_grad()
+    def decide(self, phase_code: int, round_num: int, agents: List["BaseAgent"]):
+        """
+        Thin wrapper to choose and cache the action for this phase.
+        Returns (payload_idx, choice_type). If no legal action, (None, None).
+        """
+        payload_idx, choice_type = self.choose_action_by_phase(phase_code, round_num, agents)
+        if not getattr(self, "_step_cache", None):
+            _ = self.begin_step(phase_code, round_num, agents)
+        self._step_cache["payload"] = None if payload_idx is None else int(payload_idx)
+        self._step_cache["choice_type"] = choice_type
+        return payload_idx, choice_type
+
+    @torch.no_grad()
+    def finalize_step(
+        self,
+        agents: List["BaseAgent"],
+        z_next: Optional[torch.Tensor] = None,
+    ):
+        """
+        Package a training row:
+          (z_t, phase_code, action_payload, z_{t+1}, role, choice_type, aux)
+
+        If z_next is None, we re-encode belief now (post-environment update).
+        Detaches tensors to CPU for log-friendly storage.
+        """
+        if not getattr(self, "_step_cache", None):
+            raise RuntimeError("finalize_step() called before begin_step()/decide().")
+
+        z_t = self._step_cache.get("z_t")
+        phase = self._step_cache.get("phase")
+        payload = self._step_cache.get("payload")
+        choice_type = self._step_cache.get("choice_type")
+        aux = self._step_cache.get("aux")
+
+        if z_next is None:
+            round_num = int(self._step_cache.get("round", 0))
+            z_next = self.encode_current_belief(round_num, agents)
+
+        z_t_cpu = z_t.detach().cpu()
+        z_next_cpu = z_next.detach().cpu()
+
+        row = (
+            z_t_cpu,
+            int(phase),
+            int(payload) if payload is not None else 0,
+            z_next_cpu,
+            (self.role or "Unknown"),
+            choice_type,
+            aux,
+        )
+        self.reset_step_cache()
+        return row

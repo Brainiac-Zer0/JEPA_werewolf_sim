@@ -100,6 +100,12 @@ sim:
   num_werewolves: 1
   planner_topk: 3
   use_language: true
+
+  # NEW: planner×judge mixing + optional Δz logs for phases
+  vote_mix_alpha: 0.0     # 0.0 = judge-only among top-k; 1.0 = planner-only
+  log_dz_talk: false      # if true, log Δz for each TALK (per speaker)
+  log_dz_kill: false      # if true, log Δz for NIGHT_KILL actor
+
   ui:
     enabled: true
     screen_w: 1200
@@ -107,11 +113,12 @@ sim:
     fps: 1
     msg_log_limit: 12
     msg_box_w: 360
+
   # Social influence (text → latent delta)
   social:
     enabled: true
     hidden: 64
-    scale: 0.2           # matches encoders.SocialInfluence(scale)
+    scale: 0.2           # magnitude of δ_social
     window: 6            # recent neighbor messages used
     apply_between: "discuss_vote"  # insertion point
 
@@ -119,7 +126,7 @@ model:
   input_dim: 808
   latent_dim: 32
   action_dim: 8
-  num_actions: 6            # until phase-aware split fully replaces
+  num_actions: 6
   encoders:
     message_model: "sentence-transformers/all-MiniLM-L6-v2"
   phases:
@@ -127,21 +134,19 @@ model:
     talk_categories: ["accuse", "defend", "hedge", "question", "vote"]
     num_talk_cats: 5
   factorized_planner:
-    temperature: 1.0        # scales logits of talk/vote/kill heads
+    temperature: 1.0
     masks:
       mask_self: true
       mask_dead: true
       kill_wolves_only: true
-    # Coalition study toggles (read by train.py & tests)
     coalitions:
-      compare: false        # if true, run shared vs independent kill-head probe for wolves
-      shared_kill: true     # default shared-parameters KillHead
-    # (Optional) head widths if you want to deviate from default 64 MLPs
+      compare: false
+      shared_kill: true
     hidden: 64
 
 judge:
   model_id: "meta-llama/Llama-3.1-8B-Instruct"
-  device: "auto"            # "auto" | "cpu" | "cuda"
+  device: "auto"
   batch: 3
   max_new: 128
   include_rationale: true
@@ -195,15 +200,13 @@ persona:
     coherence_weight_scale: 1.0
 
 training:
-  # Phase-3 switch: "legacy" | "phase" | "factorized"
-  mode: "factorized"
+  mode: "factorized"   # "legacy" | "phase" | "factorized"
   n_games: 5
   epochs: 5
   batch_size: 64
   lr: 1.0e-3
   max_grad_norm: 1.0
-  # Per-head weights (mirrored in legacy keys above)
-  lambda_bc: 0.5       # used for Vote/Kill and legacy BC
+  lambda_bc: 0.5
   lambda_talk: 0.5
   device: "auto"
 
@@ -211,7 +214,7 @@ ablations:
   judge: true
   bandit: false
   personas: true
-  social: true           # enable to apply SocialInfluence deltas
+  social: true
   fep_core: true
   language: true
 
@@ -219,34 +222,31 @@ ablations:
 # NEW (Phase-1) — STABILIZATION + LOGGING
 # ================================================================
 determinism:
-  enabled: true          # if true, sim.py sets all seeds and torch flags
-  seed: 1337             # run-level seed
+  enabled: true
+  seed: 1337
   torch_deterministic: true
-  cudnn_benchmark: false # keep kernels deterministic
+  cudnn_benchmark: false
 
 telemetry:
   enabled: true
   out_dir: "logs"
-  csv_name: "telemetry.csv"          # one CSV per run (sim.py will prefix with run_id)
+  csv_name: "telemetry.csv"
   judge_jsonl_name: "judge_calls.jsonl"
-  snapshot_config: true              # write config snapshot to logs/run-<id>/config.snapshot.yaml
-  print_summary: true                # tiny integrity line at end (row counts, Δz stats)
-  flush_every: 1                     # write CSV row immediately (safer for SLURM)
+  snapshot_config: true
+  print_summary: true
+  flush_every: 1
 
 phases:
   talk_categories: ["accuse", "defend", "hedge", "question", "vote"]
-  # discuss_id: 0
-  # vote_id: 1
-  # night_id: 2
 
 # ================================================================
 # NEW (Phase-1) — RUNTIME & LOGGING KNOBS FOR PATCHED CODE
 # ================================================================
 logging:
   dir: "logs"
-  metrics_csv: "logs/metrics.csv"      # sim.py per-decision rows (TALK/VOTE/KILL)
-  run_config: "logs/run_config.yaml"   # config snapshot written by sim.py
-  run_meta: "logs/run_meta.json"       # run metadata (seed, device, ts)
+  metrics_csv: "logs/metrics.csv"
+  run_config: "logs/run_config.yaml"
+  run_meta: "logs/run_meta.json"
 
 runtime:
   save_config_snapshot: true
@@ -257,14 +257,20 @@ seeds:
 # ================================================================
 # NEW (Phase-1) — TRAINING TOGGLES & LEGACY-FRIENDLY MIRRORS
 # ================================================================
-PHASE_AWARE_JEPA: false         # legacy switch; MODE takes precedence
-TRAIN_PHASE_HEADS: false        # reserved for split-head training (Talk/Vote/Kill)
-TELEMETRY_ENABLED: true         # direct top-level flag used by agent.py
+PHASE_AWARE_JEPA: false
+TRAIN_PHASE_HEADS: false
+TELEMETRY_ENABLED: true
 
-# Phase taxonomy mirrors for legacy readers
 TALK_CATEGORIES: ["accuse", "defend", "hedge", "question", "vote"]
 NUM_TALK_CATS: 5
-PHASE_COUNT: 3                  # DISCUSS/VOTE/NIGHT
-
-# Shared dims for action embeddings (aligns with model.action_dim)
+PHASE_COUNT: 3
 ACTION_EMBED_DIM: 8
+
+# ================================================================
+# COMPAT MIRROR for current sim.py: social_influence
+# (Maps to sim.social; safe to remove once sim.py reads sim.social directly)
+# ================================================================
+social_influence:
+  enabled: true
+  K: 6          # mirrors sim.social.window
+  scale: 0.2    # mirrors sim.social.scale

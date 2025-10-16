@@ -14,17 +14,22 @@ with open("config.yaml", "r") as f:
 # Core dims
 INPUT_DIM   = int(config.get("INPUT_DIM", 808))
 LATENT_DIM  = int(config.get("LATENT_DIM", 32))
-ACTION_DIM  = int(config.get("ACTION_DIM", 8))
+ACTION_DIM  = int(config.get("ACTION_DIM", 8))  # legacy default
 NUM_ACTIONS = int(config.get("NUM_ACTIONS", 6))
 NUM_AGENTS  = int(config.get("NUM_AGENTS", 6))
 
-# Optional talk categories (for future phase-aware planner split)
+# Optional talk categories (for phase-aware planner split)
 TALK_CATEGORIES = config.get("TALK_CATEGORIES", ["accuse", "defend", "hedge", "question", "vote"])
 NUM_TALK_CATS   = int(config.get("NUM_TALK_CATS", len(TALK_CATEGORIES)))
 
 # Phase scaffolding (for Day: Discuss/Vote; Night: Kill)
 PHASES = {"DISCUSS": 0, "VOTE": 1, "NIGHT": 2}
 NUM_PHASES = 3
+
+# Phase-4 knobs (with safe fallbacks)
+WORLD_INPUT_MODE  = (config.get("WORLD_INPUT_MODE", "z_plus_action") or "z_plus_action").lower()  # 'z_plus_action'|'z_only'
+ACTION_EMBED_KIND = (config.get("ACTION_EMBED_KIND", "onehot") or "onehot").lower()               # 'onehot'|'learned'
+ACTION_EMBED_DIM  = int(config.get("ACTION_EMBED_DIM", ACTION_DIM))                               # final a_embed width
 
 def phase_onehot(phase_code: int) -> torch.Tensor:
     v = torch.zeros(NUM_PHASES, dtype=torch.float32)
@@ -72,7 +77,7 @@ class MessageEncoder(nn.Module):
         return (token_embeddings * input_mask_expanded).sum(1) / denom  # (B,D)
 
 # ───────────────────────────────────────────────────────────────────────────────
-# Social influence: text → bounded latent delta  (NEW)
+# Social influence: text → bounded latent delta
 # ───────────────────────────────────────────────────────────────────────────────
 class SocialInfluence(nn.Module):
     """
@@ -97,7 +102,7 @@ class SocialInfluence(nn.Module):
         return delta.squeeze(0) if delta.size(0) == 1 else delta
 
 # ───────────────────────────────────────────────────────────────────────────────
-# Latent/state encoders & world model (unchanged APIs for compatibility)
+# Latent/state encoders & world model
 # ───────────────────────────────────────────────────────────────────────────────
 class MLPBeliefEncoder(nn.Module):
     def __init__(self, input_dim, latent_dim=32):
@@ -113,9 +118,8 @@ class MLPBeliefEncoder(nn.Module):
 
 class ActionEncoder(nn.Module):
     """
-    Backward-compatible action index embedder.
-    (For phase-aware work, you can later swap to PhaseActionEncoder without
-     changing training_utils if you map indices consistently.)
+    Backward-compatible action index embedder (legacy).
+    For phase-aware JEPA, prefer PhaseAwareActionEmbedder below.
     """
     def __init__(self, num_actions, action_dim):
         super().__init__()
@@ -125,15 +129,65 @@ class ActionEncoder(nn.Module):
         return self.embedding(action_idx)
 
 class WorldModelMLP(nn.Module):
-    def __init__(self, latent_dim, action_dim):
+    """
+    World dynamics over latent state.
+    mode='z_plus_action' → uses [z ; a_embed]
+    mode='z_only'       → ignores a_embed (for ablations/back-compat)
+    """
+    def __init__(
+        self,
+        latent_dim: int,
+        action_dim: int,
+        *,
+        mode: str = WORLD_INPUT_MODE,   # 'z_plus_action'|'z_only'
+        hidden: int = 64,
+        dropout: float = 0.0,
+    ):
         super().__init__()
-        self.model = nn.Sequential(
-            nn.Linear(latent_dim + action_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, latent_dim)
-        )
+        self.latent_dim = int(latent_dim)
+        self.action_dim = int(action_dim)
+        self.mode = (mode or "z_plus_action").lower()
+        assert self.mode in ("z_plus_action", "z_only")
 
-    def forward(self, z_t, a_t_embed):
+        in_dim = latent_dim + (action_dim if self.mode == "z_plus_action" else 0)
+        layers = [nn.Linear(in_dim, hidden), nn.GELU()]
+        if dropout and dropout > 0.0:
+            layers.append(nn.Dropout(dropout))
+        layers.append(nn.Linear(hidden, latent_dim))
+        self.model = nn.Sequential(*layers)
+
+        # init
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    @classmethod
+    def from_config(cls, cfg: dict, *, latent_dim: int | None = None, action_dim: int | None = None):
+        mcfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+        wcfg = cfg.get("world", {}) if isinstance(cfg, dict) else {}
+        ld = int(latent_dim or mcfg.get("latent_dim", LATENT_DIM))
+        ad = int(action_dim or cfg.get("ACTION_EMBED_DIM", ACTION_EMBED_DIM))
+        mode = (wcfg.get("input_mode", cfg.get("WORLD_INPUT_MODE", WORLD_INPUT_MODE)) or "z_plus_action").lower()
+        return cls(ld, ad, mode=mode)
+
+    def forward(self, z_t: torch.Tensor, a_t_embed: torch.Tensor | None = None) -> torch.Tensor:
+        if self.mode == "z_only":
+            if z_t.dim() == 1:
+                z_t = z_t.unsqueeze(0)
+            return self.model(z_t)
+        # z_plus_action
+        if a_t_embed is None:
+            raise ValueError("WorldModelMLP(mode='z_plus_action') requires a_t_embed, got None.")
+        if z_t.dim() == 1:
+            z_t = z_t.unsqueeze(0)
+        if a_t_embed.dim() == 1:
+            a_t_embed = a_t_embed.unsqueeze(0)
+        if a_t_embed.size(0) != z_t.size(0):
+            raise ValueError(f"Batch mismatch z:{z_t.size(0)} vs a:{a_t_embed.size(0)}")
+        if a_t_embed.size(-1) != self.action_dim:
+            raise ValueError(f"action_dim mismatch: expected {self.action_dim}, got {a_t_embed.size(-1)}")
+        a_t_embed = a_t_embed.to(dtype=z_t.dtype, device=z_t.device)
         combined = torch.cat([z_t, a_t_embed], dim=-1)
         return self.model(combined)
 
@@ -368,50 +422,144 @@ class PlannerHeads(nn.Module):
         )
 
 # ───────────────────────────────────────────────────────────────────────────────
-# (Optional) Phase-aware action embedding builder — not wired into old code yet.
+# Phase-aware action embedding (Phase-4)
+# ───────────────────────────────────────────────────────────────────────────────
+class PhaseAwareActionEmbedder(nn.Module):
+    """
+    Build an action embedding that encodes both phase and payload (talk cat or agent id).
+    Two strategies:
+      - kind='onehot' : [onehot(phase); onehot(payload padded)] → MLP → a_embed
+      - kind='learned': concat(Emb(phase), Emb_talk|Emb_agent) → proj → a_embed
+    API:
+      forward_b(phase: Long[B], payload: Long[B]) -> Float[B, ACTION_EMBED_DIM]
+    """
+    def __init__(
+        self,
+        *,
+        kind: str = ACTION_EMBED_KIND,           # 'onehot' | 'learned'
+        a_dim: int = ACTION_EMBED_DIM,
+        num_agents: int = NUM_AGENTS,
+        num_talk: int = NUM_TALK_CATS,
+    ):
+        super().__init__()
+        self.kind = (kind or "onehot").lower()
+        assert self.kind in ("onehot", "learned")
+        self.a_dim = int(a_dim)
+        self.num_agents = int(num_agents)
+        self.num_talk = int(num_talk)
+        self.max_payload = max(self.num_agents, self.num_talk)
+
+        if self.kind == "onehot":
+            in_dim = NUM_PHASES + self.max_payload
+            self.net = nn.Sequential(
+                nn.Linear(in_dim, 64),
+                nn.ReLU(),
+                nn.Linear(64, self.a_dim),
+            )
+            for m in self.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+                    nn.init.zeros_(m.bias)
+        else:
+            # learned: small embeddings + projection
+            d_phase = max(4, self.a_dim // 4)
+            d_pay   = max(8, self.a_dim // 2)
+            self.phase_emb = nn.Embedding(NUM_PHASES, d_phase)
+            self.talk_emb  = nn.Embedding(self.num_talk, d_pay)
+            self.agent_emb = nn.Embedding(self.num_agents, d_pay)
+            self.proj = nn.Linear(d_phase + d_pay, self.a_dim)
+            nn.init.xavier_uniform_(self.proj.weight); nn.init.zeros_(self.proj.bias)
+
+    @staticmethod
+    def _one_hot(indices: torch.Tensor, depth: int) -> torch.Tensor:
+        B = indices.shape[0]
+        out = torch.zeros(B, depth, dtype=torch.float32, device=indices.device)
+        idx = indices.clamp_(0, depth - 1)
+        out[torch.arange(B, device=indices.device), idx] = 1.0
+        return out
+
+    def forward_b(self, phase_codes: torch.Tensor, payload_idx: torch.Tensor) -> torch.Tensor:
+        """
+        phase_codes: (B,) Long in {0:DISCUSS, 1:VOTE, 2:NIGHT}
+        payload_idx: (B,) Long, cat_id for DISCUSS; agent_id for VOTE or NIGHT
+        """
+        if phase_codes.dim() != 1 or payload_idx.dim() != 1:
+            raise ValueError("phase_codes and payload_idx must be 1D tensors of shape (B,)")
+
+        if self.kind == "onehot":
+            ph = self._one_hot(phase_codes.long(), NUM_PHASES)  # (B,3)
+
+            # Build payload one-hots per phase and place into a fixed-width block [max_payload]
+            B = payload_idx.shape[0]
+            oh = torch.zeros(B, self.max_payload, dtype=torch.float32, device=payload_idx.device)
+
+            is_discuss = (phase_codes.long() == PHASES["DISCUSS"])
+            is_other   = ~is_discuss
+
+            # Discuss rows → talk space
+            if is_discuss.any():
+                p_talk = payload_idx[is_discuss].clamp(0, self.num_talk - 1)
+                rows = torch.nonzero(is_discuss, as_tuple=False).squeeze(1)
+                oh[rows, p_talk] = 1.0
+
+            # Vote/Kill rows → agent space (also left-aligned)
+            if is_other.any():
+                p_agent = payload_idx[is_other].clamp(0, self.num_agents - 1)
+                rows = torch.nonzero(is_other, as_tuple=False).squeeze(1)
+                oh[rows, p_agent] = 1.0
+
+            x = torch.cat([ph, oh], dim=1)  # (B, 3+max_payload)
+            return self.net(x)
+
+        # learned
+        ph_e = self.phase_emb(phase_codes.long())  # (B, d_phase)
+        is_discuss = (phase_codes.long() == PHASES["DISCUSS"])
+        pay_discuss = payload_idx.clamp(0, self.num_talk - 1)
+        pay_other   = payload_idx.clamp(0, self.num_agents - 1)
+
+        talk_vec  = self.talk_emb(pay_discuss)   # (B, d_pay)
+        agent_vec = self.agent_emb(pay_other)    # (B, d_pay)
+        # Row-wise select: if discuss → talk_vec else agent_vec
+        payload_e = torch.where(is_discuss.unsqueeze(1), talk_vec, agent_vec)
+        a_raw = torch.cat([ph_e, payload_e], dim=-1)
+        return self.proj(a_raw)                  # (B, a_dim)
+
+    @classmethod
+    def from_config(cls, cfg: dict) -> "PhaseAwareActionEmbedder":
+        mcfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+        kind = (cfg.get("ACTION_EMBED_KIND", ACTION_EMBED_KIND) or "onehot").lower()
+        a_dim = int(cfg.get("ACTION_EMBED_DIM", ACTION_EMBED_DIM))
+        n_agents = int(mcfg.get("num_agents", NUM_AGENTS))
+        n_talk   = int(mcfg.get("num_talk_cats", NUM_TALK_CATS))
+        return cls(kind=kind, a_dim=a_dim, num_agents=n_agents, num_talk=n_talk)
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Deprecation shim: PhaseActionEncoder → PhaseAwareActionEmbedder
 # ───────────────────────────────────────────────────────────────────────────────
 class PhaseActionEncoder(nn.Module):
     """
-    Map (phase_onehot, payload_onehot) → ACTION_DIM via small MLP.
-    Keeps a fixed ACTION_DIM regardless of which subspace produced the payload.
+    [DEPRECATED] Kept for backward compatibility.
+    Wraps PhaseAwareActionEmbedder. Old API:
+      forward(phase_code, payload_idx, *, is_talk: bool) -> (B, ACTION_DIM)
+    New usage should call PhaseAwareActionEmbedder.forward_b(phase, payload).
     """
-    def __init__(self, action_dim: int = ACTION_DIM, num_agents: int = NUM_AGENTS, num_talk: int = NUM_TALK_CATS):
+    def __init__(self, action_dim: int = ACTION_EMBED_DIM, num_agents: int = NUM_AGENTS, num_talk: int = NUM_TALK_CATS):
         super().__init__()
-        self.num_agents = num_agents
-        self.num_talk   = num_talk
-        in_dim = NUM_PHASES + max(num_agents, num_talk)
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, action_dim),
-        )
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                nn.init.zeros_(m.bias)
+        self.inner = PhaseAwareActionEmbedder(kind=ACTION_EMBED_KIND, a_dim=action_dim,
+                                              num_agents=num_agents, num_talk=num_talk)
 
-    def forward(self, phase_code: torch.Tensor, payload_idx: torch.Tensor, *, is_talk: bool) -> torch.Tensor:
-        """
-        phase_code: (B,) int in [0..2]
-        payload_idx: (B,) int  (either talk_cat_id or agent_id)
-        is_talk: which space payload_idx refers to
-        """
-        B = phase_code.shape[0]
-        ph = torch.zeros(B, NUM_PHASES, dtype=torch.float32, device=phase_code.device)
-        ph[torch.arange(B, device=phase_code.device), phase_code.clamp(0, NUM_PHASES-1)] = 1.0
-
-        space = self.num_talk if is_talk else self.num_agents
-        oh = torch.zeros(B, space, dtype=torch.float32, device=payload_idx.device)
-        pid = payload_idx.clamp(0, space-1)
-        oh[torch.arange(B, device=payload_idx.device), pid] = 1.0
-
-        # pad to max(num_agents, num_talk) so the input dim is constant
-        if space < max(self.num_agents, self.num_talk):
-            pad_cols = max(self.num_agents, self.num_talk) - space
-            oh = torch.cat([oh, torch.zeros(B, pad_cols, dtype=oh.dtype, device=oh.device)], dim=1)
-
-        x = torch.cat([ph, oh], dim=1)
-        return self.net(x)  # (B, ACTION_DIM)
+    def forward(self, phase_code: torch.Tensor, payload_idx: torch.Tensor, *, is_talk: bool | None = None) -> torch.Tensor:
+        # Accept scalars or (B,)
+        if not torch.is_tensor(phase_code):
+            phase_code = torch.tensor([int(phase_code)], dtype=torch.long)
+        if not torch.is_tensor(payload_idx):
+            payload_idx = torch.tensor([int(payload_idx)], dtype=torch.long)
+        if phase_code.dim() == 0:
+            phase_code = phase_code.unsqueeze(0)
+        if payload_idx.dim() == 0:
+            payload_idx = payload_idx.unsqueeze(0)
+        # Ignore is_talk (phase determines space); kept for signature compat.
+        return self.inner.forward_b(phase_code.long(), payload_idx.long())
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Feature packaging (add meta-friendly variant for logging)

@@ -18,11 +18,23 @@ def _load_config(path: str = "config.yaml") -> dict:
 
 CFG = _load_config()
 
-# ── Config values
-MODEL_ID = CFG.get("LLM_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2")
-LLM_SPEAKER = bool(CFG.get("LLM_SPEAKER", False))
+# --------- OS ENV SHIM HELPERS (env overrides YAML; safe parsing) ----------
+def _env_bool(key: str, default: bool) -> bool:
+    v = os.getenv(key)
+    if v is None:
+        return default
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
 
-_cfg_device = str(CFG.get("LLM_DEVICE", "") or "").strip().lower()
+def _env_str(key: str, default: str) -> str:
+    v = os.getenv(key)
+    return v if v is not None else default
+# --------------------------------------------------------------------------
+
+# ── Config values (env → YAML → defaults)
+MODEL_ID = _env_str("LLM_MODEL_ID", CFG.get("LLM_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2"))
+LLM_SPEAKER = _env_bool("LLM_SPEAKER", bool(CFG.get("LLM_SPEAKER", False)))
+
+_cfg_device = _env_str("LLM_DEVICE", str(CFG.get("LLM_DEVICE", "") or "")).strip().lower()
 if _cfg_device:
     device = _cfg_device  # "", "cpu", "cuda", "cuda:0"
 else:
@@ -61,7 +73,15 @@ if getattr(model.config, "pad_token_id", None) is None:
 model = model.to(device)
 
 # ── 3) Pipeline
-pipe_device = 0 if device.startswith("cuda") else -1
+if device.startswith("cuda"):
+    # accept "cuda" or "cuda:0" → 0
+    try:
+        pipe_device = 0 if device == "cuda" else int(device.split(":")[1])
+    except Exception:
+        pipe_device = 0
+else:
+    pipe_device = -1
+
 llm_pipeline = pipeline(
     "text-generation",
     model=model,
@@ -283,7 +303,7 @@ def chatgpt_llm_with_bias(z, agent) -> str:
     persona_effects = getattr(agent, "persona_effects", None)
     proc_kwargs = with_logit_bias_generate_kwargs(
         tokenizer=tok,
-               head=head,
+        head=head,
         z_t=z.detach() if torch.is_tensor(z) else torch.tensor(z),
         role=agent.role,
         recent_texts=_recent_texts(agent, k=3),
@@ -324,6 +344,6 @@ def chatgpt_llm_with_bias(z, agent) -> str:
         print(f"[LLM ERROR-bias] {e}")
         return "..."
 
-# Optional convenience: pick mouthpiece by config
+# Optional convenience: pick mouthpiece by config/env
 def llm_fn_from_env():
     return chatgpt_llm_with_bias if LLM_SPEAKER else chatgpt_llm_from_latent

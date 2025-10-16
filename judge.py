@@ -7,29 +7,66 @@ from typing import Dict, Any, List, Optional, Tuple
 import torch, yaml
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 
-# ────────────── Env ──────────────
-with open("config.yaml", "r") as f:
-    config = yaml.safe_load(f)
+# ────────────── Config + Env helpers ──────────────
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    return default if v is None else str(v).strip().lower() in ("1","true","yes","y","on")
 
-JUDGE_MODEL_ID = config.get("JUDGE_MODEL_ID", "meta-llama/Llama-3.1-8B-Instruct")
-JUDGE_MAX_NEW = int(config.get("JUDGE_MAX_NEW", 128))
-INCLUDE_RATIONALE = bool(config.get("INCLUDE_RATIONALE", True))
-ENABLE_PERSONA_STEER = bool(config.get("ENABLE_PERSONA_STEER", False))
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None: return default
+    try: return int(v)
+    except Exception: return default
+
+def _env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None: return default
+    try: return float(v)
+    except Exception: return default
+
+def _env_str(name: str, default: str) -> str:
+    v = os.getenv(name)
+    return default if v is None else str(v)
+
+with open("config.yaml", "r") as f:
+    config = yaml.safe_load(f) or {}
+
+# ────────────── Base config values (from file) ──────────────
+JUDGE_MODEL_ID      = config.get("JUDGE_MODEL_ID", "meta-llama/Llama-3.1-8B-Instruct")
+JUDGE_MAX_NEW       = int(config.get("JUDGE_MAX_NEW", 128))
+INCLUDE_RATIONALE   = bool(config.get("INCLUDE_RATIONALE", True))
+ENABLE_PERSONA_STEER= bool(config.get("ENABLE_PERSONA_STEER", False))
 PERSONA_CONFIG_PATH = config.get("PERSONA_CONFIG_PATH", "configs/persona_vectors.yaml")
-JUDGE_DEVICE = config.get("JUDGE_DEVICE", "").lower()
-JUDGE_BATCH = max(1, int(config.get("JUDGE_BATCH", 3)))
-JUDGE_DEBUG = bool(config.get("JUDGE_DEBUG", False))
-JUDGE_DEBUG_DIR = config.get("JUDGE_DEBUG_DIR", "logs")
+JUDGE_DEVICE        = str(config.get("JUDGE_DEVICE", "")).lower()
+JUDGE_BATCH         = max(1, int(config.get("JUDGE_BATCH", 3)))
+JUDGE_DEBUG         = bool(config.get("JUDGE_DEBUG", False))
+JUDGE_DEBUG_DIR     = config.get("JUDGE_DEBUG_DIR", "logs")
+
+# ────────────── Env overrides (SLURM-friendly shims) ──────────────
+JUDGE_MODEL_ID       = _env_str ("JUDGE_MODEL_ID",       JUDGE_MODEL_ID)
+JUDGE_MAX_NEW        = _env_int ("JUDGE_MAX_NEW",        JUDGE_MAX_NEW)
+INCLUDE_RATIONALE    = _env_bool("INCLUDE_RATIONALE",    INCLUDE_RATIONALE)
+ENABLE_PERSONA_STEER = _env_bool("ENABLE_PERSONA_STEER", ENABLE_PERSONA_STEER)
+PERSONA_CONFIG_PATH  = _env_str ("PERSONA_CONFIG_PATH",  PERSONA_CONFIG_PATH)
+JUDGE_DEVICE         = _env_str ("JUDGE_DEVICE",         JUDGE_DEVICE).lower()
+JUDGE_BATCH          = max(1, _env_int("JUDGE_BATCH",    JUDGE_BATCH))
+JUDGE_DEBUG          = _env_bool("JUDGE_DEBUG",          JUDGE_DEBUG)
+JUDGE_DEBUG_DIR      = _env_str ("JUDGE_DEBUG_DIR",      JUDGE_DEBUG_DIR)
 
 # ────────────── NEW: audit logging routed by config.logging (add-only) ──────────────
 _LOGGING = config.get("logging", {}) if isinstance(config.get("logging", {}), dict) else {}
-JUDGE_AUDIT_JSONL = _LOGGING.get("judge_jsonl", os.path.join(JUDGE_DEBUG_DIR, "judge_calls.jsonl"))
-JUDGE_AUDIT_DEBUG = bool(_LOGGING.get("debug", JUDGE_DEBUG))  # prefer config.logging.debug, fallback to JUDGE_DEBUG
+# Allow either config.logging.judge_jsonl or JUDGE_AUDIT_JSONL env; fall back to JUDGE_DEBUG_DIR/judge_calls.jsonl
+JUDGE_AUDIT_JSONL = _env_str(
+    "JUDGE_AUDIT_JSONL",
+    _LOGGING.get("judge_jsonl", os.path.join(JUDGE_DEBUG_DIR, "judge_calls.jsonl")),
+)
+# Prefer config.logging.debug unless overridden explicitly via env JUDGE_AUDIT_DEBUG / JUDGE_DEBUG
+JUDGE_AUDIT_DEBUG = _env_bool("JUDGE_AUDIT_DEBUG", bool(_LOGGING.get("debug", JUDGE_DEBUG)))
 
 def judge_logging_enabled() -> bool:
     """
     Unified check to decide whether to write rich JSONL audit traces.
-    Honors config.logging.debug (preferred) and falls back to JUDGE_DEBUG.
+    Honors config.logging.debug/env and falls back to JUDGE_DEBUG.
     """
     return bool(JUDGE_AUDIT_DEBUG or JUDGE_DEBUG)
 

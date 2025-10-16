@@ -1,269 +1,233 @@
-# speaker.py
-# Deterministic, mask-aware template speaker with logging + REINFORCE.
+# speaker_llm.py
+# Trainable, lexicon-guided logit bias head for the LLM mouthpiece.
 from __future__ import annotations
-import os, json, math, random, hashlib
-from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, Tuple
+import os, math, json
+from typing import Dict, List, Optional, Any, Tuple
 
-import torch, yaml
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import yaml
 
-# ── Config
+# ───────────────────────── Config + env shims ─────────────────────────
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    return default if v is None else str(v).strip().lower() in ("1","true","yes","y","on")
+
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None: return default
+    try: return int(v)
+    except Exception: return default
+
+def _env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None: return default
+    try: return float(v)
+    except Exception: return default
+
+def _env_str(name: str, default: str) -> str:
+    v = os.getenv(name)
+    return default if v is None else str(v)
+
 with open("config.yaml", "r") as f:
     CFG = yaml.safe_load(f) or {}
 
-SPEAKER_SEED: Optional[int] = CFG.get("SPEAKER_SEED", None)
-SPEAKER_DEBUG: bool = bool(CFG.get("SPEAKER_DEBUG", False))
-SPEAKER_LOG_DIR: str = CFG.get("SPEAKER_LOG_DIR", "logs")
-SPEAKER_TEMP: float = float(CFG.get("SPEAKER_TEMP", 1.0))
-SPEAKER_EPS: float = float(CFG.get("SPEAKER_EPS", 0.05))       # ε-greedy on top of softmax
-SPEAKER_HIST_K: int = int(CFG.get("SPEAKER_HIST_K", 3))        # recent lines to featurize
-SPEAKER_ENTROPY_BONUS: float = float(CFG.get("SPEAKER_ENTROPY_BONUS", 0.01))
-SPEAKER_LR: float = float(CFG.get("SPEAKER_LR", 1e-3))
+# Legacy speaker_llm keys (present in your config.yaml)
+_BIAS_CAP          = float(CFG.get("BIAS_CAP", 2.0))
+_BASE_STRENGTH     = float(CFG.get("BASE_STRENGTH", 1.0))
+_SPK_DEBUG         = bool(CFG.get("DEBUG", False))
+_DEFAULT_LEXICON   = dict(CFG.get("DEFAULT_LEXICON", {
+    "accuse":   ["accuse", "suspicious", "suspect", "lying", "deceive", "eliminate", "vote"],
+    "defend":   ["defend", "innocent", "trust", "ally", "support", "clear"],
+    "hedge":    ["maybe", "perhaps", "uncertain", "unsure", "might", "seems", "appears"],
+    "question": ["why", "how", "what", "who", "where", "when", "?"],
+    "vote":     ["vote", "eliminate", "banish", "target", "lynch"],
+}))
+_CAT_ORDER         = list(CFG.get("CAT_ORDER", ["accuse", "defend", "hedge", "question", "vote"]))
+_SPEAKER_HIST_K    = int(CFG.get("SPEAKER_HIST_K", 3))  # shared with speaker.py
 
-# ── Stable, shared historical features (also imported by speaker_llm.py)
-def make_hist_feats(recent_texts: List[str]) -> torch.Tensor:
-    """
-    Short, stable features from last K messages:
-      [accuse_rate, mean_len_100]
-    """
-    if not recent_texts:
+# Env overrides (SLURM-friendly)
+BIAS_CAP        = _env_float("BIAS_CAP", _BIAS_CAP)
+BASE_STRENGTH   = _env_float("BASE_STRENGTH", _BASE_STRENGTH)
+LLM_SPK_DEBUG   = _env_bool ("LLM_SPK_DEBUG", _SPK_DEBUG)
+SPEAKER_HIST_K  = _env_int  ("SPEAKER_HIST_K", _SPEAKER_HIST_K)
+
+# Normalized, ordered lexicon + a safe map (word -> token ids built in runtime)
+CAT_ORDER       = _CAT_ORDER
+DEFAULT_LEXICON = {k: list(v) for k, v in _DEFAULT_LEXICON.items() if k in CAT_ORDER}
+
+# Pull short history features from speaker.py (shared)
+try:
+    from speaker import make_hist_feats
+except Exception:
+    def make_hist_feats(recent_texts: List[str]) -> torch.Tensor:
+        # Minimal fallback: zeros when speaker.py isn’t available.
         return torch.tensor([0.0, 0.0], dtype=torch.float32)
-    n = len(recent_texts)
-    accuse_like = ("accuse", "suspect", "vote", "eliminate", "target", "lynch")
-    acc = sum(any(w in t.lower() for w in accuse_like) for t in recent_texts) / max(1, n)
-    mean_len = sum(len(t) for t in recent_texts) / max(1, n)
-    return torch.tensor([acc, min(1.5, mean_len / 100.0)], dtype=torch.float32)
 
-# ── Default templates (can be overridden in config)
-DEFAULT_TEMPLATES: List[str] = CFG.get("DEFAULT_TEMPLATES", [
-    "Accuse {target}",
-    "Defend {ally}",
-    "Ask {target} a question",
-    "Express uncertainty",
-    "Propose vote on {target}",
-])
-
-# Optional explicit mapping to coarse categories (helps logging/analytics)
-TEMPLATE_CATS: List[str] = CFG.get("TEMPLATE_CATS", [
-    "accuse", "defend", "question", "hedge", "vote"
-])
-
-def _role_to_bit(role: Optional[str]) -> float:
-    r = (role or "").lower()
-    return 1.0 if r.startswith("were") else 0.0  # 1 = werewolf, 0 = villager/worker
-
-def _rng_for_agent(agent_name: str, fallback_seed: Optional[int]) -> random.Random:
+# ───────────────────────── Model: LogitBiasHead ─────────────────────────
+class LogitBiasHead(nn.Module):
     """
-    Per-agent reproducible RNG: hash(agent_name) mixed with SPEAKER_SEED.
-    Ensures: same config + same roster ⇒ same speaker choices.
+    Tiny head that maps (z_t, short text history) → per-category bias strengths.
+    These strengths are applied to token logits belonging to each category set.
     """
-    base = 0 if fallback_seed is None else int(fallback_seed)
-    h = int(hashlib.sha256(agent_name.encode("utf-8")).hexdigest(), 16) & 0xFFFFFFFF
-    return random.Random((base ^ h) & 0xFFFFFFFF)
-
-def _safe_choice(rng: random.Random, seq: List[str]) -> Optional[str]:
-    if not seq:
-        return None
-    return seq[rng.randrange(len(seq))]
-
-def _mask_targets(candidate_targets: List[str], self_name: str, alive_names: Optional[List[str]]) -> List[str]:
-    alive = set(alive_names) if alive_names else set(candidate_targets)
-    return [t for t in candidate_targets if t in alive and t != self_name]
-
-def _softmax_sample(rng: random.Random, logits: torch.Tensor, eps: float = 0.0, temp: float = 1.0) -> int:
-    if logits.numel() == 1:
-        return 0
-    x = logits / max(1e-6, float(temp))
-    probs = torch.softmax(x, dim=-1)
-    if rng.random() < eps:
-        return rng.randrange(len(probs))
-    # Gumbel trick with external RNG for determinism
-    u = torch.tensor([max(1e-9, min(1.0-1e-9, rng.random())) for _ in range(len(probs))], dtype=probs.dtype)
-    g = -torch.log(-torch.log(u))
-    return int(torch.argmax(torch.log(probs + 1e-9) + g).item())
-
-def _fill_template(
-    tmpl: str,
-    *,
-    rng: random.Random,
-    self_name: str,
-    candidate_targets: List[str],
-    alive_names: Optional[List[str]] = None,
-) -> Tuple[str, Dict[str, Any]]:
-    """Fill placeholders conservatively; never select self; prefer alive targets."""
-    targets = _mask_targets(candidate_targets, self_name, alive_names)
-    ally = _safe_choice(rng, targets) or _safe_choice(rng, candidate_targets) or self_name
-    target = _safe_choice(rng, targets) or ally
-
-    text = tmpl
-    text = text.replace("{self}", self_name)
-    text = text.replace("{target}", target if target else self_name)
-    text = text.replace("{ally}", ally if ally else self_name)
-    return text, {"target": target, "ally": ally}
-
-# ───────────────────────── SpeakerBandit ─────────────────────────
-
-class SpeakerBandit(nn.Module):
-    """
-    Tiny template selector conditioned on z, role_bit and short history features.
-    - Deterministic per-agent RNG
-    - Returns (text, meta) where meta holds tensors your train loop expects
-    - learn_step: simple REINFORCE over template logits using judge rewards
-    """
-    def __init__(self, latent_dim: int, num_templates: int, hidden: int = 128):
+    def __init__(self, latent_dim: int = 32, hidden: int = 128, num_cats: Optional[int] = None):
         super().__init__()
         self.latent_dim = int(latent_dim)
-        self.num_templates = int(num_templates)
+        self.num_cats   = int(num_cats if num_cats is not None else len(CAT_ORDER))
+        in_dim = latent_dim + 2  # 2 = make_hist_feats(recent_texts)
         self.net = nn.Sequential(
-            nn.Linear(latent_dim + 1 + 2, hidden),
+            nn.Linear(in_dim, hidden),
             nn.Tanh(),
-            nn.Linear(hidden, num_templates)
+            nn.Linear(hidden, self.num_cats)
         )
-        self.temperature: float = SPEAKER_TEMP
+        # Cap and base scale read from cfg/env
+        self.bias_cap = float(BIAS_CAP)
+        self.base     = float(BASE_STRENGTH)
 
-    def forward(self, z_t: torch.Tensor, role_bit: torch.Tensor, hist_feats: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([z_t, role_bit, hist_feats], dim=-1)
-        return self.net(x)  # unnormalized logits over templates
+    def forward(self, z_t: torch.Tensor, hist_feats: torch.Tensor) -> torch.Tensor:
+        """
+        z_t: [d] or [B,d]
+        hist_feats: [2] or [B,2]
+        returns: [num_cats] or [B,num_cats] (unnormalized strengths)
+        """
+        if z_t.dim() == 1:         z_t = z_t.unsqueeze(0)
+        if hist_feats.dim() == 1:  hist_feats = hist_feats.unsqueeze(0)
+        x = torch.cat([z_t, hist_feats], dim=-1)
+        raw = self.net(x)                          # [-inf, +inf]
+        # squash → [-bias_cap, +bias_cap] around 0; then add base scale multiplier
+        bias = torch.tanh(raw) * self.bias_cap
+        return self.base * bias                    # final per-category strengths
 
-    @torch.no_grad()
-    def generate(
+# ───────────────────────── Generation glue ─────────────────────────
+class _CategoryBiasProcessor:
+    """
+    A light-weight logits processor that adds category-wise bias to token ids.
+
+    token_bias[id] = sum_k bias_k * mask_k[id]
+    where mask_k[id] ∈ {0,1} indicates membership of token id in category k.
+    """
+    def __init__(
         self,
-        *,
-        z_t: torch.Tensor,
-        role: Optional[str],
-        recent_texts: List[str],
-        templates: List[str],
-        candidate_targets: List[str],
-        self_name: str,
-        persona_effects: Optional[Dict[str, float]] = None,
-        alive_names: Optional[List[str]] = None,
-    ) -> Tuple[str, Dict[str, Any]]:
-        """
-        Returns:
-          text: filled utterance
-          meta: {
-             "template_id": int,
-             "role_bit": Tensor[1],
-             "hist_feats": Tensor[2],
-             "choice_probs": Tensor[num_templates],
-             "temperature": float,
-             "eps": float,
-             "persona_effects": dict,
-             "cat": str,
-          }
-        """
-        device = next(self.parameters()).device
-        if z_t.dim() == 1:
-            z_t = z_t.unsqueeze(0)
-        z_t = z_t.to(device)
+        token_bias: torch.Tensor,            # [V] on the same device as scores
+        debug: bool = False,
+    ):
+        self.token_bias = token_bias
+        self.debug = debug
 
-        rb = torch.tensor([[ _role_to_bit(role) ]], dtype=z_t.dtype, device=device)         # [1,1]
-        h  = make_hist_feats(recent_texts).to(device).unsqueeze(0)                           # [1,2]
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        # scores: [V] or [B,V]; input_ids unused (stateless bias)
+        if scores.dim() == 1:
+            out = scores + self.token_bias.to(scores.device)
+        else:
+            out = scores + self.token_bias.to(scores.device).unsqueeze(0).expand_as(scores)
+        return out
 
-        logits = self.forward(z_t, rb, h).squeeze(0)                                         # [T]
-        temp = max(0.2, float(self.temperature))
-        eps  = max(0.0, min(0.5, SPEAKER_EPS))
+def _build_token_sets(tokenizer, lexicon: Dict[str, List[str]]) -> Dict[str, List[int]]:
+    """
+    Turn category lexicon into token-id sets (greedy: takes first id for each word,
+    plus '?' literal support). We avoid breaking multi-token words; this is a
+    pragmatic heuristic for gentle biasing.
+    """
+    cat2ids: Dict[str, List[int]] = {}
+    for cat, words in lexicon.items():
+        ids: List[int] = []
+        for w in words:
+            if w == "?":
+                # Prefer the single '?' token if present; otherwise skip
+                enc = tokenizer("?")["input_ids"]
+                if len(enc) == 1:
+                    ids.append(int(enc[0]))
+                continue
+            # encode without specials; take the first token only
+            enc = tokenizer(w, add_special_tokens=False)["input_ids"]
+            if enc:
+                ids.append(int(enc[0]))
+        # Deduplicate
+        cat2ids[cat] = sorted(list({i for i in ids if i is not None}))
+    return cat2ids
 
-        # Persona nudges (subtle; keeps behavior stable)
-        bias = 0.0
+def _make_bias_vector(
+    *,
+    tokenizer,
+    head: LogitBiasHead,
+    z_t: torch.Tensor,
+    recent_texts: List[str],
+    persona_effects: Optional[Dict[str, float]] = None,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Returns:
+      token_bias: Tensor[V] — per-vocab additive bias
+      cat_strengths: {cat: float} — for optional debug logging
+    """
+    device = next(head.parameters()).device if any(p.requires_grad for p in head.parameters()) else (z_t.device if z_t.is_cuda else torch.device("cpu"))
+    z = z_t.detach().to(device)
+    hist = make_hist_feats(recent_texts).to(device)
+
+    with torch.no_grad():
+        strengths = head(z, hist).squeeze(0)   # [C]
+        # Optional persona tweak (very small; stable)
         if persona_effects:
-            bias = float(persona_effects.get("accuse_bias", 0.0))  # in [-0.2, +0.2]
-        # If we know categories, add a tiny bias to the matching template ids
-        if TEMPLATE_CATS and len(TEMPLATE_CATS) == len(templates):
-            for i, cat in enumerate(TEMPLATE_CATS):
-                if cat == "accuse":
-                    logits[i] = logits[i] + bias
-
-        rng = _rng_for_agent(self_name, SPEAKER_SEED)
-        idx = _softmax_sample(rng, logits, eps=eps, temp=temp)
-
-        # fill the chosen template
-        tmpl = templates[idx] if 0 <= idx < len(templates) else templates[0]
-        text, fill_meta = _fill_template(
-            tmpl, rng=rng, self_name=self_name,
-            candidate_targets=candidate_targets, alive_names=alive_names
-        )
-
-        probs = torch.softmax(logits / temp, dim=-1)
-
-        cat = TEMPLATE_CATS[idx] if 0 <= idx < len(TEMPLATE_CATS) else "other"
-        meta = {
-            "template_id": int(idx),
-            "role_bit": rb.squeeze(0).detach().cpu(),     # Tensor[1]
-            "hist_feats": h.squeeze(0).detach().cpu(),    # Tensor[2]
-            "choice_probs": probs.detach().cpu(),         # Tensor[T]
-            "temperature": temp,
-            "eps": eps,
-            "persona_effects": dict(persona_effects or {}),
-            "cat": cat,
-            **fill_meta
-        }
-
-        if SPEAKER_DEBUG:
+            # Example: nudge 'accuse' via persona scale
+            scale = float(persona_effects.get("accuse_bias_scale", 1.0))
             try:
-                os.makedirs(SPEAKER_LOG_DIR, exist_ok=True)
-                with open(os.path.join(SPEAKER_LOG_DIR, "speaker_decisions.jsonl"), "a", encoding="utf-8") as f:
-                    row = {
-                        "agent": self_name,
-                        "role": role,
-                        "template": tmpl,
-                        "filled": text,
-                        "cat": cat,
-                        "target": fill_meta.get("target"),
-                        "ally": fill_meta.get("ally"),
-                        "temp": temp,
-                        "eps": eps,
-                        "probs": [float(x) for x in probs.tolist()],
-                    }
-                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
-            except Exception as e:
-                print("[SPEAKER-DBG] log write failed:", e)
+                idx = CAT_ORDER.index("accuse")
+                strengths[idx] = strengths[idx] * max(0.5, min(1.5, scale))
+            except Exception:
+                pass
 
-        return text, meta
+    # Map categories → token ids and assemble per-token bias
+    cat2ids = _build_token_sets(tokenizer, DEFAULT_LEXICON)
+    vocab_size = int(getattr(tokenizer, "vocab_size", 0) or len(tokenizer))
+    token_bias = torch.zeros(vocab_size, dtype=torch.float32, device=device)
 
-    def learn_step(
-        self,
-        batch: List[Dict[str, Any]],
-        opt: Optional[torch.optim.Optimizer] = None,
-        *,
-        entropy_bonus: float = SPEAKER_ENTROPY_BONUS,
-        baseline: float = 0.0,
-    ) -> Dict[str, float]:
-        """
-        batch[i]:
-        {
-          "z": Tensor[d],
-          "role_bit": Tensor[1],
-          "hist_feats": Tensor[2],
-          "template_id": int,
-          "reward": float,
-        }
-        """
-        if not batch:
-            return {"loss": 0.0, "entropy": 0.0, "R_mean": 0.0}
+    cat_strengths_out: Dict[str, float] = {}
+    for i, cat in enumerate(CAT_ORDER):
+        s = float(strengths[i].item() if i < strengths.numel() else 0.0)
+        cat_strengths_out[cat] = s
+        for tid in cat2ids.get(cat, []):
+            if 0 <= tid < vocab_size:
+                token_bias[tid] = token_bias[tid] + s
 
-        device = next(self.parameters()).device
-        zs   = torch.stack([b["z"] for b in batch]).to(device)                              # [B,d]
-        rbit = torch.stack([b["role_bit"] for b in batch]).to(device)                       # [B,1]
-        hfs  = torch.stack([b["hist_feats"] for b in batch]).to(device)                     # [B,2]
-        acts = torch.tensor([int(b["template_id"]) for b in batch], device=device)          # [B]
-        R    = torch.tensor([float(b["reward"]) for b in batch], device=device)             # [B]
+    return token_bias, cat_strengths_out
 
-        logits = self.forward(zs, rbit, hfs)                                                # [B,T]
-        logp = F.log_softmax(logits, dim=-1).gather(1, acts.view(-1,1)).squeeze(1)          # [B]
-        ent = -(F.softmax(logits, dim=-1) * F.log_softmax(logits, dim=-1)).sum(dim=-1).mean()
+def with_logit_bias_generate_kwargs(
+    *,
+    tokenizer,
+    head: LogitBiasHead,
+    z_t: torch.Tensor,
+    role: Optional[str],
+    recent_texts: List[str],
+    persona_effects: Optional[Dict[str, float]] = None,
+) -> Dict[str, Any]:
+    """
+    Returns kwargs to pass into HF pipeline(..., **kwargs) so the LLM generation
+    is nudged by our bias head. Keeps interface used by llm_script.py.
+    """
+    token_bias, cat_strengths = _make_bias_vector(
+        tokenizer=tokenizer,
+        head=head,
+        z_t=z_t,
+        recent_texts=recent_texts[-SPEAKER_HIST_K:] if SPEAKER_HIST_K > 0 else recent_texts,
+        persona_effects=persona_effects,
+    )
 
-        # REINFORCE objective
-        loss = -( (R - baseline) * logp ).mean() - float(entropy_bonus) * ent
+    if LLM_SPK_DEBUG:
+        try:
+            dbg = {
+                "role": role,
+                "recent_texts": recent_texts[-SPEAKER_HIST_K:],
+                "cat_strengths": {k: round(float(v), 3) for k, v in cat_strengths.items()},
+            }
+            print("[LLM-SPK]", json.dumps(dbg))
+        except Exception:
+            pass
 
-        if opt is None:
-            opt = torch.optim.Adam(self.parameters(), lr=SPEAKER_LR)
+    # Create a processor instance; HF pipeline will call it each decode step
+    proc = _CategoryBiasProcessor(token_bias=token_bias, debug=LLM_SPK_DEBUG)
 
-        opt.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
-        opt.step()
-
-        return {"loss": float(loss.item()), "entropy": float(ent.item()), "R_mean": float(R.mean().item())}
+    # The HF pipeline accepts 'logits_processor' via 'generate_kwargs' (for pipelines:
+    # pass-through arbitrary kwargs). Some versions expect a list named 'logits_processor'.
+    return {
+        "logits_processor": [proc],
+    }

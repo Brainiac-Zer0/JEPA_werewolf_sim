@@ -16,6 +16,8 @@
 #   * Proper boolean masks (self/dead/wolves)
 #   * Judge re-ranking over VoteHead top-k
 #   * Phase-aware rollout tuples: (z_t, phase_code, payload_idx, z_{t+1}, role)
+#   * (This build) Planner×Judge mixing, social influence knobs, talk mask logging,
+#                  optional Δz for TALK and KILL
 # -----------------------------------------------------------------------------
 
 import sys
@@ -89,6 +91,58 @@ SAVE_CFG_SNAPSHOT = bool(CFG.get("runtime", {}).get("save_config_snapshot", True
 SEEDS = CFG.get("seeds", {}) if isinstance(CFG.get("seeds", {}), dict) else {}
 SEED_GLOBAL = int(SEEDS.get("global", 123))
 
+# NEW: sim-level knobs (planner×judge mixing, Δz logs)
+SIM_CFG = CFG.get("sim", {}) if isinstance(CFG.get("sim"), dict) else {}
+VOTE_MIX_ALPHA: float = float(SIM_CFG.get("vote_mix_alpha", 0.0))  # 0.0 judge-only among top-k; 1.0 planner-only
+LOG_DZ_TALK: bool = bool(SIM_CFG.get("log_dz_talk", False))
+LOG_DZ_KILL: bool = bool(SIM_CFG.get("log_dz_kill", False))
+
+# NEW: social influence knobs
+# Prefer modern `sim.social`, fallback to legacy `social_influence` if present.
+_SOC_SECTION = SIM_CFG.get("social", None)
+if not isinstance(_SOC_SECTION, dict):
+    _SOC_SECTION = CFG.get("social_influence", {}) if isinstance(CFG.get("social_influence"), dict) else {}
+SOC_CFG = _SOC_SECTION
+SOC_ENABLED: bool = bool(SOC_CFG.get("enabled", True))
+SOC_K: int = int(SOC_CFG.get("K", 6))                 # number of recent utterances
+SOC_SCALE: float = float(SOC_CFG.get("scale", 1.0))   # scaling on δ_social
+
+# ── ENV OVERRIDES (job script shims)
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name, None)
+    if v is None:
+        return default
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name, None)
+    if v is None:
+        return default
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+def _env_float(name: str, default: float) -> float:
+    v = os.getenv(name, None)
+    if v is None:
+        return default
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+USE_LANGUAGE   = _env_bool("USE_LANGUAGE", USE_LANGUAGE)
+PLANNER_TOPK   = _env_int("PLANNER_TOPK", PLANNER_TOPK)
+VOTE_MIX_ALPHA = _env_float("VOTE_MIX_ALPHA", VOTE_MIX_ALPHA)
+LOG_DZ_TALK    = _env_bool("LOG_DZ_TALK", LOG_DZ_TALK)
+LOG_DZ_KILL    = _env_bool("LOG_DZ_KILL", LOG_DZ_KILL)
+
+# Social overrides
+SOC_ENABLED = _env_bool("SOC_ENABLED", SOC_ENABLED)
+SOC_K       = _env_int("SOC_K", SOC_K)
+SOC_SCALE   = _env_float("SOC_SCALE", SOC_SCALE)
+
 # ── runtime globals (populated iff visual=True)
 screen = font = font_s = clock = None
 msg_log: deque[tuple[str, str]] = deque(maxlen=200)
@@ -147,6 +201,32 @@ def emit_event(rows, *, run_id, round_num, phase_code, phase_str, agent, role,
         "speaker_mode": speaker_mode,
         "persona_norm": persona_norm,
     })
+
+# NEW: mix helpers (planner × judge)
+def _safe_norm_probs(x: torch.Tensor) -> torch.Tensor:
+    s = float(x.sum().item())
+    if s <= 0.0 or not torch.isfinite(x).all():
+        return torch.full_like(x, 1.0 / max(1, x.numel()))
+    return x / s
+
+def _mix_topk_scores(topk_probs_planner: List[float], judged: List[dict], alpha: float) -> int:
+    """
+    Return index into top-k list using convex mix:
+      alpha * planner_probs + (1-alpha) * normalized_judge_scores
+    """
+    if alpha <= 0.0:
+        return max(range(len(judged)), key=lambda i: float(judged[i].get("score", 0.0)))
+    if alpha >= 1.0:
+        return int(torch.tensor(topk_probs_planner).argmax().item())
+
+    p_pl = torch.tensor([max(0.0, float(p)) for p in topk_probs_planner], dtype=torch.float32)
+    p_pl = _safe_norm_probs(p_pl)
+
+    p_j = torch.tensor([max(0.0, float(x.get("score", 0.0))) for x in judged], dtype=torch.float32)
+    p_j = _safe_norm_probs(p_j)
+
+    mix = alpha * p_pl + (1.0 - alpha) * p_j
+    return int(torch.argmax(mix).item())
 
 # ╭────────────────────────── UI HELPERS ───────────────────────────╮
 def _wrap(text: str, fnt: pygame.font.Font, width: int) -> list[str]:
@@ -356,6 +436,12 @@ def simulate_game(visual: bool = True):
         living = [a for a in agents if a.alive]
         print(f"\n=== Day {round_num} ===")
 
+        # ─── optional: cache z pre-talk for Δz(TALK)
+        z_pre_talk: Dict[str, torch.Tensor] = {}
+        if LOG_DZ_TALK:
+            for ag in living:
+                z_pre_talk[ag.name] = ag.encode_current_belief(round_num, agents).detach()
+
         # ─── Asynchronous dialogue (one future per agent) ───
         futures = {executor.submit(a.speak, round_num, agents): a for a in living}
         while futures:
@@ -368,16 +454,16 @@ def simulate_game(visual: bool = True):
                     msg_log.append((ag.name, msg))
 
                 # If TalkHead is available, infer a talk category for logging/telemetry
+                num_cats = 5  # fallback
                 try:
                     fp = _get_heads(ag)
                     if hasattr(fp, "talk"):
                         with torch.no_grad():
                             z_t_talk = ag.encode_current_belief(round_num, agents)
-                            # infer number of categories from TalkHead final layer
                             try:
                                 num_cats = int(fp.talk.net[-1].out_features)  # type: ignore[attr-defined]
                             except Exception:
-                                num_cats = 5  # fallback default
+                                num_cats = 5
                             tmask = _talk_mask(num_cats).unsqueeze(0)  # (1, C)
                             t_logits = fp.talk(z_t_talk.unsqueeze(0), mask=tmask).squeeze(0)
                             ag.talk_category_last = int(torch.argmax(t_logits).item())
@@ -385,6 +471,17 @@ def simulate_game(visual: bool = True):
                         ag.talk_category_last = int(getattr(ag, "talk_category_last", -1))
                 except Exception:
                     ag.talk_category_last = int(getattr(ag, "talk_category_last", -1))
+
+                # NEW: log TALK mask (category IDs) for this speaker
+                try:
+                    mask_logs.append({
+                        "round": round_num,
+                        "phase": "DAY_DISCUSS",
+                        "actor": ag.name,
+                        "mask": [f"cat_{i}" for i in range(int(num_cats))]
+                    })
+                except Exception:
+                    pass
 
                 # NEW: log TALK row (phase-aware + numeric payload)
                 phase_log.append({"round": round_num, "phase": "DAY_DISCUSS"})
@@ -398,6 +495,25 @@ def simulate_game(visual: bool = True):
                     speaker_mode=getattr(ag, "speaker_mode", "") or "",
                     persona_norm=getattr(ag, "persona_norm", 0.0),
                 )
+
+                # optional Δz for TALK: measure after the agent has spoken
+                if LOG_DZ_TALK and ag.name in z_pre_talk:
+                    try:
+                        z_post = ag.encode_current_belief(round_num, agents).detach()
+                        dz_l2 = float(torch.norm(z_post - z_pre_talk[ag.name]).item())
+                        dz_1mcos = float(1.0 - F.cosine_similarity(
+                            z_post.unsqueeze(0), z_pre_talk[ag.name].unsqueeze(0)
+                        ).item())
+                        # backfill into the latest DAY_DISCUSS row for this agent
+                        for row in reversed(metrics_rows):
+                            if row["round"] != round_num:
+                                break
+                            if row["phase"] == "DAY_DISCUSS" and row["agent"] == ag.name and not row.get("dz_l2"):
+                                row["dz_l2"] = f"{dz_l2:.6f}"
+                                row["dz_1mcos"] = f"{dz_1mcos:.6f}"
+                                break
+                    except Exception:
+                        pass
 
             if visual:
                 draw_agents(agents)
@@ -416,23 +532,22 @@ def simulate_game(visual: bool = True):
         z_map: Dict[BaseAgent, torch.Tensor] = {ag: ag.encode_current_belief(round_num, agents) for ag in living}
 
         # NEW: Apply language→state coupling once per agent (between Discuss and Vote)
-        if social is not None:
+        if social is not None and SOC_ENABLED:
             for ag in living:
-                # collect recent neighbor utterances (exclude self)
-                neighbors = [(n, m) for (n, m) in list(ag.message_memory)[-6:]
+                neighbors = [(n, m) for (n, m) in list(ag.message_memory)[-SOC_K:]
                              if n != ag.name and m and m.strip()]
                 if not neighbors:
                     continue
                 texts = [m for (_n, m) in neighbors]
                 with torch.no_grad():
                     t_embed = shared_msg_encoder(texts).mean(dim=0)   # (D_text,)
-                    delta = social(t_embed)                           # (LATENT_DIM,)
+                    delta = social(t_embed) * SOC_SCALE               # (LATENT_DIM,)
                     z_map[ag] = (z_map[ag] + delta).detach()
 
         for ag in living:
             z_t = z_map[ag]
 
-            # planner top-k candidates (names + probs) — use VoteHead if present
+            # planner top-k candidates (names + probs) — use VoteHead when available
             topk = _vote_topk_for_agent(ag, z_t, living, PLANNER_TOPK)
             if not topk:
                 continue
@@ -441,6 +556,18 @@ def simulate_game(visual: bool = True):
             alive_names = [x.name for x in living if x.name != ag.name]
             mask_logs.append({"round": round_num, "phase": "DAY_VOTE", "actor": ag.name, "mask": alive_names})
             phase_log.append({"round": round_num, "phase": "DAY_VOTE"})
+
+            # No-legal guard (shouldn't happen, but safe)
+            if not alive_names:
+                emit_event(
+                    metrics_rows, run_id=run_id, round_num=round_num,
+                    phase_code=1, phase_str="DAY_VOTE",
+                    agent=ag.name, role=ag.role, choice_type="VOTE_TARGET",
+                    payload_idx=-1, mask_names=[],
+                    speaker_mode=getattr(ag, "speaker_mode", "") or "",
+                    persona_norm=getattr(ag, "persona_norm", 0.0),
+                )
+                continue
 
             # Build judge items for this agent (same context, different candidate strings)
             context_block = _agent_context_block(ag, max_lines=3)
@@ -453,13 +580,14 @@ def simulate_game(visual: bool = True):
             # Score with judge (batched per agent)
             judged = score_batch(judge_items, judge_rubric)
 
-            # Pick best by judge score
-            best_idx = max(range(len(judged)), key=lambda i: judged[i].get("score", 0.0))
-            best_name = topk[best_idx][0]
+            # Mixed selection among top-k (planner × judge)
+            mix_idx = _mix_topk_scores([p for (_n, p) in topk], judged, VOTE_MIX_ALPHA)
+            best_name = topk[mix_idx][0]
+            best_j = judged[mix_idx]
+
             # map to actual agent object
             target = next((x for x in living if x.name == best_name), None)
             if target is None:
-                # fallback: first alive that's not self
                 target = next((x for x in living if x.name != ag.name), living[0])
 
             vote_map[ag] = target
@@ -469,8 +597,8 @@ def simulate_game(visual: bool = True):
             pending[ag.name] = (z_t.detach(), 1, a_idx, ag.role)
 
             # Log judge decision + subscores
-            subs = judged[best_idx].get("subscores", {})
-            s = judged[best_idx].get("score", 0.0)
+            subs = best_j.get("subscores", {})
+            s = best_j.get("score", 0.0)
             log_line = (f"Judge→ {ag.name} votes {target.name} "
                         f"[score={s:.2f} | coh={subs.get('coherence',0.0):.2f} "
                         f"truth={subs.get('truthfulness',0.0):.2f} "
@@ -583,7 +711,7 @@ def simulate_game(visual: bool = True):
         # ─── POST-ACT: re-encode to get z_{t+1} and append rollouts ───
         z_deltas = []
         cos_deltas = []
-        # NEW: per-agent Δz to fill back into their most recent vote row
+        # NEW: per-agent Δz to fill back into their most recent rows
         dz_by_agent: Dict[str, float] = {}
         cos_by_agent: Dict[str, float] = {}
 
@@ -614,6 +742,17 @@ def simulate_game(visual: bool = True):
                     if ag_name in dz_by_agent:
                         row["dz_l2"] = f"{dz_by_agent[ag_name]:.6f}"
                         row["dz_1mcos"] = f"{cos_by_agent[ag_name]:.6f}"
+
+            # NEW: optionally backfill Δz into kill rows (actor's change)
+            if LOG_DZ_KILL:
+                for row in reversed(metrics_rows):
+                    if row["round"] != round_num:
+                        break
+                    if row["phase"] == "NIGHT_KILL":
+                        ag_name = row["agent"]  # the wolf who acted
+                        if ag_name in dz_by_agent:
+                            row["dz_l2"] = f"{dz_by_agent[ag_name]:.6f}"
+                            row["dz_1mcos"] = f"{cos_by_agent[ag_name]:.6f}"
 
         # win check
         wolves_alive = [a for a in agents if a.alive and a.role == WEREWOLF]
