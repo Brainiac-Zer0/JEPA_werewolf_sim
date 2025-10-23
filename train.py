@@ -8,6 +8,7 @@
 #   • Accept both rollout schemas (legacy & phase-aware)
 #   • Phase-4: routeable training modes → legacy | phase | factorized | auto
 #   • New: CLI overrides; post-train evaluation with per-head accuracy & illegal mass
+#   • NEW: Outer simulate→train cycles, optional mouthpiece (speaker & bias-head) training
 # -----------------------------------------------------------------------------
 
 import os
@@ -38,8 +39,18 @@ from training_utils import (         # noqa: E402
     TrainingEpochLogger,
     set_global_determinism,
     save_run_config,
+    # NEW: canonical mouthpiece persistence here (not in speaker_llm)
+    save_mouthpiece as mp_save,
+    load_mouthpiece as mp_load,
 )
 from judge import score_batch, JudgeRubric  # noqa: E402
+
+# Speaker mouthpiece classes are optional (only for construction if no checkpoint found).
+try:
+    from speaker_llm import LogitBiasHead, SpeakerBandit  # noqa: E402
+except Exception:
+    LogitBiasHead = None
+    SpeakerBandit = None
 
 # ── Load config
 with open("config.yaml", "r") as f:
@@ -80,7 +91,7 @@ TR_CFG = CFG.get("training", {}) if isinstance(CFG.get("training"), dict) else {
 _mode_default = (TR_CFG.get("mode") or ("phase" if CFG.get("PHASE_AWARE_JEPA", False) else "legacy")).lower()
 # Allow TRAIN_MODE or MODE env to override
 MODE = _env_str("TRAIN_MODE", _env_str("MODE", _mode_default)).lower()
-EPOCHS = _env_int("EPOCHS", int(TR_CFG.get("epochs", 5)))
+EPOCHS = _env_int("EPOCHS", int(TR_CFG.get("epochs", 2)))
 BATCH_SIZE = _env_int("BATCH_SIZE", int(TR_CFG.get("batch_size", 64)))
 LR = _env_float("LR", float(TR_CFG.get("lr", 1.0e-3)))
 
@@ -105,7 +116,6 @@ TRAIN_PHASE_HEADS: bool = _env_bool("TRAIN_PHASE_HEADS", bool(CFG.get("TRAIN_PHA
 
 # ── Seed / determinism
 RUN_SEED: int = _env_int("RUN_SEED", _env_int("SEED", int(CFG.get("RUN_SEED", 1337))))
-
 
 # ============================== Speaker helpers ===============================
 
@@ -164,6 +174,104 @@ def _train_speakers_from_agents(agents: List[Any], rubric: JudgeRubric) -> None:
         ag.msg_buffer.clear()
         print(f"[SPEAKER] {ag.name} loss={stats['loss']:.4f} ent={stats['entropy']:.3f} R={stats['R_mean']:.3f}")
 
+def _collect_utterance_dataset_from_agents(agents: List[Any]) -> List[Dict[str, Any]]:
+    """
+    Build a per-utterance dataset from agents' msg_buffer for optional bias-head supervision.
+    Each row (dict) may include:
+      text, role, talk_intent (optional int), template_id (optional), reward (if already scored)
+    """
+    ds: List[Dict[str, Any]] = []
+    for ag in agents or []:
+        buf = getattr(ag, "msg_buffer", None)
+        if not buf:
+            continue
+        for m in buf:
+            ds.append({
+                "text": m.get("text", ""),
+                "role": ag.role or "Unknown",
+                "talk_intent": m.get("talk_intent", None),
+                "template_id": m.get("template_id", None),
+                "reward": m.get("reward", None),
+            })
+    return ds
+
+def _train_bias_head_on_intents(
+    role_name: str,
+    agents: List[Any],
+    bias_head_for_role: Any | None,
+    *,
+    lr: float = 1.0e-4,
+    epochs: int = 1,
+) -> Dict[str, float]:
+    """
+    Minimal supervised step for a logit-bias head if present.
+    Expects bias_head to expose a simple 'train_step' method; otherwise no-ops.
+    Returns small stats dict for logging.
+    """
+    if bias_head_for_role is None or not hasattr(bias_head_for_role, "train_step"):
+        return {"count": 0}
+
+    ds = _collect_utterance_dataset_from_agents(agents)
+    labeled = [r for r in ds if isinstance(r.get("talk_intent", None), int)]
+    if not labeled:
+        return {"count": 0}
+
+    texts = [r["text"] for r in labeled]
+    intents = [int(r["talk_intent"]) for r in labeled]
+    try:
+        stats = bias_head_for_role.train_step(texts, intents, lr=lr, epochs=epochs)
+    except Exception as e:
+        print(f"[SPEAKER/BIAS] {role_name}: bias-head train_step failed: {e}")
+        return {"count": 0}
+
+    out = {"count": float(len(labeled))}
+    if isinstance(stats, dict):
+        out.update({k: float(v) for k, v in stats.items()})
+    return out
+
+# Mouthpiece registries (per role), populated lazily
+SPEAKER_BY_ROLE: Dict[str, Any] = {}
+BIAS_BY_ROLE: Dict[str, Any] = {}
+
+def _ensure_mouthpiece_for_role(role_name: str):
+    """Create or load optional mouthpiece modules for a role (loads if resuming)."""
+    if role_name in SPEAKER_BY_ROLE and role_name in BIAS_BY_ROLE:
+        return
+    speaker, bias = None, None
+    # Load checkpoint if present
+    try:
+        speaker, bias = mp_load(role_name, speaker=None, bias_head=None)
+        if speaker is not None or bias is not None:
+            print(f"[SPEAKER] Loaded mouthpiece for role={role_name}")
+    except Exception as e:
+        print(f"[SPEAKER] Load mouthpiece failed for role={role_name}: {e}")
+        speaker, bias = None, None
+    # Create missing pieces if classes are available
+    if speaker is None and SpeakerBandit is not None:
+        try:
+            speaker = SpeakerBandit()
+            print(f"[SPEAKER] Created new SpeakerBandit for role={role_name}")
+        except Exception:
+            speaker = None
+    if bias is None and LogitBiasHead is not None:
+        try:
+            bias = LogitBiasHead(latent_dim=int(CFG.get("LATENT_DIM", 32)))
+            print(f"[SPEAKER] Created new LogitBiasHead for role={role_name}")
+        except Exception:
+            bias = None
+    SPEAKER_BY_ROLE[role_name] = speaker
+    BIAS_BY_ROLE[role_name] = bias
+
+def _save_mouthpiece_for_role(role_name: str):
+    """Persist mouthpiece modules if available."""
+    try:
+        mp_save(
+            role_name,
+            speaker=SPEAKER_BY_ROLE.get(role_name),
+            bias_head=BIAS_BY_ROLE.get(role_name),
+        )
+    except Exception as e:
+        print(f"[SPEAKER] WARNING: failed to save mouthpiece for {role_name}: {e}")
 
 # ============================ Rollout collection ==============================
 
@@ -202,7 +310,6 @@ def collect_rollouts_for_role(
             except Exception:
                 continue
     return all_rollouts
-
 
 # ============================== Integrity helpers =============================
 
@@ -254,7 +361,6 @@ def _delta_stats_by_phase(rollouts) -> dict:
         }
     return out
 
-
 # =================================== Main =====================================
 
 def parse_args() -> argparse.Namespace:
@@ -266,6 +372,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=LR)
     p.add_argument("--n_games", type=int, default=N_GAMES)
     p.add_argument("--seed", type=int, default=RUN_SEED)
+
+    # NEW: outer cycles + mouthpiece toggles
+    p.add_argument("--outer_cycles", type=int,
+                   default=_env_int("OUTER_CYCLES", int(TR_CFG.get("outer_cycles", 1))),
+                   help="How many simulate→train cycles to run (default 1).")
+    p.add_argument("--games_per_cycle", type=int,
+                   default=_env_int("GAMES_PER_CYCLE", N_GAMES),
+                   help="Number of games per cycle per role (default: config N_GAMES).")
+    p.add_argument("--speaker", type=int, choices=[0, 1],
+                   default=1 if SPEAKER_ENABLED else 0,
+                   help="Enable(1)/disable(0) mouthpiece training for this run.")
+    p.add_argument("--speaker_only", action="store_true",
+                   help="Only train mouthpiece; skip JEPA modules.")
     return p.parse_args()
 
 def main() -> None:
@@ -285,7 +404,7 @@ def main() -> None:
 
     # 1) Judge rubric (for optional speaker learning)
     rubric = None
-    if SPEAKER_ENABLED:
+    if bool(args.speaker):
         try:
             rubric = JudgeRubric.load(JUDGE_RUBRIC_PATH)
             print(f"[SPEAKER] Loaded judge rubric: {JUDGE_RUBRIC_PATH}")
@@ -293,129 +412,191 @@ def main() -> None:
             print(f"[SPEAKER] WARNING: failed to load rubric ({e}); speaker learning will be skipped).")
             rubric = None
 
-    # 2) Train per role with integrity prints and epoch CSV logging
+    # 2) Orchestrate simulate→train cycles
     run_summary: Dict[str, Any] = {"run_id": run_id, "seed": seed, "roles": {}, "config": {
-        "mode": effective_mode_cfg, "epochs": epochs, "batch_size": batch_size, "lr": lr, "n_games": n_games
+        "mode": effective_mode_cfg, "epochs": epochs, "batch_size": batch_size, "lr": lr,
+        "outer_cycles": int(getattr(args, "outer_cycles", 1)),
+        "games_per_cycle": int(getattr(args, "games_per_cycle", n_games)),
+        "speaker": int(getattr(args, "speaker", 1 if SPEAKER_ENABLED else 0)),
+        "speaker_only": bool(getattr(args, "speaker_only", False)),
     }}
 
+    outer_cycles = int(getattr(args, "outer_cycles", 1))
+    games_per_cycle = int(getattr(args, "games_per_cycle", n_games))
+    speaker_enabled = bool(getattr(args, "speaker", 1 if SPEAKER_ENABLED else 0))
+    speaker_only = bool(getattr(args, "speaker_only", False))
+
+    # Pre-create/load mouthpieces (if available)
     for role_name in (WEREWOLF, VILLAGER):
-        print(f"[JEPA] Simulating {n_games} games for role: {role_name}")
-        role_rollouts = collect_rollouts_for_role(role_name, n_games, rubric=rubric)
+        _ensure_mouthpiece_for_role(role_name)
 
-        if not role_rollouts:
-            print(f"[WARN] No rollouts for {role_name}. Skipping training for this role.")
-            run_summary["roles"][role_name] = {"overall": {"count": 0}}
-            continue
+    # For JEPA eval aggregation across cycles
+    eval_cache: Dict[str, Dict[str, float]] = {}
 
-        stats = _delta_stats(role_rollouts)
-        print(f"[JEPA] Collected {stats['count']} roll-outs for {role_name} | "
-              f"Δz L2={stats['mean_L2']:.4f}  (1-cos)={stats['mean_1mcos']:.4f}")
+    for cyc in range(1, outer_cycles + 1):
+        print(f"\n===== CYCLE {cyc}/{outer_cycles} =====")
 
-        ph_stats = _delta_stats_by_phase(role_rollouts)
-        if ph_stats:
-            try:
-                pretty = ", ".join(
-                    f"phase={k}: n={v['count']} L2={v['mean_L2']:.4f} (1-cos)={v['mean_1mcos']:.4f}"
-                    for k, v in sorted(ph_stats.items())
-                )
-                print(f"[JEPA] Per-phase Δz stats for {role_name} → {pretty}")
-            except Exception:
-                pass
+        for role_name in (WEREWOLF, VILLAGER):
+            print(f"[JEPA] Simulating {games_per_cycle} games for role: {role_name}")
+            # Speaker REINFORCE happens inside collect if rubric is provided
+            effective_rubric = rubric if speaker_enabled else None
 
-        # 3) Choose training path (auto-upgrade to 'phase' on richer data)
-        has_phase_rows = any(len(r) >= 5 for r in role_rollouts)
-        effective_mode = effective_mode_cfg
-        if effective_mode_cfg == "auto":
-            effective_mode = "phase" if has_phase_rows else "legacy"
+            role_rollouts = collect_rollouts_for_role(role_name, games_per_cycle, rubric=effective_rubric)
 
-        print(f"[JEPA] Training JEPA modules for role: {role_name} (mode={effective_mode})")
+            if not role_rollouts:
+                print(f"[WARN] No rollouts for {role_name} in cycle {cyc}.")
+                run_summary["roles"][role_name] = {"overall": {"count": 0}}
+                continue
 
-        eval_metrics: Dict[str, float] = {}
-        if effective_mode == "legacy":
-            world_model, action_encoder, planner = load_role_models(role_name)
-            train_jepa(
-                rollout_data=role_rollouts,
-                world_model=world_model,
-                action_encoder=action_encoder,
-                planner=planner,
-                role_name=role_name,
-                run_id=run_id,
-                epoch_logger=epoch_logger,
-                epochs=epochs, batch_size=batch_size, learning_rate=lr,
-            )
-            eval_metrics = evaluate_jepa(role_rollouts, world_model, action_encoder, planner)
+            # Integrity prints
+            stats = _delta_stats(role_rollouts)
+            print(f"[JEPA] Collected {stats['count']} roll-outs for {role_name} | "
+                  f"Δz L2={stats['mean_L2']:.4f}  (1-cos)={stats['mean_1mcos']:.4f}")
+            ph_stats = _delta_stats_by_phase(role_rollouts)
+            if ph_stats:
+                try:
+                    pretty = ", ".join(
+                        f"phase={k}: n={v['count']} L2={v['mean_L2']:.4f} (1-cos)={v['mean_1mcos']:.4f}"
+                        for k, v in sorted(ph_stats.items())
+                    )
+                    print(f"[JEPA] Per-phase Δz stats for {role_name} → {pretty}")
+                except Exception:
+                    pass
 
-        elif effective_mode == "phase":
-            world_model, phase_action_encoder, planner = load_role_models_phase(role_name)
-            train_jepa_phaseaware(
-                rollout_data_phaseaware=role_rollouts,
-                world_model=world_model,
-                planner=planner,
-                role_name=role_name,
-                run_id=run_id,
-                epoch_logger=epoch_logger,
-                phase_action_encoder=phase_action_encoder,
-                epochs=epochs, batch_size=batch_size, learning_rate=lr,
-            )
-            eval_metrics = evaluate_jepa_phase(role_rollouts, world_model, phase_action_encoder, planner)
+            # Choose training path per role
+            has_phase_rows = any(len(r) >= 5 for r in role_rollouts)
+            effective_mode = effective_mode_cfg
+            if effective_mode_cfg == "auto":
+                effective_mode = "phase" if has_phase_rows else "legacy"
 
-        elif effective_mode == "factorized":
-            world_model, phase_action_encoder, fplanner = load_role_models_factorized(role_name)
-            train_jepa_factorized(
-                rollout_data_phaseaware=role_rollouts,
-                world_model=world_model,
-                phase_action_encoder=phase_action_encoder,
-                planner_factorized=fplanner,
-                role_name=role_name,
-                run_id=run_id,
-                epoch_logger=epoch_logger,
-                epochs=epochs, batch_size=batch_size, learning_rate=lr,
-            )
-            eval_metrics = evaluate_jepa_factorized(role_rollouts, world_model, phase_action_encoder, fplanner)
+            # Train JEPA unless speaker-only
+            eval_metrics: Dict[str, float] = {}
+            if not speaker_only:
+                print(f"[JEPA] Training JEPA modules for role: {role_name} (mode={effective_mode})")
 
-            # (Optional) Coalition probe — independent specialists vs shared, Werewolf only.
-            if role_name == WEREWOLF and COAL_COMPARE:
-                print("[COAL] Probe: IndependentKillHeads vs SharedKillHead (see console/CSV for loss trends)")
-                from collections import defaultdict
-                groups = defaultdict(list)
-                for r in role_rollouts:
-                    if len(r) >= 7 and isinstance(r[6], dict) and "self_idx" in r[6]:
-                        groups[int(r[6]["self_idx"])].append(r)
-                if not groups:
-                    print("[COAL] No self_idx in aux; skipping independent probe.")
+                if effective_mode == "legacy":
+                    world_model, action_encoder, planner = load_role_models(role_name)
+                    train_jepa(
+                        rollout_data=role_rollouts,
+                        world_model=world_model,
+                        action_encoder=action_encoder,
+                        planner=planner,
+                        role_name=role_name,
+                        run_id=run_id,
+                        epoch_logger=epoch_logger,
+                        epochs=epochs, batch_size=batch_size, learning_rate=lr,
+                    )
+                    eval_metrics = evaluate_jepa(role_rollouts, world_model, action_encoder, planner)
+
+                elif effective_mode == "phase":
+                    world_model, phase_action_encoder, planner = load_role_models_phase(role_name)
+                    train_jepa_phaseaware(
+                        rollout_data_phaseaware=role_rollouts,
+                        world_model=world_model,
+                        planner=planner,
+                        role_name=role_name,
+                        run_id=run_id,
+                        epoch_logger=epoch_logger,
+                        phase_action_encoder=phase_action_encoder,
+                        epochs=epochs, batch_size=batch_size, learning_rate=lr,
+                    )
+                    eval_metrics = evaluate_jepa_phase(role_rollouts, world_model, phase_action_encoder, planner)
+
+                elif effective_mode == "factorized":
+                    world_model, phase_action_encoder, fplanner = load_role_models_factorized(role_name)
+                    train_jepa_factorized(
+                        rollout_data_phaseaware=role_rollouts,
+                        world_model=world_model,
+                        phase_action_encoder=phase_action_encoder,
+                        planner_factorized=fplanner,
+                        role_name=role_name,
+                        run_id=run_id,
+                        epoch_logger=epoch_logger,
+                        epochs=epochs, batch_size=batch_size, learning_rate=lr,
+                    )
+                    eval_metrics = evaluate_jepa_factorized(role_rollouts, world_model, phase_action_encoder, fplanner)
+
+                    # (Optional) Coalition probe — independent specialists vs shared, Werewolf only.
+                    if role_name == WEREWOLF and COAL_COMPARE:
+                        print("[COAL] Probe: IndependentKillHeads vs SharedKillHead (see console/CSV for loss trends)")
+                        from collections import defaultdict
+                        groups = defaultdict(list)
+                        for r in role_rollouts:
+                            if len(r) >= 7 and isinstance(r[6], dict) and "self_idx" in r[6]:
+                                groups[int(r[6]["self_idx"])].append(r)
+                        if not groups:
+                            print("[COAL] No self_idx in aux; skipping independent probe.")
+                        else:
+                            for wolf_id, rows in groups.items():
+                                wm_i, pae_i, fplanner_i = load_role_models_factorized(role_name)  # fresh init
+                                train_jepa_factorized(
+                                    rollout_data_phaseaware=rows,
+                                    world_model=wm_i,
+                                    phase_action_encoder=pae_i,
+                                    planner_factorized=fplanner_i,
+                                    role_name=f"{role_name}-wolf{wolf_id}",
+                                    run_id=run_id,
+                                    epoch_logger=None,
+                                    epochs=max(1, epochs // 2),
+                                    batch_size=min(16, batch_size),
+                                    learning_rate=lr,
+                                )
+                        # Shared already trained above. Use logs to compare.
+
                 else:
-                    for wolf_id, rows in groups.items():
-                        wm_i, pae_i, fplanner_i = load_role_models_factorized(role_name)  # fresh init
-                        train_jepa_factorized(
-                            rollout_data_phaseaware=rows,
-                            world_model=wm_i,
-                            phase_action_encoder=pae_i,
-                            planner_factorized=fplanner_i,
-                            role_name=f"{role_name}-wolf{wolf_id}",
-                            run_id=run_id,
-                            epoch_logger=None,
-                            epochs=max(1, epochs // 5),
-                            batch_size=min(16, batch_size),
-                            learning_rate=lr,
+                    raise ValueError(f"Unknown training mode: {effective_mode_cfg}")
+
+                if eval_metrics:
+                    eval_cache.setdefault(role_name, {})
+                    eval_cache[role_name] = eval_metrics
+                    print(f"[EVAL] {role_name} ({effective_mode}) → {json.dumps(eval_metrics, indent=2)}")
+
+            # ===== Mouthpiece (speaker + bias-head) =====
+            if speaker_enabled:
+                # 1) REINFORCE already triggered during rollout via _train_speakers_from_agents
+                # 2) (Optional) Supervised bias-head step if present + we have labeled intents
+                try:
+                    agents_for_bias = None
+                    try:
+                        # Re-run a tiny sim to get meta-agents for labeled intents, if available
+                        sim_ret_extra = run_sim_and_collect_rollouts(visual=False)
+                        if isinstance(sim_ret_extra, tuple) and isinstance(sim_ret_extra[1], dict):
+                            agents_for_bias = sim_ret_extra[1].get("agents", None)
+                    except Exception:
+                        agents_for_bias = None
+
+                    if agents_for_bias:
+                        bias_stats = _train_bias_head_on_intents(
+                            role_name=role_name,
+                            agents=agents_for_bias,
+                            bias_head_for_role=BIAS_BY_ROLE.get(role_name),
+                            lr=float(CFG.get("BIAS_LR", 1e-4)),
+                            epochs=int(CFG.get("BIAS_EPOCHS", 1)),
                         )
-                # Shared already trained above. Use logs to compare.
+                        if bias_stats.get("count", 0) > 0:
+                            print(f"[SPEAKER/BIAS] {role_name}: {bias_stats}")
+                except Exception as e:
+                    print(f"[SPEAKER] Mouthpiece step skipped due to error: {e}")
 
-        else:
-            raise ValueError(f"Unknown training mode: {effective_mode_cfg}")
+                # Save mouthpiece pieces if any updated
+                _save_mouthpiece_for_role(role_name)
 
-        # Log evaluation metrics
-        if eval_metrics:
-            print(f"[EVAL] {role_name} ({effective_mode}) → {json.dumps(eval_metrics, indent=2)}")
+            # record/update summary entry (rolling per cycle; last cycle persists)
+            role_entry = {"overall": stats}
+            if ph_stats:
+                role_entry["per_phase"] = ph_stats
+            if eval_cache.get(role_name):
+                role_entry["eval"] = eval_cache[role_name]
+            run_summary["roles"][role_name] = role_entry
 
-        # record summary
-        role_entry = {"overall": stats}
-        if ph_stats:
-            role_entry["per_phase"] = ph_stats
-        if eval_metrics:
-            role_entry["eval"] = eval_metrics
-        run_summary["roles"][role_name] = role_entry
+    # 3) Persist integrity summary at end
+    #    Belt-and-suspenders: save mouthpieces once more after all cycles
+    for role_name in (WEREWOLF, VILLAGER):
+        try:
+            _save_mouthpiece_for_role(role_name)
+        except Exception:
+            pass
 
-    # 4) Persist integrity summary
     run_dir = os.path.join(LOGS_DIR, run_id)
     os.makedirs(run_dir, exist_ok=True)
     with open(os.path.join(run_dir, "run_summary.json"), "w", encoding="utf-8") as f:
@@ -423,7 +604,6 @@ def main() -> None:
     print("\n=== Integrity Summary ===")
     print(json.dumps(run_summary, indent=2))
     print("\n[JEPA] All roles trained and checkpoints updated.")
-
 
 # ─────────────────────────────── CLI entry
 if __name__ == "__main__":

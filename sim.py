@@ -15,9 +15,15 @@
 #   * Use TalkHead / VoteHead / KillHead when available
 #   * Proper boolean masks (self/dead/wolves)
 #   * Judge re-ranking over VoteHead top-k
-#   * Phase-aware rollout tuples: (z_t, phase_code, payload_idx, z_{t+1}, role)
+#   * Phase-aware rollout tuples:
+#       (z_t, phase_code, payload_idx, z_{t+1}, role, choice_type, aux)
 #   * (This build) Planner×Judge mixing, social influence knobs, talk mask logging,
 #                  optional Δz for TALK and KILL
+# - NEW (Phase 5: Communication Alignment)
+#   * Judge real utterances during DISCUSS and attach per-utterance subscores
+#   * Log these judge fields in TALK rows
+#   * Compute talk→vote alignment and log/backfill on VOTE rows
+#   * Attach tokenizer when hooking up the LLM so talk×bias fusion engages
 # -----------------------------------------------------------------------------
 
 import sys
@@ -165,17 +171,65 @@ def write_config_snapshot(cfg: dict, path: str):
         yaml.safe_dump(cfg, f)
 
 def append_csv_rows(path: str, rows: list[dict]):
+    """
+    Robust CSV appender:
+      - Keeps existing header if file already exists.
+      - Ignores any extra keys in rows.
+      - Fills missing columns with "".
+    """
     if not rows:
         return
     ensure_dir(path)
-    header = list(rows[0].keys())
-    new_file = not pathlib.Path(path).exists()
-    with open(path, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=header)
-        if new_file:
+
+    p = pathlib.Path(path)
+    file_exists = p.exists()
+    existing_header: List[str] = []
+
+    if file_exists:
+        # Try to read existing header
+        try:
+            with open(path, "r", newline="") as fr:
+                r = csv.reader(fr)
+                existing_header = next(r)
+        except Exception:
+            existing_header = []
+
+    if existing_header:
+        header = existing_header
+    else:
+        # New file: use union of keys across provided rows (sorted for determinism)
+        keys: set = set()
+        for r in rows:
+            keys.update(r.keys())
+        header = sorted(keys)
+
+    mode = "a" if file_exists and existing_header else "w"
+    with open(path, mode, newline="") as f:
+        w = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
+        if mode == "w":
             w.writeheader()
         for r in rows:
-            w.writerow(r)
+            w.writerow({k: r.get(k, "") for k in header})
+
+# ── Sanity validators (catch shape drift early) ─────────────────────
+def _assert_len(name: str, obj, expected: int, *, ctx: str = ""):
+    got = (len(obj) if hasattr(obj, "__len__") else int(getattr(obj, "numel", lambda: -1)()))
+    assert got == expected, (
+        f"[SANITY] {name} length mismatch: expected={expected} got={got}"
+        + (f" | {ctx}" if ctx else "")
+    )
+
+def _check_aux(aux: dict, *, round_num: int, agent: str):
+    assert isinstance(aux, dict) and "alive" in aux, f"[SANITY] aux missing alive | r{round_num} {agent}"
+    _assert_len("aux['alive']", aux["alive"], NUM_AGENTS, ctx=f"r{round_num} agent={agent}")
+    if "wolves" in aux:
+        _assert_len("aux['wolves']", aux["wolves"], NUM_AGENTS, ctx=f"r{round_num} agent={agent}")
+
+def _check_mask(mask: torch.Tensor, expected: int, *, kind: str, round_num: int, agent: str):
+    assert isinstance(mask, torch.Tensor) and mask.dim() == 1, \
+        f"[SANITY] {kind} mask must be 1-D tensor | r{round_num} {agent}"
+    _assert_len(f"{kind} mask", mask, expected, ctx=f"r{round_num} agent={agent}")
+    assert torch.isfinite(mask.float()).all(), f"[SANITY] {kind} mask has non-finite values | r{round_num} {agent}"
 
 # NEW: uniform event logger (adds phase_code + numeric payloads)
 def emit_event(rows, *, run_id, round_num, phase_code, phase_str, agent, role,
@@ -284,6 +338,8 @@ def _vote_mask_for(ag: BaseAgent, agents: list[BaseAgent], num_agents: int) -> t
             idx = int(x.name.split("_")[1])
             if 0 <= idx < num_agents:
                 mask[idx] = True
+    # build-time check
+    _check_mask(mask, num_agents, kind="vote", round_num=-1, agent="(build)")
     return mask
 
 def _kill_mask_for(wolf: BaseAgent, agents: list[BaseAgent], num_agents: int) -> torch.Tensor:
@@ -294,6 +350,8 @@ def _kill_mask_for(wolf: BaseAgent, agents: list[BaseAgent], num_agents: int) ->
             idx = int(x.name.split("_")[1])
             if 0 <= idx < num_agents:
                 mask[idx] = True
+    # build-time check
+    _check_mask(mask, num_agents, kind="kill", round_num=-1, agent="(build)")
     return mask
 
 def _talk_mask(num_cats: int) -> torch.Tensor:
@@ -315,7 +373,12 @@ def _vote_topk_for_agent(ag: BaseAgent, z_t: torch.Tensor, agents: list[BaseAgen
                 num_agents = int(fp.vote.net[-1].out_features)  # type: ignore[attr-defined]
             except Exception:
                 num_agents = NUM_AGENTS
+            if num_agents != NUM_AGENTS:
+                raise AssertionError(
+                    f"[SANITY] VoteHead out_features={num_agents} != NUM_AGENTS={NUM_AGENTS} | agent={ag.name}"
+                )
             vmask = _vote_mask_for(ag, agents, num_agents).unsqueeze(0)  # (1, N)
+            _check_mask(vmask.squeeze(0), num_agents, kind="vote", round_num=-1, agent=ag.name)
             logits = fp.vote(z_t.unsqueeze(0), mask=vmask).squeeze(0)    # (N,)
         else:
             logits = ag.planner(z_t.unsqueeze(0)).squeeze(0)             # legacy over N
@@ -350,6 +413,21 @@ def _candidate_text(target_name: str) -> str:
     """Turn an action (vote target) into a short candidate utterance for the judge."""
     return f"We should vote to eliminate {target_name}."
 
+# ───────────────────── TALK→VOTE alignment (Phase-5) ─────────────────────
+# Category ids follow agent.py: 0=accuse,1=defend,2=hedge,3=question,4=vote
+def _talk_vote_alignment(cat_id: int) -> float:
+    if cat_id == 4:   # vote
+        return 1.0
+    if cat_id == 0:   # accuse
+        return 0.9
+    if cat_id == 3:   # question
+        return 0.6
+    if cat_id == 2:   # hedge
+        return 0.4
+    if cat_id == 1:   # defend
+        return 0.2
+    return 0.5
+
 # ╭────────────────────────── MAIN LOOP ─────────────────────────────╮
 def simulate_game(visual: bool = True):
     # NEW: run id + determinism + log dirs + config snapshot
@@ -378,6 +456,7 @@ def simulate_game(visual: bool = True):
 
     # ───── Agent creation + role assignment ─────
     agents = [BaseAgent(f"Agent_{i}") for i in range(NUM_AGENTS)]
+    assert len(agents) == NUM_AGENTS, "[SANITY] agent list does not match NUM_AGENTS"
     assign_roles(agents, NUM_WEREWOLVES)
     # NEW: apply personality randomization (if available)
     if apply_personality is not None:
@@ -406,12 +485,19 @@ def simulate_game(visual: bool = True):
     # LLM hookup: choose mouthpiece by env (baseline or bias version)
     if not USE_LANGUAGE:
         for ag in agents:
-            ag.llm_fn = lambda z, self: "..."
+            ag.attach_llm(lambda prompt, generate_kwargs=None: "...", tokenizer=None)
     else:
+        # Provide both callable and tokenizer so fused biasing can engage.
         from llm_script import llm_fn_from_env
         mouth_fn = llm_fn_from_env()
+        try:
+            # Attempt to import the module-global tokenizer created in llm_script.
+            # If not present, attach without tokenizer (agent will no-op the logits processor).
+            from llm_script import tok as _llm_tok  # type: ignore
+        except Exception:
+            _llm_tok = None
         for ag in agents:
-            ag.llm_fn = mouth_fn
+            ag.attach_llm(mouth_fn, tokenizer=_llm_tok)
 
     # Load judge rubric once
     try:
@@ -428,6 +514,15 @@ def simulate_game(visual: bool = True):
     phase_log: list[dict] = []      # [{"round":i,"phase":"..."}]
     mask_logs: list[dict] = []      # [{"round":i,"phase":"...","actor":"Agent_k","mask":[...]}]
 
+    # Optional speak shim: try to pass phase_code to speak() if supported
+    def _speak_call(ag: BaseAgent, rnd: int, ags: list[BaseAgent]):
+        try:
+            # Preferred: new signature with phase_code
+            return ag.speak(rnd, ags, phase_code=0)
+        except TypeError:
+            # Back-compat: old signature
+            return ag.speak(rnd, ags)
+
     # ───── main day/night loop ─────
     while True:
         if visual:
@@ -443,7 +538,7 @@ def simulate_game(visual: bool = True):
                 z_pre_talk[ag.name] = ag.encode_current_belief(round_num, agents).detach()
 
         # ─── Asynchronous dialogue (one future per agent) ───
-        futures = {executor.submit(a.speak, round_num, agents): a for a in living}
+        futures = {executor.submit(_speak_call, a, round_num, agents): a for a in living}
         while futures:
             done, _ = cf.wait(futures, timeout=0.05, return_when=cf.FIRST_COMPLETED)
             for fut in done:
@@ -465,12 +560,47 @@ def simulate_game(visual: bool = True):
                             except Exception:
                                 num_cats = 5
                             tmask = _talk_mask(num_cats).unsqueeze(0)  # (1, C)
+                            _check_mask(tmask.squeeze(0), num_cats, kind="talk", round_num=round_num, agent=ag.name)
                             t_logits = fp.talk(z_t_talk.unsqueeze(0), mask=tmask).squeeze(0)
                             ag.talk_category_last = int(torch.argmax(t_logits).item())
                     else:
                         ag.talk_category_last = int(getattr(ag, "talk_category_last", -1))
                 except Exception:
                     ag.talk_category_last = int(getattr(ag, "talk_category_last", -1))
+
+                # NEW: Judge the actual utterance and attach to msg_buffer (Phase-5)
+                utter_judge = None
+                try:
+                    ctx_block = _agent_context_block(ag, max_lines=3)
+                    j_items = [{
+                        "context": ctx_block,
+                        "role": ag.role or "Unknown",
+                        "candidate": msg,             # judge the *spoken line*
+                    }]
+                    # ► pass run meta so judge audit JSONL can line up with CSV
+                    j_res = score_batch(
+                        j_items, judge_rubric,
+                        run_id=run_id, round_num=round_num, phase="DAY_DISCUSS", agent=ag.name
+                    )[0]
+                    subs = j_res.get("subscores", {}) or {}
+                    utter_judge = {
+                        "score": float(j_res.get("score", 0.0)),
+                        "coherence": float(subs.get("coherence", 0.0)),
+                        "truthfulness": float(subs.get("truthfulness", 0.0)),
+                        "role_alignment": float(subs.get("role_alignment", 0.0)),
+                        "social_safety": float(subs.get("social_safety", 0.0)),
+                    }
+                    # Attach to the latest buffer row for downstream training
+                    if getattr(ag, "msg_buffer", None):
+                        ag.msg_buffer[-1]["judge_score"] = utter_judge["score"]
+                        ag.msg_buffer[-1]["judge_subscores"] = {
+                            "coherence": utter_judge["coherence"],
+                            "truthfulness": utter_judge["truthfulness"],
+                            "role_alignment": utter_judge["role_alignment"],
+                            "social_safety": utter_judge["social_safety"],
+                        }
+                except Exception:
+                    utter_judge = None  # keep sim robust if judge fails
 
                 # NEW: log TALK mask (category IDs) for this speaker
                 try:
@@ -483,7 +613,7 @@ def simulate_game(visual: bool = True):
                 except Exception:
                     pass
 
-                # NEW: log TALK row (phase-aware + numeric payload)
+                # NEW: log TALK row (phase-aware + numeric payload), include utterance judge
                 phase_log.append({"round": round_num, "phase": "DAY_DISCUSS"})
                 emit_event(
                     metrics_rows,
@@ -492,6 +622,7 @@ def simulate_game(visual: bool = True):
                     agent=ag.name, role=ag.role,
                     choice_type="TALK_INTENT",
                     payload_idx=int(getattr(ag, "talk_category_last", -1)),
+                    judge=utter_judge,                                # ← Phase-5
                     speaker_mode=getattr(ag, "speaker_mode", "") or "",
                     persona_norm=getattr(ag, "persona_norm", 0.0),
                 )
@@ -515,6 +646,31 @@ def simulate_game(visual: bool = True):
                     except Exception:
                         pass
 
+                # --- Phase-aware TALK rollout (DISCUSS = 0) with choice_type + aux
+                try:
+                    # z_t before talking (cached if LOG_DZ_TALK; else recompute safely)
+                    z_talk_pre = z_pre_talk.get(ag.name, ag.encode_current_belief(round_num, agents).detach())
+                    # z_{t+1} after utterance
+                    z_talk_post = ag.encode_current_belief(round_num, agents).detach()
+
+                    talk_payload = int(getattr(ag, "talk_category_last", -1))
+                    talk_payload_t = torch.tensor(talk_payload)
+                    talk_aux = ag.make_aux(agents)
+                    _check_aux(talk_aux, round_num=round_num, agent=ag.name)
+
+                    # Append phase-aware TALK rollout:
+                    rollout.append((
+                        z_talk_pre,
+                        torch.tensor(0),
+                        talk_payload_t,
+                        z_talk_post,
+                        ag.role or "Unknown",
+                        "TALK_INTENT",
+                        talk_aux,
+                    ))
+                except Exception:
+                    pass
+
             if visual:
                 draw_agents(agents)
                 clock.tick(FPS)
@@ -524,8 +680,9 @@ def simulate_game(visual: bool = True):
                         sys.exit()
 
         # ─── PRE-ACT: (z_t cache), social coupling, LLM Judge over planner top-k, final vote choice ───
-        # Always use phase-aware pending: name -> (z_t, phase_code, payload_idx, role)
-        pending: Dict[str, Tuple[torch.Tensor, int, torch.Tensor, str]] = {}
+        # Phase-aware pending format:
+        #   name -> (z_t, phase_code, payload_idx_tensor, role, choice_type, aux_dict)
+        pending: Dict[str, Tuple[torch.Tensor, int, torch.Tensor, str, str, dict]] = {}
         vote_map: Dict[BaseAgent, BaseAgent] = {}
 
         # First compute z_t for all living
@@ -554,6 +711,12 @@ def simulate_game(visual: bool = True):
 
             # NEW: record legal vote mask (names) + phase tick
             alive_names = [x.name for x in living if x.name != ag.name]
+            # Basic name/dup sanity
+            assert all(n.startswith("Agent_") for n in alive_names), \
+                f"[SANITY] vote mask has bad names: {alive_names} | r{round_num} {ag.name}"
+            assert len(set(alive_names)) == len(alive_names), \
+                f"[SANITY] vote mask has duplicates: {alive_names} | r{round_num} {ag.name}"
+
             mask_logs.append({"round": round_num, "phase": "DAY_VOTE", "actor": ag.name, "mask": alive_names})
             phase_log.append({"round": round_num, "phase": "DAY_VOTE"})
 
@@ -577,8 +740,16 @@ def simulate_game(visual: bool = True):
                 "candidate": _candidate_text(name),
             } for (name, _p) in topk]
 
-            # Score with judge (batched per agent)
-            judged = score_batch(judge_items, judge_rubric)
+            # Alignment between last talk intent and these vote candidates (Phase-5)
+            align_tv = _talk_vote_alignment(int(getattr(ag, "talk_category_last", -1)))
+            align_vec = [align_tv for _ in range(len(judge_items))]
+
+            # Score with judge (batched per agent) + pass run meta for audit JSONL
+            judged = score_batch(
+                judge_items, judge_rubric,
+                run_id=run_id, round_num=round_num, phase="DAY_VOTE", agent=ag.name,
+                alignment_values=align_vec
+            )
 
             # Mixed selection among top-k (planner × judge)
             mix_idx = _mix_topk_scores([p for (_n, p) in topk], judged, VOTE_MIX_ALPHA)
@@ -593,8 +764,21 @@ def simulate_game(visual: bool = True):
             vote_map[ag] = target
             tgt_idx = int(target.name.split('_')[1])
             a_idx = torch.tensor(int(tgt_idx))  # scalar tensor
-            # PHASE-AWARE: code 1 for DAY_VOTE
-            pending[ag.name] = (z_t.detach(), 1, a_idx, ag.role)
+            # PHASE-AWARE: code 1 for DAY_VOTE, include choice_type + aux snapshot
+            aux_snap = ag.make_aux(agents)
+            _check_aux(aux_snap, round_num=round_num, agent=ag.name)
+            pending[ag.name] = (
+                z_t.detach(),
+                1,
+                a_idx,
+                ag.role or "Unknown",
+                "VOTE_TARGET",
+                aux_snap,
+            )
+
+            # Also stash alignment for training buffer
+            if getattr(ag, "msg_buffer", None):
+                ag.msg_buffer[-1]["alignment_vote"] = float(align_tv)
 
             # Log judge decision + subscores
             subs = best_j.get("subscores", {})
@@ -628,6 +812,14 @@ def simulate_game(visual: bool = True):
                 persona_norm=getattr(ag, "persona_norm", 0.0),
             )
 
+            # Backfill alignment metric into the most recent VOTE row for this agent/round
+            for row in reversed(metrics_rows):
+                if row["round"] != round_num:
+                    break
+                if row["phase"] == "DAY_VOTE" and row["agent"] == ag.name and not row.get("align_tv"):
+                    row["align_tv"] = f"{align_tv:.3f}"
+                    break
+
         if vote_map:
             print("✉ Votes (judge-selected):", ", ".join(f"{k.name}->{v.name}" for k, v in vote_map.items()))
         else:
@@ -651,6 +843,12 @@ def simulate_game(visual: bool = True):
             wolf = wolves[0]
             legal_targets = [a.name for a in agents if a.alive and a.name != wolf.name and a.role != WEREWOLF]
             # keep mask logging (useful even if no kill occurs later)
+            # Basic name/dup sanity
+            assert all(n.startswith("Agent_") for n in legal_targets), \
+                f"[SANITY] kill mask has bad names: {legal_targets} | r{round_num} {wolf.name}"
+            assert len(set(legal_targets)) == len(legal_targets), \
+                f"[SANITY] kill mask has duplicates: {legal_targets} | r{round_num} {wolf.name}"
+
             mask_logs.append({"round": round_num, "phase": "NIGHT_KILL", "actor": wolf.name, "mask": legal_targets})
 
             # Prefer KillHead when available; fallback to random target
@@ -664,13 +862,27 @@ def simulate_game(visual: bool = True):
                             nA = int(fp_w.kill.net[-1].out_features)  # type: ignore[attr-defined]
                         except Exception:
                             nA = NUM_AGENTS
+                        if nA != NUM_AGENTS:
+                            raise AssertionError(
+                                f"[SANITY] KillHead out_features={nA} != NUM_AGENTS={NUM_AGENTS} | r{round_num} agent={wolf.name}"
+                            )
                         kmask = _kill_mask_for(wolf, agents, nA).unsqueeze(0)  # (1,N)
+                        _check_mask(kmask.squeeze(0), nA, kind="kill", round_num=round_num, agent=wolf.name)
                         k_logits = fp_w.kill(z_t_w.unsqueeze(0), mask=kmask).squeeze(0)  # (N,)
                         tgt_idx = int(torch.argmax(k_logits).item())
                         victim = next((a for a in agents if a.name == f"Agent_{tgt_idx}" and a.alive), None)
                         if victim is not None:
                             # phase-aware pending for NIGHT_KILL (2)
-                            pending[wolf.name] = (z_t_w.detach(), 2, torch.tensor(int(tgt_idx)), wolf.role)
+                            aux_snap = wolf.make_aux(agents)
+                            _check_aux(aux_snap, round_num=round_num, agent=wolf.name)
+                            pending[wolf.name] = (
+                                z_t_w.detach(),
+                                2,
+                                torch.tensor(int(tgt_idx)),
+                                wolf.role or "Unknown",
+                                "KILL_TARGET",
+                                aux_snap,
+                            )
                 except Exception:
                     victim = None
 
@@ -681,7 +893,16 @@ def simulate_game(visual: bool = True):
                 if victim is not None:
                     # still record a phase-aware pending tuple (simulate a chosen idx)
                     z_t_w = z_map.get(wolf, wolf.encode_current_belief(round_num, agents)).detach()
-                    pending[wolf.name] = (z_t_w, 2, torch.tensor(int(victim.name.split('_')[1])), wolf.role)
+                    aux_snap = wolf.make_aux(agents)
+                    _check_aux(aux_snap, round_num=round_num, agent=wolf.name)
+                    pending[wolf.name] = (
+                        z_t_w,
+                        2,
+                        torch.tensor(int(victim.name.split('_')[1])),
+                        wolf.role or "Unknown",
+                        "KILL_TARGET",
+                        aux_snap,
+                    )
 
             if victim:
                 eliminate_player(victim)
@@ -717,10 +938,23 @@ def simulate_game(visual: bool = True):
 
         for ag in agents:
             if ag.name in pending:
+                # Pending holds: (z_t, ph_code, payload_idx, role, choice_type, aux)
                 z_next = ag.encode_current_belief(round_num + 1, agents).detach()
-                z_t, ph_code, payload_idx, role = pending[ag.name]
+                z_t, ph_code, payload_idx, role, choice_type, aux = pending[ag.name]
+                # aux sanity (just in case)
+                _check_aux(aux, round_num=round_num, agent=ag.name)
+
                 # Phase-aware rollout tuple (ensure scalars for phase & payload)
-                rollout.append((z_t, torch.tensor(int(ph_code)), torch.tensor(int(payload_idx)), z_next, role))
+                rollout.append((
+                    z_t,
+                    torch.tensor(int(ph_code)),
+                    torch.tensor(int(payload_idx)),
+                    z_next,
+                    role or "Unknown",
+                    choice_type,
+                    aux,
+                ))
+
                 l2 = torch.norm(z_next - z_t).item()
                 z_deltas.append(l2)
                 cos_val = F.cosine_similarity(z_next.unsqueeze(0), z_t.unsqueeze(0)).item()

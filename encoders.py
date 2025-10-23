@@ -1,8 +1,12 @@
+# encoders.py — Phase-5 ready encoders & heads (situated dialog + stable APIs)
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModel
 from functools import lru_cache
+from typing import List, Tuple, Optional, Dict
 import yaml
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -31,6 +35,24 @@ WORLD_INPUT_MODE  = (config.get("WORLD_INPUT_MODE", "z_plus_action") or "z_plus_
 ACTION_EMBED_KIND = (config.get("ACTION_EMBED_KIND", "onehot") or "onehot").lower()               # 'onehot'|'learned'
 ACTION_EMBED_DIM  = int(config.get("ACTION_EMBED_DIM", ACTION_DIM))                               # final a_embed width
 
+# ── Encoders Phase-5 knobs (optional, safe defaults)
+ENC_CFG = (config.get("encoders", {}) or {})
+ENC_CTX = (ENC_CFG.get("context", {}) or {})
+CTX_WINDOW      = int(ENC_CTX.get("window", 6))
+CTX_DECAY       = float(ENC_CTX.get("decay", 0.85))
+CTX_SELF_GATE   = float(ENC_CTX.get("self_gate", 1.15))
+CTX_OTHER_GATE  = float(ENC_CTX.get("other_gate", 1.0))
+CTX_ADD_ROLE    = bool(ENC_CTX.get("add_role_bit", True))
+CTX_L2_NORM     = bool(ENC_CTX.get("l2_norm", True))
+
+ENC_TEXT        = (ENC_CFG.get("text", {}) or {})
+TEXT_L2_NORM    = bool(ENC_TEXT.get("l2_norm", True))
+TEXT_CACHE_SIZE = int(ENC_TEXT.get("cache_size", 8192))
+
+ENC_REG         = (ENC_CFG.get("regularization", {}) or {})
+TALK_ENTROPY_W  = float(ENC_REG.get("talk_entropy_w", 0.0))
+TALK_KL_UNIF_W  = float(ENC_REG.get("talk_kl_uniform_w", 0.0))
+
 def phase_onehot(phase_code: int) -> torch.Tensor:
     v = torch.zeros(NUM_PHASES, dtype=torch.float32)
     if 0 <= phase_code < NUM_PHASES:
@@ -38,10 +60,10 @@ def phase_onehot(phase_code: int) -> torch.Tensor:
     return v
 
 # ───────────────────────────────────────────────────────────────────────────────
-# TEXT ENCODER MODULE  (shared; includes tiny LRU for single-string calls)
+# TEXT ENCODER MODULE  (shared; includes L2 + larger cache)
 # ───────────────────────────────────────────────────────────────────────────────
 class MessageEncoder(nn.Module):
-    def __init__(self, model_name='sentence-transformers/all-MiniLM-L6-v2'):
+    def __init__(self, model_name: str = 'sentence-transformers/all-MiniLM-L6-v2'):
         super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.transformer = AutoModel.from_pretrained(model_name)
@@ -50,14 +72,17 @@ class MessageEncoder(nn.Module):
         for p in self.transformer.parameters():
             p.requires_grad_(False)
 
-    @lru_cache(maxsize=4096)
+    @lru_cache(maxsize=TEXT_CACHE_SIZE)
     def _encode_cached_one(self, text: str):
         # Returns a CPU tensor (D,) for determinism & low VRAM
         encoded_input = self.tokenizer([text], padding=True, truncation=True, return_tensors='pt')
         with torch.no_grad():
             model_output = self.transformer(**encoded_input)
         pooled = self.mean_pooling(model_output, encoded_input['attention_mask'])[0]  # (D,)
-        return pooled.detach().cpu()
+        vec = pooled.detach().cpu()
+        if TEXT_L2_NORM:
+            vec = F.normalize(vec, dim=0, eps=1e-8)
+        return vec
 
     def forward(self, texts):
         # Fast path for a single string (cacheable)
@@ -68,13 +93,92 @@ class MessageEncoder(nn.Module):
         with torch.no_grad():
             model_output = self.transformer(**encoded_input)
         pooled = self.mean_pooling(model_output, encoded_input['attention_mask'])
-        return pooled.detach()
+        out = pooled.detach()
+        if TEXT_L2_NORM:
+            out = F.normalize(out, dim=1, eps=1e-8)
+        return out
 
     def mean_pooling(self, model_output, attention_mask):
         token_embeddings = model_output.last_hidden_state  # (B,T,D)
         input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size())  # (B,T,1)->(B,T,D)
         denom = input_mask_expanded.sum(1).clamp_min(1.0)  # avoid div/0
         return (token_embeddings * input_mask_expanded).sum(1) / denom  # (B,D)
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Dialog context encoder: (speaker,text) window → one context vector
+# ───────────────────────────────────────────────────────────────────────────────
+class DialogContextEncoder(nn.Module):
+    """
+    Turn a short window of recent dialog into one context vector.
+    - Per-utterance embed via MessageEncoder (shared).
+    - Exponential decay on recency.
+    - Self/other gating.
+    - Optional role bit concatenation (Werewolf/Worker ~ 1/0).
+    Output: (D,) where D = msg_dim (+1 if add_role_bit).
+    """
+    def __init__(
+        self,
+        message_encoder: MessageEncoder,
+        *,
+        window: int = CTX_WINDOW,
+        decay: float = CTX_DECAY,
+        self_gate: float = CTX_SELF_GATE,
+        other_gate: float = CTX_OTHER_GATE,
+        add_role_bit: bool = CTX_ADD_ROLE,
+        l2_norm: bool = CTX_L2_NORM,
+    ):
+        super().__init__()
+        self.msg_enc = message_encoder
+        self.window = int(window)
+        self.decay = float(decay)
+        self.self_gate = float(self_gate)
+        self.other_gate = float(other_gate)
+        self.add_role_bit = bool(add_role_bit)
+        self.l2_norm = bool(l2_norm)
+        self.output_dim = self.msg_enc.output_dim + (1 if self.add_role_bit else 0)
+
+    @torch.no_grad()
+    def forward_from_messages(
+        self,
+        messages: List[Tuple[str, str]],
+        *,
+        self_name: Optional[str] = None,
+        role_bit: Optional[int] = None
+    ) -> torch.Tensor:
+        """
+        messages: [(speaker_name, text), ...] most-recent LAST.
+        self_name: current agent name (to gate self vs others).
+        role_bit: optional {1 werewolf, 0 villager}; appended if add_role_bit=True.
+        """
+        if not messages:
+            base = torch.zeros(self.msg_enc.output_dim)
+            return self._maybe_cat_role(base, role_bit)
+
+        msgs = messages[-self.window:]
+        T = len(msgs)
+        weights = torch.tensor([self.decay ** (T - 1 - i) for i in range(T)], dtype=torch.float32)
+        weights = weights / weights.sum().clamp_min(1e-8)
+
+        texts = [m[1] for m in msgs]
+        embeds = self.msg_enc(texts)  # (T, D)
+
+        if self_name is not None:
+            gates = torch.tensor(
+                [self.self_gate if (speaker == self_name) else self.other_gate for (speaker, _) in msgs],
+                dtype=torch.float32
+            ).unsqueeze(1)  # (T,1)
+            embeds = embeds * gates
+
+        ctx = (weights.unsqueeze(1) * embeds).sum(0)  # (D,)
+        if self.l2_norm:
+            ctx = F.normalize(ctx, dim=0, eps=1e-8)
+        return self._maybe_cat_role(ctx, role_bit)
+
+    def _maybe_cat_role(self, v: torch.Tensor, role_bit: Optional[int]) -> torch.Tensor:
+        if self.add_role_bit:
+            bit = torch.tensor([float(1.0 if role_bit else 0.0)], dtype=torch.float32)
+            return torch.cat([v, bit], dim=0)
+        return v
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Social influence: text → bounded latent delta
@@ -100,6 +204,24 @@ class SocialInfluence(nn.Module):
         delta = self.net(x)
         delta = torch.tanh(delta) * self.scale
         return delta.squeeze(0) if delta.size(0) == 1 else delta
+
+@torch.no_grad()
+def social_delta_from_dialog(
+    social_module: SocialInfluence,
+    ctx_encoder: DialogContextEncoder,
+    messages: List[Tuple[str, str]],
+    *,
+    self_name: Optional[str] = None,
+    role_bit: Optional[int] = None,
+) -> torch.Tensor:
+    """
+    Convenience: (speaker,text)[] → context vector → δ_social via SocialInfluence.
+    If DialogContextEncoder added a role bit, it is stripped before SocialInfluence.
+    """
+    ctx_vec = ctx_encoder.forward_from_messages(messages, self_name=self_name, role_bit=role_bit)
+    if ctx_encoder.add_role_bit:
+        ctx_vec = ctx_vec[:-1]
+    return social_module(ctx_vec)
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Latent/state encoders & world model
@@ -427,8 +549,10 @@ class PlannerHeads(nn.Module):
 class PhaseAwareActionEmbedder(nn.Module):
     """
     Build an action embedding that encodes both phase and payload (talk cat or agent id).
-    Two strategies:
-      - kind='onehot' : [onehot(phase); onehot(payload padded)] → MLP → a_embed
+    DISCUSS phase → payload is talk_category_id ∈ [0, NUM_TALK_CATS)
+    VOTE/NIGHT   → payload is agent_id       ∈ [0, NUM_AGENTS)
+    Strategies:
+      - kind='onehot' : [onehot(phase); onehot(payload padded to max(num_agents,num_talk))] → MLP → a_embed
       - kind='learned': concat(Emb(phase), Emb_talk|Emb_agent) → proj → a_embed
     API:
       forward_b(phase: Long[B], payload: Long[B]) -> Float[B, ACTION_EMBED_DIM]
@@ -519,7 +643,6 @@ class PhaseAwareActionEmbedder(nn.Module):
 
         talk_vec  = self.talk_emb(pay_discuss)   # (B, d_pay)
         agent_vec = self.agent_emb(pay_other)    # (B, d_pay)
-        # Row-wise select: if discuss → talk_vec else agent_vec
         payload_e = torch.where(is_discuss.unsqueeze(1), talk_vec, agent_vec)
         a_raw = torch.cat([ph_e, payload_e], dim=-1)
         return self.proj(a_raw)                  # (B, a_dim)
@@ -560,6 +683,57 @@ class PhaseActionEncoder(nn.Module):
             payload_idx = payload_idx.unsqueeze(0)
         # Ignore is_talk (phase determines space); kept for signature compat.
         return self.inner.forward_b(phase_code.long(), payload_idx.long())
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Persona modulation helpers (opt-in; keep head APIs stable)
+# ───────────────────────────────────────────────────────────────────────────────
+class PersonaModulation:
+    """
+    Light-touch multipliers derived from agent.persona_effects.
+    Apply outside heads (or as tiny logit nudges) to preserve interfaces.
+    """
+    def __init__(self, effects: Dict | None):
+        eff = effects or {}
+        self.talk_temperature_scale = float(eff.get("speaker_temp_scale", 1.0))
+        self.coherence_weight_scale = float(eff.get("coherence_weight_scale", 1.0))
+        self.accuse_prior_boost     = float(eff.get("accuse_bias_scale", 1.0)) - 1.0  # ~[-0.5,+0.5]→ small
+
+    def apply_talk_prior(self, talk_logits: torch.Tensor, accuse_index: Optional[int]) -> torch.Tensor:
+        """
+        Optional: add a tiny bias to the 'accuse' logit.
+        talk_logits: (B,C) or (C,)
+        """
+        if accuse_index is None or abs(self.accuse_prior_boost) < 1e-6:
+            return talk_logits
+        if talk_logits.dim() == 1:
+            out = talk_logits.clone()
+            out[accuse_index] = out[accuse_index] + self.accuse_prior_boost
+            return out
+        out = talk_logits.clone()
+        out[:, accuse_index] = out[:, accuse_index] + self.accuse_prior_boost
+        return out
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Regularizers for Talk (opt-in; trainer composes with weights from config)
+# ───────────────────────────────────────────────────────────────────────────────
+def talk_entropy_loss(talk_logits: torch.Tensor) -> torch.Tensor:
+    """
+    Encourage mild exploration; returns positive scalar (mean over batch).
+    Use as: loss += TALK_ENTROPY_W * talk_entropy_loss(t_logits)
+    """
+    p = torch.softmax(talk_logits, dim=-1)
+    ent = -(p * (p.clamp_min(1e-12).log())).sum(dim=-1)
+    return -ent.mean()  # negative entropy (so adding this increases entropy)
+
+def talk_kl_to_uniform(talk_logits: torch.Tensor) -> torch.Tensor:
+    """
+    Tiny KL to uniform prior to avoid category collapse.
+    """
+    C = talk_logits.size(-1)
+    p = torch.softmax(talk_logits, dim=-1)
+    u = torch.full_like(p, 1.0 / C)
+    kl = (p * (p.clamp_min(1e-12).log() - u.log())).sum(dim=-1)
+    return kl.mean()
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Feature packaging (add meta-friendly variant for logging)

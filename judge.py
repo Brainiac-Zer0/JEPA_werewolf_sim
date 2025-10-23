@@ -32,7 +32,7 @@ with open("config.yaml", "r") as f:
     config = yaml.safe_load(f) or {}
 
 # ────────────── Base config values (from file) ──────────────
-JUDGE_MODEL_ID      = config.get("JUDGE_MODEL_ID", "meta-llama/Llama-3.1-8B-Instruct")
+JUDGE_MODEL_ID      = config.get("JUDGE_MODEL_ID", "microsoft/Phi-3-mini-4k-instruct")
 JUDGE_MAX_NEW       = int(config.get("JUDGE_MAX_NEW", 128))
 INCLUDE_RATIONALE   = bool(config.get("INCLUDE_RATIONALE", True))
 ENABLE_PERSONA_STEER= bool(config.get("ENABLE_PERSONA_STEER", False))
@@ -41,6 +41,12 @@ JUDGE_DEVICE        = str(config.get("JUDGE_DEVICE", "")).lower()
 JUDGE_BATCH         = max(1, int(config.get("JUDGE_BATCH", 3)))
 JUDGE_DEBUG         = bool(config.get("JUDGE_DEBUG", False))
 JUDGE_DEBUG_DIR     = config.get("JUDGE_DEBUG_DIR", "logs")
+
+# ────────────── Phase-5 structured judge toggles ──────────────
+_judge_cfg = config.get("judge", {}) if isinstance(config.get("judge", {}), dict) else {}
+RERANK_TOPK        = bool(_judge_cfg.get("rerank_topk", True))
+STORE_SUBSCORES    = bool(_judge_cfg.get("store_subscores", True))
+TALK_VOTE_ALIGN_ON = bool(_judge_cfg.get("talk_vote_alignment", True))
 
 # ────────────── Env overrides (SLURM-friendly shims) ──────────────
 JUDGE_MODEL_ID       = _env_str ("JUDGE_MODEL_ID",       JUDGE_MODEL_ID)
@@ -88,10 +94,9 @@ def audit_judge_calls(
 ) -> None:
     """
     ADD-ONLY helper: write one JSON line per (item, result) pair.
-    Call this AFTER score_batch(...) returns; no changes inside score_batch.
 
     Each line includes keys that line up with the sim CSV:
-      run_id, round, phase, agent, context, role, candidate, subscores, score.
+      run_id, round, phase, agent, context, role, candidate, subscores, score[, align_tv].
     """
     if not judge_logging_enabled():
         return
@@ -106,7 +111,7 @@ def audit_judge_calls(
             for i in range(n):
                 it  = items[i] or {}
                 out = results[i] or {}
-                rec = {
+                rec: Dict[str, Any] = {
                     "run_id": run_id,
                     "round": int(round_num),
                     "phase": str(phase),
@@ -117,6 +122,8 @@ def audit_judge_calls(
                     "subscores": out.get("subscores", {}),
                     "score": float(out.get("score", 0.0)),
                 }
+                if "align_tv" in out:
+                    rec["align_tv"] = out["align_tv"]
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception as e:
         # Never crash the caller on audit failures
@@ -182,7 +189,7 @@ def _lazy_pipe():
         except Exception:
             pass
 
-        _model = AutoModelForCausalLM.from_pretrained(JUDGE_MODEL_ID, torch_dtype=dtype)
+        _model = AutoModelForCausalLM.from_pretrained(JUDGE_MODEL_ID, torch_dtype=dtype, low_cpu_mem_usage=True)
 
         # ensure pad token for batching
         if _tok.pad_token_id is None:
@@ -219,20 +226,34 @@ def _rubric_lines(rubric: JudgeRubric) -> str:
     )
 
 def _make_prompt(context: str, role: str, candidate: str, rubric: JudgeRubric, tok) -> str:
-    msgs = [
-        {"role": "system", "content": _SYSTEM_HDR + "\n\nRubric:\n" + _rubric_lines(rubric)},
-        {"role": "user",
-         "content": f"Role: {role}\nContext:\n{context.strip()}\n\nCANDIDATE:\n{candidate.strip()}\n\n"
-                    f"Begin JSON object immediately; do not add prose.\nJSON:\n{{"}  # pre-seed opening brace
-    ]
-    try:
-        return tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-    except Exception:
-        # fallback: raw concat
-        return (
-            f"<system>\n{_SYSTEM_HDR}\nRubric:\n{_rubric_lines(rubric)}\n</system>\n"
-            f"Role: {role}\nContext:\n{context}\n\nCANDIDATE:\n{candidate}\n\nJSON:\n{{"
-        )
+    # Model-agnostic raw prompt with tiny JSON example; avoids chat template issues on small models.
+    example = (
+        '{\n'
+        '  "subscores": {"coherence": 0.82, "truthfulness": 0.73, "role_alignment": 0.61, "social_safety": 0.95},\n'
+        '  "score": 0.76,\n'
+        '  "rationale": "Short reason."\n'
+        '}\n'
+    )
+    sys_hdr = (
+        "You are an impartial metrics judge for a hidden-role social deduction game.\n"
+        "Evaluate ONLY the CANDIDATE utterance per the rubric and return STRICT JSON.\n"
+        "Keys:\n"
+        "  - subscores: object of floats in [0,1] for each criterion name\n"
+        '  - score: float in [0,1] (weighted by rubric "w" values)\n'
+        "  - rationale: short string\n"
+        "Your reply MUST be only a single JSON object. No prose, no code fences.\n"
+        "Example JSON format (values are illustrative only):\n"
+        f"{example}"
+        "Rubric:\n" + _rubric_lines(rubric) + "\n"
+    )
+    user = (
+        f"Role: {role}\n"
+        f"Context:\n{context.strip()}\n\n"
+        f"CANDIDATE:\n{candidate.strip()}\n\n"
+        "Begin JSON now. Output only one JSON object with keys subscores, score, rationale.\n"
+        "JSON:\n"
+    )
+    return sys_hdr + "\n" + user
 
 # ────────────── JSON helpers ──────────────
 _CODEFENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
@@ -332,6 +353,13 @@ def score_batch(
     rubric: JudgeRubric,
     *,
     persona_hook: Optional["PersonaHook"] = None,
+    # Phase-5 logging/meta passthrough (optional)
+    run_id: str = "",
+    round_num: int = -1,
+    phase: str = "",
+    agent: str = "",
+    # Optional alignment passthrough per candidate (same length as items)
+    alignment_values: Optional[List[Optional[float]]] = None,
 ) -> List[Dict[str, Any]]:
     if not items: return []
     pipe, tok = _lazy_pipe()
@@ -361,7 +389,7 @@ def score_batch(
     for idx, out_full in enumerate(raw):
         out  = out_full[0] if isinstance(out_full, list) else out_full
         cont = out.get("generated_text", "") or out.get("text", "")
-        text = "{" + cont  # re-attach the pre-seeded opening brace
+        text = cont  # ← no re-attached '{' — parse exactly what model returned
 
         # 1) Try strict parse (fenced or balanced, with mild repair/auto-close)
         json_candidate = _extract_from_fence(text) or _extract_last_json(text) or _autoclose_braces(text)
@@ -408,7 +436,25 @@ def score_batch(
         _dbg_write(dbg)
         _dbg_print(f"item#{idx} parsed_ok={parsed_ok} score={score:.2f}")
 
-        results.append({"subscores": subs, "score": score, "rationale": rationale})
+        rec: Dict[str, Any] = {"subscores": subs, "score": score, "rationale": rationale}
+        if TALK_VOTE_ALIGN_ON and alignment_values is not None and idx < len(alignment_values):
+            rec["align_tv"] = alignment_values[idx] if alignment_values[idx] is not None else None
+        results.append(rec)
+
+    # Persist per-candidate subscores/score for analytics & training alignment
+    if STORE_SUBSCORES:
+        try:
+            audit_judge_calls(
+                run_id=run_id or "",
+                round_num=int(round_num) if round_num is not None else -1,
+                phase=str(phase or ""),
+                agent=str(agent or ""),
+                items=items,
+                results=results,
+                jsonl_path=None,  # default path via config/env
+            )
+        except Exception as e:
+            _dbg_print("audit_judge_calls failed:", e)
 
     return results
 
@@ -417,13 +463,27 @@ def choose_best(
     rubric: JudgeRubric,
     *,
     persona_hook: Optional["PersonaHook"] = None,
+    # Phase-5 logging/meta passthrough (optional)
+    run_id: str = "",
+    round_num: int = -1,
+    phase: str = "",
+    agent: str = "",
 ) -> Tuple[int, Dict[str, Any]]:
     items = [{"context": c, "role": r, "candidate": a} for (c, r, a) in contexts_roles_candidates]
-    scored = score_batch(items, rubric, persona_hook=persona_hook)
+    scored = score_batch(
+        items, rubric, persona_hook=persona_hook,
+        run_id=run_id, round_num=round_num, phase=phase, agent=agent
+    )
     if not scored: return -1, {}
+
+    if not RERANK_TOPK:
+        # Honor planner order: keep first candidate, still return its scores
+        return 0, scored[0]
+
     def tie_key(d: Dict[str, Any]):
         subs = d.get("subscores", {})
         return (d.get("score", 0.0), subs.get("truthfulness", 0.0), subs.get("coherence", 0.0))
+
     best_idx = max(range(len(scored)), key=lambda i: tie_key(scored[i]))
     return best_idx, scored[best_idx]
 
@@ -449,5 +509,8 @@ if __name__ == "__main__":
     ap.add_argument("--candidate", required=True, help="Candidate utterance")
     args = ap.parse_args()
     rubric = JudgeRubric.load(args.rubric)
-    res = score_batch([{"context": args.context, "role": args.role, "candidate": args.candidate}], rubric)
+    res = score_batch(
+        [{"context": args.context, "role": args.role, "candidate": args.candidate}],
+        rubric
+    )
     print(json.dumps(res[0], indent=2))

@@ -46,6 +46,22 @@ except Exception:
                 "kill": self.kill(z, kill_mask),
             }
 
+# ── Optional mouthpiece controllers (if present)
+try:
+    # SpeakerBandit: produces logits over templates given latent/role/history features
+    # LogitBiasHead: produces token-level biases or category biases; API varies by repo
+    from speaker_llm import SpeakerBandit, LogitBiasHead  # type: ignore
+except Exception:
+    SpeakerBandit = None  # type: ignore
+    LogitBiasHead = None  # type: ignore
+
+# Optional language coupling helpers (only used if present)
+try:
+    from encoders import MessageEncoder, SocialInfluence
+except Exception:
+    MessageEncoder = None  # type: ignore
+    SocialInfluence = None  # type: ignore
+
 CHECKPOINT_DIR = "checkpoints"
 LOGS_DIR = "logs"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -68,12 +84,39 @@ NUM_AGENTS_CFG: int = int(CFG.get("NUM_AGENTS", 6))
 ACTION_EMBED_DIM: int = int(CFG.get("ACTION_DIM", CFG.get("ACTION_EMBED_DIM", 8)))  # prefer ACTION_DIM if present
 LATENT_DIM: int = int(CFG.get("LATENT_DIM", 32))
 
-# New Phase-4 switches
+# New Phase-4/5 switches
 USE_AMP: bool = bool(CFG.get("USE_AMP", False))
 SCHEDULER: str = str(CFG.get("LR_SCHEDULER", "none")).lower()  # 'none'|'cosine'|'onecycle'
 SAVE_OPTIM: bool = bool(CFG.get("SAVE_OPTIM", False))
 DEBUG_MASKS: bool = bool(CFG.get("DEBUG_MASKS", False))
 STRATIFY_PHASE_BATCHES: bool = bool(CFG.get("STRATIFY_PHASE_BATCHES", True))
+
+# ── Phase-5: mouthpiece & rewards config (defaults are conservative)
+RW = CFG.get("MOUTHPIECE_REWARD_WEIGHTS", {}) or {}
+R_COHE   = float(RW.get("coherence", 0.40))
+R_ROLE   = float(RW.get("role_alignment", 0.30))
+R_SAFE   = float(RW.get("social_safety", 0.15))
+R_TRUTH  = float(RW.get("truthfulness_villager", 0.15))
+R_DECEP  = float(RW.get("deception_wolf", 0.30))  # applied to (1 - truthfulness)
+R_ALIGN  = float(RW.get("talk_vote_alignment", 0.10))  # extra bonus
+
+# ── Phase-5: reward/rubric alignment guard (default False to match rubric)
+REWARD_USE_ROLE_ALIGNMENT: bool = bool(CFG.get("REWARD_USE_ROLE_ALIGNMENT", False))
+
+MB = CFG.get("MOUTHPIECE_TRAINING", {}) or {}
+SB_LR       = float(MB.get("speaker_bandit_lr", 5e-4))
+SB_EPOCHS   = int(MB.get("speaker_bandit_epochs", 1))
+SB_ENTROPY  = float(MB.get("speaker_bandit_entropy_coef", 0.01))
+SB_BASE_EMA = float(MB.get("speaker_bandit_baseline_ema", 0.9))
+
+BH_LR      = float(MB.get("bias_head_lr", 5e-4))
+BH_EPOCHS  = int(MB.get("bias_head_epochs", 1))
+BH_ENT_REG = float(MB.get("bias_head_entropy_reg", 0.005))
+BH_KL_REG  = float(MB.get("bias_head_kl_reg", 0.0))
+
+LANG_COUP = CFG.get("LANGUAGE_COUPLING", {}) or {}
+LC_ENABLED  = bool(LANG_COUP.get("enabled", False))
+LC_WEIGHT   = float(LANG_COUP.get("loss_weight", 0.05))
 
 # =============================================================================
 # Determinism & run metadata
@@ -323,7 +366,11 @@ def train_jepa(
                 logits  = planner(z_t_tensor)                                 # [B, num_agents]
                 L_mse = mse_loss(z_pred, z_next_tensor)
                 L_bc  = ce_loss(logits, a_idx_tensor)
-                loss  = L_mse + LAMBDA_BC * L_bc
+
+                # Optional language coupling (legacy has no texts; stays zero unless you extend rollouts)
+                L_lc = torch.tensor(0.0, device=DEVICE)
+
+                loss  = L_mse + LAMBDA_BC * L_bc + L_lc
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -424,6 +471,38 @@ def train_jepa_phaseaware(
 
     world_model.train(), planner.train(), pae.train()
 
+    # ---- Language coupling singletons (lazy) ---------------------------------
+    _LC_MSG = None  # type: Optional[Any]
+    _LC_SOC = None  # type: Optional[nn.Module]
+
+    def _ensure_lang_coupling_modules() -> Tuple[Optional[Any], Optional[nn.Module]]:
+        nonlocal _LC_MSG, _LC_SOC
+        if not LC_ENABLED or MessageEncoder is None or SocialInfluence is None:
+            return None, None
+        if _LC_MSG is None:
+            msg_model = (CFG.get("model", {})
+                           .get("encoders", {})
+                           .get("message_model", "sentence-transformers/all-MiniLM-L6-v2"))
+            _LC_MSG = MessageEncoder(model_name=msg_model)
+        if _LC_SOC is None:
+            soc_cfg = (CFG.get("sim", {}).get("social", {}) or {})
+            hidden = int(soc_cfg.get("hidden", 64))
+            scale  = float(soc_cfg.get("scale", 0.2))
+            _LC_SOC = SocialInfluence(text_dim=_LC_MSG.output_dim, latent_dim=LATENT_DIM, hidden=hidden, scale=scale)
+            _LC_SOC.to(DEVICE)
+        return _LC_MSG, _LC_SOC
+
+    def _collect_texts_from_batch(batch: List[RolloutSample]) -> list:
+        texts: list = []
+        for r in batch:
+            aux = r.aux or {}
+            if isinstance(aux, dict):
+                if "recent_texts" in aux and isinstance(aux["recent_texts"], list):
+                    texts.extend([t for t in aux["recent_texts"] if isinstance(t, str)])
+                elif "neighbor_texts" in aux and isinstance(aux["neighbor_texts"], list):
+                    texts.extend([t for t in aux["neighbor_texts"] if isinstance(t, str)])
+        return texts
+
     for ep in range(1, epochs + 1):
         random.shuffle(rows)
         batches = make_batches(rows, batch_size)
@@ -470,7 +549,20 @@ def train_jepa_phaseaware(
                 else:
                     L_bc = torch.tensor(0.0, device=DEVICE)
 
-                loss = L_mse + LAMBDA_BC * L_bc
+                # ---- Optional language coupling --------------------------------
+                L_lc = torch.tensor(0.0, device=DEVICE)
+                if LC_ENABLED:
+                    msg_enc, soc = _ensure_lang_coupling_modules()
+                    if msg_enc is not None and soc is not None:
+                        texts = _collect_texts_from_batch(batch)
+                        if texts:
+                            L_lc = language_coupling_loss(
+                                z_next=z_next_tensor,
+                                texts=texts,
+                                msg_encoder=msg_enc, social=soc, weight=LC_WEIGHT
+                            )
+
+                loss = L_mse + LAMBDA_BC * L_bc + L_lc
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -641,6 +733,38 @@ def train_jepa_factorized(
     planner_factorized.train()
     pae.train()
 
+    # ---- Language coupling singletons (lazy) ---------------------------------
+    _LC_MSG = None  # type: Optional[Any]
+    _LC_SOC = None  # type: Optional[nn.Module]
+
+    def _ensure_lang_coupling_modules() -> Tuple[Optional[Any], Optional[nn.Module]]:
+        nonlocal _LC_MSG, _LC_SOC
+        if not LC_ENABLED or MessageEncoder is None or SocialInfluence is None:
+            return None, None
+        if _LC_MSG is None:
+            msg_model = (CFG.get("model", {})
+                           .get("encoders", {})
+                           .get("message_model", "sentence-transformers/all-MiniLM-L6-v2"))
+            _LC_MSG = MessageEncoder(model_name=msg_model)
+        if _LC_SOC is None:
+            soc_cfg = (CFG.get("sim", {}).get("social", {}) or {})
+            hidden = int(soc_cfg.get("hidden", 64))
+            scale  = float(soc_cfg.get("scale", 0.2))
+            _LC_SOC = SocialInfluence(text_dim=_LC_MSG.output_dim, latent_dim=LATENT_DIM, hidden=hidden, scale=scale)
+            _LC_SOC.to(DEVICE)
+        return _LC_MSG, _LC_SOC
+
+    def _collect_texts_from_batch(batch: List[RolloutSample]) -> list:
+        texts: list = []
+        for r in batch:
+            aux = r.aux or {}
+            if isinstance(aux, dict):
+                if "recent_texts" in aux and isinstance(aux["recent_texts"], list):
+                    texts.extend([t for t in aux["recent_texts"] if isinstance(t, str)])
+                elif "neighbor_texts" in aux and isinstance(aux["neighbor_texts"], list):
+                    texts.extend([t for t in aux["neighbor_texts"] if isinstance(t, str)])
+        return texts
+
     for ep in range(1, epochs + 1):
         random.shuffle(rows)
         batches = make_batches(rows, batch_size)
@@ -709,7 +833,20 @@ def train_jepa_factorized(
                 if is_kill_mask.any():
                     L_kill = ce_loss(logits["kill"][is_kill_mask], payload[is_kill_mask])
 
-                loss = L_mse + (LAMBDA_TALK * L_talk) + (LAMBDA_BC * (L_vote + L_kill))
+                # ---- Optional language coupling --------------------------------
+                L_lc = torch.tensor(0.0, device=DEVICE)
+                if LC_ENABLED:
+                    msg_enc, soc = _ensure_lang_coupling_modules()
+                    if msg_enc is not None and soc is not None:
+                        texts = _collect_texts_from_batch(batch)
+                        if texts:
+                            L_lc = language_coupling_loss(
+                                z_next=z_next_tensor,
+                                texts=texts,
+                                msg_encoder=msg_enc, social=soc, weight=LC_WEIGHT
+                            )
+
+                loss = L_mse + (LAMBDA_TALK * L_talk) + (LAMBDA_BC * (L_vote + L_kill)) + L_lc
 
             # Backprop
             optimizer.zero_grad(set_to_none=True)
@@ -946,6 +1083,390 @@ def evaluate_jepa_factorized(
         "vote_illegal": tot["vote_illegal"] / max(1.0, tot["vote_acc_n"]),
         "kill_illegal": tot["kill_illegal"] / max(1.0, tot["kill_acc_n"]),
     }
+
+# =============================================================================
+# Phase-5: Utterance dataset collation + mouthpiece trainers
+# =============================================================================
+
+@dataclass
+class UtteranceSample:
+    # inputs
+    z_t: torch.Tensor
+    role: str
+    round_num: int
+    template_id: Optional[int]
+    talk_cat: Optional[int]
+    hist_feats: Optional[torch.Tensor]   # any small embedding/feature vec (or None)
+    # scored targets
+    judge_score: float
+    coherence: float
+    truthfulness: float
+    role_alignment: float
+    social_safety: float
+    align_tv: Optional[float]            # talk→vote alignment [0..1]
+
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+def _role_is_wolf(role: str) -> bool:
+    return (role or "").strip().lower() in ("werewolf", "wolf")
+
+def collect_utterance_dataset(agents: List[Any]) -> List[UtteranceSample]:
+    """
+    Pull per-utterance training rows from agents' msg_buffer (populated in sim.py Phase-5).
+    Each msg_buffer entry is expected to contain:
+      - 'z' (latent at speak time) or we fallback to agent.encode_current_belief(...) when available (rare)
+      - 'template_id' (int) if the speaker used a template-scaffold
+      - 'judge_score' and 'judge_subscores' with keys: coherence, truthfulness, role_alignment, social_safety
+      - 'alignment_vote' (float) for talk→vote alignment
+      - 'talk_category' or agent.talk_category_last for intent supervision
+      - 'round' optional; fallback to 0
+      - optional 'hist_feats' tensor-like
+    """
+    out: List[UtteranceSample] = []
+    for ag in agents or []:
+        buf = getattr(ag, "msg_buffer", None)
+        if not buf:
+            continue
+        role = getattr(ag, "role", "") or ""
+        for row in buf:
+            z = row.get("z", None)
+            if z is None:
+                # best-effort fallback (rare; we prefer the exact z_t captured when talking)
+                try:
+                    z = ag.encode_current_belief(int(row.get("round", 0)), agents).detach()
+                except Exception:
+                    continue
+            if not torch.is_tensor(z):
+                try:
+                    z = torch.tensor(z).float()
+                except Exception:
+                    continue
+            j = row.get("judge_subscores", {}) or {}
+            out.append(UtteranceSample(
+                z_t = z.detach(),
+                role = role,
+                round_num = int(row.get("round", 0)),
+                template_id = int(row["template_id"]) if "template_id" in row else None,
+                talk_cat = int(row["talk_category"]) if "talk_category" in row else int(getattr(ag, "talk_category_last", -1)) if getattr(ag, "talk_category_last", -1) != -1 else None,
+                hist_feats = row.get("hist_feats", None),
+                judge_score = _safe_float(row.get("judge_score", 0.0)),
+                coherence = _safe_float(j.get("coherence", 0.0)),
+                truthfulness = _safe_float(j.get("truthfulness", 0.0)),
+                role_alignment = _safe_float(j.get("role_alignment", 0.0)),
+                social_safety = _safe_float(j.get("social_safety", 0.0)),
+                align_tv = _safe_float(row.get("alignment_vote", 0.0)) if "alignment_vote" in row else None,
+            ))
+    return out
+
+def _compute_reward(sample: UtteranceSample) -> float:
+    """
+    Role-aware scalar reward combining judge subscores and alignment.
+    NOTE: role_alignment is included only if REWARD_USE_ROLE_ALIGNMENT=True
+    to keep consistency with rubric (truthfulness, coherence, social_safety).
+    """
+    base = (R_COHE * sample.coherence) + (R_SAFE * sample.social_safety)
+
+    if REWARD_USE_ROLE_ALIGNMENT:
+        base += (R_ROLE * sample.role_alignment)
+
+    # Truthfulness handling differs by role (wolves rewarded for deception)
+    if _role_is_wolf(sample.role):
+        base += (R_DECEP * max(0.0, 1.0 - sample.truthfulness))
+    else:
+        base += (R_TRUTH * sample.truthfulness)
+
+    if sample.align_tv is not None:
+        base += (R_ALIGN * sample.align_tv)
+
+    # clamp to sane range
+    return float(max(-1.0, min(2.0, base)))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SpeakerBandit trainer (policy gradient with EMA baseline + entropy bonus)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _BanditLogger:
+    def __init__(self, csv_path: str = os.path.join(LOGS_DIR, "metrics_speaker.csv")):
+        self.path = csv_path
+        if not os.path.exists(self.path,):
+            with open(self.path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=["epoch","loss","reward_mean","reward_std","entropy"])
+                w.writeheader()
+    def log(self, epoch: int, loss: float, r_mean: float, r_std: float, ent: float):
+        with open(self.path, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["epoch","loss","reward_mean","reward_std","entropy"])
+            w.writerow({"epoch": epoch, "loss": round(loss,6), "reward_mean": round(r_mean,6), "reward_std": round(r_std,6), "entropy": round(ent,6)})
+
+def train_speaker_bandit(
+    dataset: List[UtteranceSample],
+    speaker: Optional[nn.Module],
+    *,
+    epochs: int = SB_EPOCHS,
+    lr: float = SB_LR,
+    entropy_coef: float = SB_ENTROPY,
+    baseline_ema: float = SB_BASE_EMA,
+) -> None:
+    if speaker is None or SpeakerBandit is None:
+        print("[MOUTHPIECE] SpeakerBandit not available; skipping bandit training.")
+        return
+    # Filter rows that have a template_id (required for supervised action id)
+    rows = [s for s in dataset if s.template_id is not None]
+    if not rows:
+        print("[MOUTHPIECE] No template_id in dataset; skipping bandit training.")
+        return
+
+    speaker.to(DEVICE)
+    speaker.train()
+    opt = optim.Adam(speaker.parameters(), lr=lr)
+
+    # moving baseline for variance reduction
+    baseline = 0.0
+
+    logger = _BanditLogger()
+
+    for ep in range(1, max(1, epochs) + 1):
+        random.shuffle(rows)
+        total_loss = 0.0
+        ent_acc = 0.0
+        rewards_all: List[float] = []
+
+        for s in rows:
+            # Prepare inputs: latent + optional hist feats + role bit
+            z = s.z_t.to(DEVICE)
+            if z.dim() == 1:
+                z = z.unsqueeze(0)
+            role_bit = torch.tensor([[1.0 if _role_is_wolf(s.role) else 0.0]], device=DEVICE)
+            if s.hist_feats is None:
+                hist = torch.zeros((1, 8), device=DEVICE)  # small default
+            else:
+                h = s.hist_feats
+                if not torch.is_tensor(h):
+                    h = torch.tensor(h).float()
+                hist = h.to(DEVICE).view(1, -1)
+
+            # Speaker forward should return logits over templates
+            logits = speaker(z, role_bit=role_bit, hist_feats=hist)  # [1, T]
+            probs = torch.softmax(logits, dim=-1)
+            logprobs = torch.log_softmax(logits, dim=-1)
+
+            # pick the actually-used template_id as the "action"
+            t_id = int(s.template_id)
+            if t_id < 0 or t_id >= probs.size(-1):
+                # Skip if speaker head doesn't match dataset template space
+                continue
+
+            lp = logprobs[0, t_id]
+            ent = -(probs * logprobs).sum()
+
+            R = _compute_reward(s)
+            rewards_all.append(R)
+
+            # REINFORCE loss = -(R - b) * logpi + entropy bonus
+            adv = R - baseline
+            loss = -(adv * lp) - (entropy_coef * ent)
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(speaker.parameters(), MAX_NORM)
+            opt.step()
+
+            # EMA baseline update
+            baseline = baseline_ema * baseline + (1.0 - baseline_ema) * R
+
+            total_loss += float(loss.item())
+            ent_acc += float(ent.item())
+
+        n = max(1, len(rewards_all))
+        logger.log(ep, total_loss / n, float(np.mean(rewards_all)) if rewards_all else 0.0, float(np.std(rewards_all)) if rewards_all else 0.0, ent_acc / n)
+        print(f"[SpeakerBandit] epoch={ep} loss={total_loss/n:.4f} Rμ={np.mean(rewards_all) if rewards_all else 0.0:.3f} H={ent_acc/n:.3f}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LogitBiasHead trainer (intent CE + reward-weighted soft targets)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _BiasLogger:
+    def __init__(self, csv_path: str = os.path.join(LOGS_DIR, "metrics_bias_head.csv")):
+        self.path = csv_path
+        if not os.path.exists(self.path):
+            with open(self.path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=["epoch","ce","reward_ce","entropy","kl"])
+                w.writeheader()
+    def log(self, epoch: int, ce: float, rce: float, ent: float, kl: float):
+        with open(self.path, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["epoch","ce","reward_ce","entropy","kl"])
+            w.writerow({"epoch": epoch, "ce": round(ce,6), "reward_ce": round(rce,6), "entropy": round(ent,6), "kl": round(kl,6)})
+
+def _entropy_categorical(logits: torch.Tensor) -> torch.Tensor:
+    lp = torch.log_softmax(logits, dim=-1)
+    p = torch.softmax(logits, dim=-1)
+    return -(p * lp).sum(dim=-1).mean()
+
+def _kl_to_uniform(logits: torch.Tensor) -> torch.Tensor:
+    # KL(p || U) = sum p log(p / U); U=1/K => -H(p) + log K
+    k = logits.size(-1)
+    H = _entropy_categorical(logits)
+    return (math.log(k) - H).clamp(min=0.0)
+
+def train_bias_head_on_intents(
+    dataset: List[UtteranceSample],
+    bias_head: Optional[nn.Module],
+    *,
+    epochs: int = BH_EPOCHS,
+    lr: float = BH_LR,
+    ent_reg: float = BH_ENT_REG,
+    kl_reg: float = BH_KL_REG,
+    num_categories: int = NUM_TALK_CATS,
+) -> None:
+    """
+    We interpret LogitBiasHead as a module that can output *category* logits given latent features.
+    If your implementation exposes a different API, adapt this call-site accordingly.
+    Fallback: skip with a clear message.
+    """
+    if bias_head is None or LogitBiasHead is None:
+        print("[MOUTHPIECE] LogitBiasHead not available; skipping bias training.")
+        return
+
+    # Build supervision: only rows with a talk category label
+    rows = [s for s in dataset if s.talk_cat is not None and s.talk_cat >= 0 and s.talk_cat < num_categories]
+    if not rows:
+        print("[MOUTHPIECE] No talk category labels; skipping bias training.")
+        return
+
+    bias_head.to(DEVICE)
+    bias_head.train()
+    opt = optim.Adam(bias_head.parameters(), lr=lr)
+    ce = nn.CrossEntropyLoss()
+
+    logger = _BiasLogger()
+
+    for ep in range(1, max(1, epochs) + 1):
+        random.shuffle(rows)
+        ce_sum = rce_sum = ent_sum = kl_sum = 0.0
+        n = 0
+
+        for s in rows:
+            z = s.z_t.to(DEVICE)
+            if z.dim() == 1:
+                z = z.unsqueeze(0)
+            role_bit = torch.tensor([[1.0 if _role_is_wolf(s.role) else 0.0]], device=DEVICE)
+            # Try to call a generic `category_logits` API; fallback to `forward` if available
+            if hasattr(bias_head, "category_logits"):
+                logits = bias_head.category_logits(z, role_bit=role_bit)  # [1, C]
+            else:
+                logits = bias_head(z)  # best effort
+
+            target = torch.tensor([int(s.talk_cat)], device=DEVICE, dtype=torch.long)
+
+            # Plain CE to observed intent
+            L_ce = ce(logits, target)
+
+            # Reward-weighted soft target (encourage high-judge-score categories)
+            with torch.no_grad():
+                # One-hot at the observed category scaled by positive reward
+                R = max(0.0, _compute_reward(s))
+                soft = torch.zeros_like(logits).softmax(-1)
+                soft[:] = 1.0 / logits.size(-1)
+                soft[0, target.item()] = min(1.0, 0.5 + 0.5 * R)  # push toward chosen cat if reward high
+                soft = (soft / soft.sum(dim=-1, keepdim=True)).detach()
+
+            logp = torch.log_softmax(logits, dim=-1)
+            L_rce = -(soft * logp).sum(dim=-1).mean()
+
+            # regularizers
+            H = _entropy_categorical(logits)
+            KL = _kl_to_uniform(logits)
+
+            loss = L_ce + L_rce + (-ent_reg * H) + (kl_reg * KL)
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(bias_head.parameters(), MAX_NORM)
+            opt.step()
+
+            ce_sum  += float(L_ce.item())
+            rce_sum += float(L_rce.item())
+            ent_sum += float(H.item())
+            kl_sum  += float(KL.item())
+            n += 1
+
+        n = max(1, n)
+        logger.log(ep, ce_sum/n, rce_sum/n, ent_sum/n, kl_sum/n)
+        print(f"[BiasHead] epoch={ep} CE={ce_sum/n:.4f} RCE={rce_sum/n:.4f} H={ent_sum/n:.3f} KL={kl_sum/n:.3f}")
+
+# =============================================================================
+# Mouthpiece checkpoint I/O
+# =============================================================================
+
+def save_mouthpiece(role: str, *, speaker: Optional[nn.Module] = None, bias_head: Optional[nn.Module] = None) -> str:
+    out = os.path.join(CHECKPOINT_DIR, f"{role.lower()}_mouthpiece.pt")
+    state: Dict[str, Any] = {}
+    if speaker is not None:
+        try:
+            state["speaker_bandit"] = speaker.state_dict()
+        except Exception:
+            print("[SAVE] SpeakerBandit state_dict failed; skipping.")
+    if bias_head is not None:
+        try:
+            state["bias_head"] = bias_head.state_dict()
+        except Exception:
+            print("[SAVE] BiasHead state_dict failed; skipping.")
+    torch.save(state, out)
+    print(f"[SAVE] Mouthpiece saved → {out}")
+    return out
+
+def load_mouthpiece(role: str, *, speaker: Optional[nn.Module] = None, bias_head: Optional[nn.Module] = None) -> Tuple[Optional[nn.Module], Optional[nn.Module]]:
+    path = os.path.join(CHECKPOINT_DIR, f"{role.lower()}_mouthpiece.pt")
+    if not os.path.exists(path):
+        print(f"[INIT] No mouthpiece checkpoint for {role}.")
+        return speaker, bias_head
+    state = torch.load(path, map_location="cpu")
+    if speaker is not None and "speaker_bandit" in state:
+        try:
+            speaker.load_state_dict(state["speaker_bandit"])
+            print(f"[LOAD] SpeakerBandit ← {path}")
+        except Exception as e:
+            print(f"[LOAD] SpeakerBandit load failed: {e}")
+    if bias_head is not None and "bias_head" in state:
+        try:
+            bias_head.load_state_dict(state["bias_head"])
+            print(f"[LOAD] BiasHead ← {path}")
+        except Exception as e:
+            print(f"[LOAD] BiasHead load failed: {e}")
+    return speaker, bias_head
+
+# =============================================================================
+# (Optional) Language coupling helper (not wired by default to JEPA loops)
+# =============================================================================
+
+def language_coupling_loss(
+    z_next: torch.Tensor,
+    texts: List[str],
+    *,
+    msg_encoder: Optional[Any] = None,
+    social: Optional[Any] = None,
+    weight: float = LC_WEIGHT,
+) -> torch.Tensor:
+    """
+    Small auxiliary that pulls z_next toward a SocialInfluence projection of the
+    mean text embedding (encourages language↔state consistency).
+    Not used by default; can be called from custom training scripts.
+    """
+    if not texts or msg_encoder is None or social is None or weight <= 0.0:
+        return torch.tensor(0.0, device=z_next.device if torch.is_tensor(z_next) else DEVICE)
+    try:
+        with torch.no_grad():
+            t_emb = msg_encoder(texts).mean(dim=0)  # [D_text]
+        delta = social(t_emb.to(DEVICE))
+        if z_next.dim() == 1:
+            z_next = z_next.unsqueeze(0)
+        target = delta.unsqueeze(0).expand_as(z_next)
+        return weight * F.mse_loss(z_next, target)
+    except Exception:
+        return torch.tensor(0.0, device=DEVICE)
 
 # =============================================================================
 # I/O for checkpoints (uses CFG dims if present)

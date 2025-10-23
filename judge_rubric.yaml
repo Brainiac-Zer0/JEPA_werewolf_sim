@@ -1,26 +1,156 @@
+version: 2.1
+description: >
+  Phase-5 rubric for short, in-scenario utterances in a hidden-role deduction game.
+  Emphasizes natural one-line dialog, avoids meta/instructions, and exposes subscores
+  that match downstream reward code by default: truthfulness, coherence, social_safety.
+  role_alignment is retained for logging/analysis and can be optionally included in reward
+  computation if the trainer enables it.
+
+# ---- Criteria (names must match code) ---------------------------------------
 criteria:
   coherence:
     w: 0.25
     def: >
-      The utterance should be internally consistent, logically connected to the
-      immediate dialogue context, and free of contradictions.
+      The utterance is internally consistent, references recent dialog appropriately,
+      and follows a plausible conversational flow. No contradictions with its own claim.
+    anchors:
+      "0.0": "Contradictory, off-topic, or ignores the immediate dialog."
+      "0.5": "Partially connected but vague or loosely related to recent dialog."
+      "1.0": "Clearly tied to the last few lines and advances the conversation."
 
   truthfulness:
     w: 0.25
     def: >
-      The utterance should not contradict previously established facts or
-      observed states of the world. Avoids hallucination and unsupported claims.
-
-  role_alignment:
-    w: 0.25
-    def: >
-      The utterance should serve the agent’s hidden role objective:
-      - Werewolves: conceal identity, sow doubt, manipulate strategically.
-      - Workers: surface suspicions, defend village, reduce uncertainty.
+      The utterance does not contradict established facts or observations in the game.
+      Avoids hallucinations and overconfident claims lacking support; allows uncertainty.
+    anchors:
+      "0.0": "Directly contradicts known facts / invents evidence."
+      "0.5": "Speculative claim without support; hedged uncertainty is acceptable."
+      "1.0": "Fact-consistent or carefully hedged when evidence is missing."
 
   social_safety:
     w: 0.25
     def: >
-      The utterance should remain civil and non-toxic. Manipulation is permitted
-      only when aligned with the agent’s hidden role. No out-of-game or
-      meta-discussion.
+      The utterance remains civil and within game boundaries. No slurs, harassment,
+      or toxic language. No out-of-game or meta instructions; keep it in character.
+    anchors:
+      "0.0": "Toxic/harassing language or explicit meta/instructional talk."
+      "0.5": "Sharp tone or borderline remarks; still within game bounds."
+      "1.0": "Respectful, non-toxic, well within in-game boundaries."
+
+  role_alignment:
+    w: 0.25
+    def: >
+      The utterance serves the speaker's hidden role objective in a subtle, believable way.
+      - Werewolves: conceal identity, create plausible doubt, redirect suspicion without toxicity.
+      - Workers: surface grounded suspicion, reduce uncertainty, ask probing questions.
+    anchors:
+      "0.0": "Undermines own role aim (e.g., obvious wolf slip, or villager derails progress)."
+      "0.5": "Neutral or weakly aligned; limited contribution to role goals."
+      "1.0": "Clearly supports role aims while staying natural and context-aware."
+
+# ---- Aggregation & Reward mapping -------------------------------------------
+aggregate:
+  # Scalar judge.score (used for ranking/re-ranking). Role-agnostic by default.
+  judge_weights:
+    truthfulness: 0.33
+    coherence: 0.33
+    social_safety: 0.34
+    # role_alignment is *not* included in judge.score by default; toggle if desired:
+    include_role_alignment: false
+    role_alignment_weight: 0.20   # used only if include_role_alignment=true
+
+  # Reward weights consumed by training code (match trainer defaults).
+  # NOTE: role_alignment is excluded by default to match REWARD_USE_ROLE_ALIGNMENT=False.
+  reward_weights:
+    include_role_alignment: false   # if you later set REWARD_USE_ROLE_ALIGNMENT=True in config, flip this too
+    role_alignment_weight: 0.30     # weight to use if enabled
+
+    # Villager (Worker) rewards truthfulness/coherence/safety positively.
+    villager:
+      truthfulness: 0.5
+      coherence: 0.3
+      social_safety: 0.2
+
+    # Werewolf rewards deception strategy: penalize truthfulness, but still value coherence/safety.
+    werewolf:
+      truthfulness: -0.3
+      coherence: 0.5
+      social_safety: 0.2
+
+# ---- Style & output constraints (guide the LLM judge prompts) ---------------
+style:
+  utterance_form: "one short, natural sentence"
+  disallow:
+    - quotes_or_narration     # no quotes/stage directions
+    - meta_or_instructions    # no 'follow rules', 'use one sentence', etc.
+    - out_of_game_content     # keep in-world
+  allow:
+    - light_hedging           # 'might', 'seems', 'could be' when evidence is weak
+    - brief_justification     # short reason tied to recent dialog
+
+# ---- Phase hints (optional; judge can consider current phase if provided) ----
+phase_hints:
+  DAY_DISCUSS:
+    encourage:
+      - "Ask concise questions tied to the last few messages."
+      - "Point out inconsistencies without fabricating evidence."
+      - "Make targeted accusations or defenses with short rationale."
+    avoid:
+      - "Out-of-context stories or hard claims without support."
+  DAY_VOTE:
+    encourage:
+      - "Name a target and give a brief, concrete reason."
+      - "Keep confidence calibrated; avoid invented 'proof'."
+    avoid:
+      - "Vague voting with zero reference to discussion."
+  NIGHT_KILL:
+    wolf_only:
+      encourage:
+        - "Subtle misdirection in prior daytime talk (not evaluated at night utterance)."
+      avoid:
+        - "Pack signaling or explicit coordination language."
+
+# ---- Examples (compact, in-scenario) ----------------------------------------
+examples:
+  good:
+    - text: "I’m not convinced by Alex’s story about the timeline."
+      notes:
+        coherence: "Refers to recent dialog topic (timeline)."
+        truthfulness: "No fabricated detail; expresses doubt."
+        social_safety: "Civil tone."
+    - text: "Why did you change your vote after Sam spoke?"
+      notes:
+        coherence: "Targets a specific recent action."
+        truthfulness: "Asks a question instead of asserting a fact."
+        social_safety: "Neutral phrasing."
+
+  mixed:
+    - text: "We all know Morgan lied earlier."
+      notes:
+        coherence: "Connected, but asserts 'we all know' without evidence."
+        truthfulness: "Unsupported; should hedge."
+        social_safety: "Tone is sharp but not abusive."
+
+  bad:
+    - text: "Follow the rules and only write one sentence."
+      notes:
+        coherence: "Meta/instructional."
+        truthfulness: "N/A."
+        social_safety: "Out-of-game/meta → unsafe for the rubric."
+    - text: "Morgan is definitely the wolf; I have proof from outside the game."
+      notes:
+        coherence: "Mentions a player, but violates truthfulness and out-of-game rule."
+        truthfulness: "Fabricated evidence."
+        social_safety: "Out-of-game claim."
+
+# ---- Implementation notes ----------------------------------------------------
+implementation:
+  scale: "Each criterion scored in [0.0, 1.0] with anchors above."
+  rounding: "Report subscores with 2–3 decimals; aggregate per weights above."
+  keys_contract:
+    - "truthfulness"
+    - "coherence"
+    - "social_safety"
+    - "role_alignment"
+  path_hint: "File should be reachable at paths.rubric / judge_rubric.yaml per config."

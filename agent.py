@@ -24,8 +24,8 @@ from encoders import (
     FactorizedPlanner,      # ✅ real multi-head wrapper from encoders
 )
 
-# NEW: speaker import
-from speaker import SpeakerBandit, DEFAULT_TEMPLATES  # make_hist_feats not needed here
+# NEW: unified mouthpiece (LLM router + bandit)
+from speaker import SpeakerPolicy, DEFAULT_TEMPLATES
 
 # Load config once
 with open("config.yaml", "r") as f:
@@ -62,6 +62,10 @@ SPEAKER_LR       = _env_float("SPEAKER_LR", float(config.get("SPEAKER_LR", 1e-3)
 SPEAKER_HIST_K   = _env_int("SPEAKER_HIST_K", int(config.get("SPEAKER_HIST_K", 3)))
 NUM_TALK_CATS    = _env_int("NUM_TALK_CATS", int(config.get("NUM_TALK_CATS", 5)))
 
+# Phase-5 knobs
+BIAS_LR          = _env_float("BIAS_LR", float(config.get("BIAS_LR", 1e-3)))
+FUSION_ALPHA_DEF = _env_float("TALK_FUSION_ALPHA", float(config.get("sim", {}).get("talk_fusion_alpha", 0.5)))
+
 # Phases
 PHASES = {"DISCUSS": 0, "VOTE": 1, "NIGHT": 2}
 
@@ -76,10 +80,9 @@ HEDGE_CAT_ID     = 2
 QUESTION_CAT_ID  = 3
 VOTE_CAT_ID      = 4
 
-# Map SpeakerBandit template ids → talk category ids (truncate/clip to templates length)
+# Map templates → talk category ids (truncate/clip to templates length)
 TEMPLATE_TO_CAT_ID = [ACCUSE_CAT_ID, DEFEND_CAT_ID, HEDGE_CAT_ID, QUESTION_CAT_ID, VOTE_CAT_ID]
 if len(TEMPLATE_TO_CAT_ID) < len(DEFAULT_TEMPLATES):
-    # Extend with hedge for any extra templates to be safe
     TEMPLATE_TO_CAT_ID = TEMPLATE_TO_CAT_ID + [HEDGE_CAT_ID] * (len(DEFAULT_TEMPLATES) - len(TEMPLATE_TO_CAT_ID))
 else:
     TEMPLATE_TO_CAT_ID = TEMPLATE_TO_CAT_ID[:len(DEFAULT_TEMPLATES)]
@@ -102,12 +105,16 @@ class BaseAgent:
         self.role: Optional[str] = None
         self.alive: bool = True
         self.last_message: str = ""
-        self.llm_fn = None  # (z, self) -> str  • attached from llm_script
 
-        # NEW: phase-aware speech bookkeeping (read by sim.py)
+        # Legacy LLM hooks (kept for back-compat; not used by SpeakerPolicy)
+        self.llm_fn = None
+        self.llm_tokenizer = None
+
+        # Speech bookkeeping (read by sim.py)
         self.talk_category_last: int = -1
         self.speaker_mode: str = "none"   # {"bandit","llm","none"}
         self.persona_norm: float = 0.0
+        self.persona_effects: Dict[str, float] = {}  # ← exposed for steering/training
 
         # JEPA sub-modules
         self.message_encoder = MessageEncoder()  # may be overwritten with shared instance by sim
@@ -117,11 +124,11 @@ class BaseAgent:
 
         # Legacy single-head planner (kept for back-compat paths)
         self.planner        = planner or PlannerHead(latent_dim=LATENT_DIM, num_agents=NUM_AGENTS)
-        # NEW: factorized heads (preferred path)
+        # Preferred path: factorized heads
         self.planner_factorized = planner_factorized or FactorizedPlanner(
             latent_dim=LATENT_DIM, num_agents=NUM_AGENTS, num_talk_cats=NUM_TALK_CATS
         )
-        # NEW: stored for future use in training (not consumed by agent logic)
+        # Stored for training (not consumed by agent logic)
         self.phase_action_encoder = phase_action_encoder
 
         # Memories
@@ -130,23 +137,32 @@ class BaseAgent:
         self.heard_messages: Dict[str, str] = {}
         self.message_memory: deque[tuple[str, str]] = deque(maxlen=MAX_MEMORY)
 
-        # Speaker (optional) + buffer for training
-        self.speaker = None
-        self.speaker_opt = None
-        self.msg_buffer: List[dict] = []  # {z, role_bit, hist_feats, template_id, text, round, reward}
+        # Training buffer for message-level rewards (judge fills reward later)
+        # {mode,z,role_bit,hist_feats,template_id,talk_intent,text,round,phase_code,reward}
+        self.msg_buffer: List[dict] = []
 
-        # NEW: minimal per-step telemetry container (sim reads this to write CSV)
+        # Minimal per-step telemetry container (sim writes CSV from this)
         self.telemetry: Dict = {}
 
-        # NEW: pack awareness
+        # Pack awareness
         self.is_wolf: bool = False
-        self.wolf_ids: Set[int] = set()   # indices of known packmates (incl. self if you want)
+        self.wolf_ids: Set[int] = set()
 
-        # NEW: per-step cache for Phase-4 rollout construction
+        # Per-step cache for Phase-4 rollout construction
         self._step_cache: Dict = {}
 
-        if SPEAKER_ENABLED:
-            self._init_speaker()
+        # Unified mouthpiece (routes LLM ↔ bandit, applies hygiene, trainable)
+        self.speaker = SpeakerPolicy(latent_dim=LATENT_DIM, templates=DEFAULT_TEMPLATES)
+        self.speaker.attach_optimizers(bandit_lr=SPEAKER_LR, bias_lr=BIAS_LR)
+
+        # Back-compat alias used by some older pipelines (expects a bias head on the agent)
+        self.llm_bias_head = getattr(self.speaker.bias, "head", None)
+
+        # Optional: honor env toggle to enable/disable LLM route at init
+        try:
+            self.speaker.use_llm = bool(config.get("llm", {}).get("speaker_enabled", False))
+        except Exception:
+            pass
 
     # ───────────────────────── pack/role helpers ─────────────────────────
     def set_role(self, role: str) -> None:
@@ -163,21 +179,39 @@ class BaseAgent:
                 continue
         self.wolf_ids = ids
 
+    def set_persona_effects(self, effects: Optional[Dict[str, float]]):
+        """Setter so sims/tests can steer personality and temperature nudges."""
+        self.persona_effects = effects or {}
+
     def _self_idx(self) -> int:
         try:
             return int(self.name.split("_")[1])
         except Exception:
             return 0
 
-    # ───────────────────────── internal helpers ─────────────────────────
-    def _init_speaker(self):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.speaker = SpeakerBandit(latent_dim=LATENT_DIM, num_templates=len(DEFAULT_TEMPLATES))
-        self.speaker.to(device)
-        self.speaker_opt = torch.optim.Adam(self.speaker.parameters(), lr=SPEAKER_LR)
+    # ───────────────────────── legacy LLM attach shim ─────────────────────────
+    def attach_llm(self, llm_callable=None, tokenizer=None, *, enabled: bool = True):
+        """
+        Back-compat shim:
+          - toggles the LLM route inside SpeakerPolicy
+          - preserves old signature (llm_fn, tokenizer) even though the policy
+            manages its own backend internally
+        """
+        try:
+            self.speaker.use_llm = bool(enabled)
+        except Exception:
+            pass
+        # Keep these for external tools/tests that probe attributes
+        self.llm_fn = llm_callable
+        self.llm_tokenizer = tokenizer
+        if tokenizer is not None and llm_callable is not None:
+            try:
+                setattr(self.llm_fn, "tokenizer", tokenizer)
+            except Exception:
+                pass
 
+    # ───────────────────────── small helpers ─────────────────────────
     def _recent_texts(self) -> List[str]:
-        """Last K observed lines for conditioning the speaker."""
         if not self.message_memory:
             return []
         return [m for (_, m) in list(self.message_memory)[-SPEAKER_HIST_K:] if m]
@@ -189,7 +223,6 @@ class BaseAgent:
         return [int(a.name.split("_")[1]) for a in self._alive_others(agents)]
 
     def _update_persona_norm_if_present(self):
-        """Recompute persona vector norm if a persona has been attached."""
         if hasattr(self, "persona_vec"):
             try:
                 pv = torch.as_tensor(self.persona_vec, dtype=torch.float32)
@@ -200,34 +233,48 @@ class BaseAgent:
             self.persona_norm = 0.0
 
     def _infer_talk_category(self, text: str) -> int:
-        """
-        Frozen, rule-based mapping from free text to category id.
-        Keeps LLM path deterministic for clean ablations.
-        """
         t = (text or "").lower().strip()
-
-        # Strong vote cues
         if any(kw in t for kw in ["we should vote", "vote to", "vote out", "vote ", "eliminate ", "lynch "]):
             return VOTE_CAT_ID
-
-        # Interrogatives / requests for justification
         if any(kw in t for kw in ["why", "how", "what about", "explain", "because?"]):
             return QUESTION_CAT_ID
-
-        # Clear defense cues
         if any(kw in t for kw in ["i trust", "not a wolf", "innocent", "seems fine", "defend"]):
             return DEFEND_CAT_ID
-
-        # Accusation / suspicion cues
         if any(kw in t for kw in ["is a wolf", "suspect", "guilty", "looks bad", "suspicious"]):
             return ACCUSE_CAT_ID
-
-        # Default: hedge
         return HEDGE_CAT_ID
+
+    @torch.no_grad()
+    def talkhead_simplex(self, z: torch.Tensor) -> Optional[torch.Tensor]:
+        try:
+            logits = self.planner_factorized.talk(z)
+            if logits.dim() > 1:
+                logits = logits.squeeze(0)
+            mask = self.build_talk_mask().to(logits.device)
+            if not mask.any():
+                return None
+            return torch.softmax(logits, dim=-1)
+        except Exception:
+            return None
+
+    @torch.no_grad()
+    def _talk_intent_from_head(self, z: torch.Tensor) -> Optional[int]:
+        """Return intent id from TalkHead masked argmax, or None if unavailable."""
+        try:
+            logits = self.planner_factorized.talk(z)
+            if logits.dim() > 1:
+                logits = logits.squeeze(0)
+            mask = self.build_talk_mask().to(logits.device)
+            if not mask.any():
+                return None
+            masked = torch.full_like(logits, float("-inf"))
+            masked[mask] = logits[mask]
+            return int(torch.argmax(masked).item())
+        except Exception:
+            return None
 
     # ───────────────────────── Perception ─────────────────────────
     def observe(self, agents: List["BaseAgent"]):
-        """Pull others' latest messages into short-term memory."""
         observed: List[tuple[str, str]] = []
         for a in agents:
             if a.alive and a.name != self.name:
@@ -238,11 +285,9 @@ class BaseAgent:
 
     # ───────────────────────── Mask builders ─────────────────────────
     def build_talk_mask(self) -> torch.Tensor:
-        """Allow all talk categories for now (override if you want to ban some)."""
         return torch.ones(NUM_TALK_CATS, dtype=torch.bool)
 
     def build_vote_mask(self, agents: List["BaseAgent"]) -> torch.Tensor:
-        """Legal = alive & not self."""
         mask = torch.zeros(NUM_AGENTS, dtype=torch.bool)
         for a in agents:
             if a.alive and a.name != self.name:
@@ -253,14 +298,9 @@ class BaseAgent:
         return mask
 
     def build_kill_mask(self, agents: List["BaseAgent"]) -> torch.Tensor:
-        """
-        Wolves can kill only alive non-wolves, non-self.
-        Villagers produce an all-False mask (no-op at night).
-        """
         mask = torch.zeros(NUM_AGENTS, dtype=torch.bool)
         if not self.is_wolf:
-            return mask  # villagers don't issue kills
-
+            return mask
         for a in agents:
             try:
                 idx = int(a.name.split("_")[1])
@@ -278,13 +318,11 @@ class BaseAgent:
           - DISCUSS: payload_idx ∈ [0..NUM_TALK_CATS-1], choice_type="TALK_INTENT"
           - VOTE:    payload_idx ∈ [0..NUM_AGENTS-1], choice_type="VOTE_TARGET"
           - NIGHT:   payload_idx ∈ [0..NUM_AGENTS-1], choice_type="KILL_TARGET" (wolves only)
-        When no legal action exists, returns (None, None).
         """
         z = self.encode_current_belief(round_num, agents)
 
         def _masked_argmax(logits_1d: torch.Tensor, legal_mask_1d: torch.Tensor, head: str):
             if legal_mask_1d is None:
-                # If mask missing, treat as all-true with same shape
                 legal_mask_1d = torch.ones_like(logits_1d, dtype=torch.bool)
             elif legal_mask_1d.dtype != torch.bool:
                 legal_mask_1d = legal_mask_1d.bool()
@@ -299,12 +337,11 @@ class BaseAgent:
             legal_idx = torch.where(legal_mask_1d)[0].tolist()
             return choice, legal_idx, probs
 
-        # DISCUSS → TalkHead
         if phase_code == PHASES["DISCUSS"]:
-            logits = self.planner_factorized.talk(z)           # [C] or [1,C]
+            logits = self.planner_factorized.talk(z)
             if logits.dim() > 1:
                 logits = logits.squeeze(0)
-            mask = self.build_talk_mask().to(logits.device)    # [C]
+            mask = self.build_talk_mask().to(logits.device)
             choice, legal_idx, probs = _masked_argmax(logits, mask, head="talk")
             if choice is None:
                 return None, None
@@ -317,9 +354,8 @@ class BaseAgent:
             self.talk_category_last = choice
             return choice, "TALK_INTENT"
 
-        # VOTE → VoteHead (masked to alive non-self)
         if phase_code == PHASES["VOTE"]:
-            logits = self.planner_factorized.vote(z)           # [N]
+            logits = self.planner_factorized.vote(z)
             if logits.dim() > 1:
                 logits = logits.squeeze(0)
             mask = self.build_vote_mask(agents).to(logits.device)
@@ -332,95 +368,29 @@ class BaseAgent:
                     "vote_choice_idx": choice,
                     "vote_probs": probs,
                 })
-            # compact history
             self.vote_history.append(f"Agent_{choice}")
             if len(self.vote_history) > MAX_MEMORY:
                 self.vote_history.pop(0)
             return choice, "VOTE_TARGET"
 
-        # NIGHT → KillHead (wolves only)
-        if phase_code == PHASES["NIGHT"]:
-            logits = self.planner_factorized.kill(z)           # [N]
-            if logits.dim() > 1:
-                logits = logits.squeeze(0)
-            mask = self.build_kill_mask(agents).to(logits.device)
-            choice, legal_idx, probs = _masked_argmax(logits, mask, head="kill")
-            if choice is None:
-                return None, None
-            if TELEMETRY_ENABLED:
-                self.telemetry.update({
-                    "kill_mask_idx": legal_idx,
-                    "kill_choice_idx": choice,
-                    "kill_probs": probs,
-                })
-            return choice, "KILL_TARGET"
-
-        # Unknown phase
-        return None, None
-
-    # Legacy vote helper (kept; internally routes through factorized head)
-    @torch.no_grad()
-    def plan_vote(self, z: torch.Tensor, agents: List["BaseAgent"]):
-        """
-        Back-compat wrapper. Uses factorized VoteHead with proper masks.
-        """
-        logits = self.planner_factorized.vote(z)               # [N]
-        if logits.dim() > 1:
-            logits = logits.squeeze(0)
-        mask = self.build_vote_mask(agents).to(logits.device)
-        masked = torch.full_like(logits, float("-inf"))
-        masked[mask] = logits[mask]
-        chosen_idx = int(torch.argmax(masked).item())
-        alive = self._alive_others(agents)
-        chosen = next((a for a in alive if a.name == f"Agent_{chosen_idx}"), alive[0] if alive else self)
-
-        # Telemetry (softmax only over legal set)
-        probs = torch.softmax(logits[mask], dim=-1).detach().cpu().tolist()
-        if TELEMETRY_ENABLED:
-            self.telemetry.update({
-                "vote_alive_idx": torch.where(mask)[0].tolist(),
-                "vote_probs": probs,
-                "vote_choice_idx": chosen_idx,
-            })
-
-        # Compact history
-        self.vote_history.append(chosen.name)
-        if len(self.vote_history) > MAX_MEMORY:
-            self.vote_history.pop(0)
-
-        return chosen
-
     def choose_night_target(self, agents: List["BaseAgent"]):
-        """
-        Night kill policy (legacy fallback). Prefer factorized head via choose_action_by_phase.
-        """
         candidates = [a for a in agents if a.alive and a.name != self.name]
         return candidates[0].name if candidates else None
 
     # ───────────────────────── Latent belief encoding ─────────────────────────
     def encode_current_belief(self, round_num: int, agents: List["BaseAgent"]):
-        """
-        Encode the current belief state z_t from internal + social features.
-        Phase-1 fixes:
-        - BUGFIX: pass the *local* self_msg_embed into package_features (was previously wrong)
-        - Device hygiene: create tensors on z/encoder device
-        - Telemetry: store z norms and message lengths for CSV
-        """
         device = next(self.encoder.parameters()).device
 
-        # Self message embedding
         self_msg_embed = self.message_encoder(self.last_message).squeeze().to(device)
         if torch.isnan(self_msg_embed).any():
             self_msg_embed = torch.zeros_like(self_msg_embed)
 
-        # Neighbour messages embedding (ablated if USE_LANGUAGE==False)
         neighbour_msgs = [msg for _, msg in self.observe(agents) if msg] if USE_LANGUAGE else []
         if neighbour_msgs:
             neighbour_embed = self.message_encoder(neighbour_msgs).mean(dim=0).to(device)
         else:
             neighbour_embed = torch.zeros_like(self_msg_embed)
 
-        # Vote history vector (normalized counts over agent indices)
         vote_vec = torch.zeros(NUM_AGENTS, device=device)
         for name in self.vote_history[-MAX_MEMORY:]:
             try:
@@ -430,13 +400,11 @@ class BaseAgent:
         if float(vote_vec.sum().item()) > 0.0:
             vote_vec = vote_vec / vote_vec.sum()
 
-        # Memory summary over past latents
         if self.latent_history:
             memory_summary = torch.stack([t.to(device) for t in self.latent_history]).mean(dim=0)
         else:
             memory_summary = torch.zeros(LATENT_DIM, device=device)
 
-        # ✅ Correct packaging (single call, correct variable)
         x = package_features(
             agent_alive=self.alive,
             round_num=round_num,
@@ -448,16 +416,13 @@ class BaseAgent:
 
         z = self.encoder(x)
 
-        # NaN guard in z
         if torch.isnan(z).any() or torch.isinf(z).any():
             raise RuntimeError("NaN/Inf in z latent")
 
-        # store for temporal context
         self.latent_history.append(z.detach())
         if len(self.latent_history) > MAX_MEMORY:
             self.latent_history.pop(0)
 
-        # Telemetry
         if TELEMETRY_ENABLED:
             self.telemetry.update({
                 "round": round_num,
@@ -473,7 +438,6 @@ class BaseAgent:
     # ───────────────────────── Rollout aux snapshot ─────────────────────────
     def make_aux(self, agents: List["BaseAgent"]) -> Dict:
         alive = [bool(a.alive) for a in agents]
-        # Try to build wolves vector if roles are attached; else fall back to self.wolf_ids
         wolves_attached = [getattr(a, "is_wolf", False) for a in agents]
         if any(wolves_attached):
             wolves = wolves_attached
@@ -495,105 +459,81 @@ class BaseAgent:
         confidence = "unsure who to trust." if std > 0.5 else "confident in my suspicions."
         return f"The group seems {mood} I am {confidence}"
 
-    # ───────────────────────── Speak ─────────────────────────
-    def speak(self, round_num: int, agents: List["BaseAgent"]):
+    # ───────────────────────── Speak (unified policy) ─────────────────────────
+    def speak(self, round_num: int, agents: List["BaseAgent"], *, phase_code: Optional[int] = None):
         """
-        If SPEAKER_ENABLED=1, use trainable Speaker (template bandit).
-        Otherwise fall back to llm_script mouthpiece (frozen).
+        Unified mouthpiece call:
+          - natural, in-scenario dialogue via LLM route (with hygiene & bias)
+          - stable fallback via Bandit templates
+        Always logs a training record into msg_buffer for Judge/REINFORCE + bias-head.
         """
-        # Always encode z first (also updates message_memory via observe)
         z = self.encode_current_belief(round_num, agents)
-
-        # Refresh persona norm if a persona vector has been attached
         self._update_persona_norm_if_present()
 
-        # Reset talk category for this utterance
-        self.talk_category_last = -1
+        candidate_targets = [a.name for a in agents if a.alive and a.name != self.name]
 
-        if self.speaker is not None:
-            # Persona-driven exploration tweak (light)
-            if hasattr(self, "persona_effects"):
-                scale = float(self.persona_effects.get("speaker_temp_scale", 1.0))
-                self.speaker.temperature = max(0.3, min(2.0, 1.0 * scale))
+        text, meta = self.speaker.generate(
+            z_t=z.detach(),
+            role=self.role or "Unknown",
+            recent_texts=self._recent_texts(),
+            candidate_targets=candidate_targets,
+            self_name=self.name,
+            phase_code=phase_code,
+            persona_effects=self.persona_effects,
+        )
 
-            # Build conditioning inputs
-            recent = self._recent_texts()
-            cand_targets = [a.name for a in agents if a.alive]  # include self; speaker avoids self as target
-            text, meta = self.speaker.generate(
-                z_t=z.detach(),
-                role=self.role or "Unknown",
-                recent_texts=recent,
-                templates=DEFAULT_TEMPLATES,
-                candidate_targets=cand_targets,
-                self_name=self.name,
-                persona_effects=getattr(self, "persona_effects", None),
-            )
-            # Buffer line for training
-            self.msg_buffer.append({
-                "z": z.detach().cpu(),
-                "role_bit": meta.get("role_bit", 0),
-                "hist_feats": meta.get("hist_feats"),
-                "template_id": meta.get("template_id"),
-                "text": text,
-                "round": round_num,
-                "reward": None,
-            })
-            self.last_message = text
-            self.speaker_mode = "bandit"
+        self.last_message = text
+        self.speaker_mode = meta.get("mode", "none")
 
-            # Map to talk category id (prefer meta, else template mapping, else hedge)
-            cat_from_meta = meta.get("category_id", None)
-            if isinstance(cat_from_meta, int):
-                self.talk_category_last = int(cat_from_meta)
+        # --- NEW: choose a talk_intent label for bias-head supervision ---
+        intent_id: Optional[int] = None
+
+        # (a) If bandit/template, map template_id → category.
+        template_id = meta.get("template_id", -1)
+        if isinstance(template_id, int) and template_id >= 0:
+            if template_id < len(TEMPLATE_TO_CAT_ID):
+                intent_id = int(TEMPLATE_TO_CAT_ID[template_id])
             else:
-                tid = int(meta.get("template_id", -1)) if meta.get("template_id", None) is not None else -1
-                if 0 <= tid < len(TEMPLATE_TO_CAT_ID):
-                    self.talk_category_last = int(TEMPLATE_TO_CAT_ID[tid])
-                else:
-                    self.talk_category_last = HEDGE_CAT_ID
+                intent_id = HEDGE_CAT_ID  # safe default
 
-            # Telemetry
-            if TELEMETRY_ENABLED:
-                self.telemetry.update({
-                    "speak_template_id": int(meta.get("template_id", -1)),
-                    "speak_text_len": len(text or ""),
-                    "talk_category_last": int(self.talk_category_last),
-                    "speaker_mode": self.speaker_mode,
-                    "persona_norm": float(self.persona_norm),
-                })
-            return text
+        # (b) Otherwise (LLM/non-template), use TalkHead masked argmax on current z.
+        if intent_id is None:
+            z_for_head = meta.get("z", z.detach())
+            intent_id = self._talk_intent_from_head(z_for_head)
 
-        # Fallback: frozen mouthpiece
-        if not self.llm_fn:
-            self.last_message = "…"
-            self.speaker_mode = "none"
-            if TELEMETRY_ENABLED:
-                self.telemetry.update({
-                    "speak_text_len": 1,
-                    "talk_category_last": HEDGE_CAT_ID,
-                    "speaker_mode": self.speaker_mode,
-                    "persona_norm": float(self.persona_norm),
-                })
-            self.talk_category_last = HEDGE_CAT_ID
-            return "…"
+        # (c) Lightweight text fallback if head was unavailable.
+        if intent_id is None:
+            intent_id = int(self._infer_talk_category(text))
 
-        response = self.llm_fn(z, self)
-        self.last_message = response
-        self.speaker_mode = "llm"
-        self.talk_category_last = self._infer_talk_category(response)
+        # Keep local state consistent
+        self.talk_category_last = int(intent_id)
+
+        # Record into training buffer (now with talk_intent)
+        self.msg_buffer.append({
+            "mode": self.speaker_mode,
+            "z": meta.get("z", z.detach().cpu()),
+            "role_bit": meta.get("role_bit", torch.tensor(1.0 if (self.role or "").lower().startswith("were") else 0.0)),
+            "hist_feats": meta.get("hist_feats", torch.tensor([0.0, 0.0])),
+            "template_id": template_id,
+            "talk_intent": int(intent_id),  # ← NEW: label for bias-head training
+            "text": text,
+            "round": round_num,
+            "phase_code": phase_code if phase_code is not None else -1,
+            "reward": None,
+        })
 
         if TELEMETRY_ENABLED:
             self.telemetry.update({
-                "speak_text_len": len(response or ""),
+                "speak_text_len": len(text or ""),
                 "talk_category_last": int(self.talk_category_last),
+                "talk_intent_id": int(intent_id),  # ← optional telemetry
                 "speaker_mode": self.speaker_mode,
                 "persona_norm": float(self.persona_norm),
             })
-        return response
+        return text
 
-    # ───────────────────────── NEW: Phase-4 rollout helpers ─────────────────────────
+    # ───────────────────────── Phase-4 rollout helpers ─────────────────────────
     def reset_for_new_game(self):
-        """Clear state between games."""
         self.alive = True
         self.last_message = ""
         self.talk_category_last = -1
@@ -605,15 +545,10 @@ class BaseAgent:
         self._step_cache = {}
 
     def reset_step_cache(self):
-        """Clear per-step cached values (z_t, phase, payload, choice_type, aux, round)."""
         self._step_cache = {}
 
     @torch.no_grad()
     def begin_step(self, phase_code: int, round_num: int, agents: List["BaseAgent"]) -> torch.Tensor:
-        """
-        Capture z_t and aux at the start of a sim phase-step.
-        Returns z_t for convenience (some sims like to log it).
-        """
         self.reset_step_cache()
         z_t = self.encode_current_belief(round_num, agents)
         self._step_cache = {
@@ -628,10 +563,6 @@ class BaseAgent:
 
     @torch.no_grad()
     def decide(self, phase_code: int, round_num: int, agents: List["BaseAgent"]):
-        """
-        Thin wrapper to choose and cache the action for this phase.
-        Returns (payload_idx, choice_type). If no legal action, (None, None).
-        """
         payload_idx, choice_type = self.choose_action_by_phase(phase_code, round_num, agents)
         if not getattr(self, "_step_cache", None):
             _ = self.begin_step(phase_code, round_num, agents)
@@ -640,18 +571,7 @@ class BaseAgent:
         return payload_idx, choice_type
 
     @torch.no_grad()
-    def finalize_step(
-        self,
-        agents: List["BaseAgent"],
-        z_next: Optional[torch.Tensor] = None,
-    ):
-        """
-        Package a training row:
-          (z_t, phase_code, action_payload, z_{t+1}, role, choice_type, aux)
-
-        If z_next is None, we re-encode belief now (post-environment update).
-        Detaches tensors to CPU for log-friendly storage.
-        """
+    def finalize_step(self, agents: List["BaseAgent"], z_next: Optional[torch.Tensor] = None):
         if not getattr(self, "_step_cache", None):
             raise RuntimeError("finalize_step() called before begin_step()/decide().")
 

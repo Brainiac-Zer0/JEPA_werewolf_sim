@@ -10,24 +10,66 @@ import torch, yaml
 with open("config.yaml", "r") as f:
     CFG = yaml.safe_load(f) or {}
 
-# ── Canonical role names
+# ── Canonical role names (kept consistent with sim/agent/judge)
 WEREWOLF: str = CFG.get("WEREWOLF", "Werewolf")
 VILLAGER: str = CFG.get("VILLAGER", "Worker")
 
-# Optional global seeds for reproducibility
-RUN_SEED: Optional[int] = CFG.get("RUN_SEED", None)
-PERSONA_SEED: Optional[int] = CFG.get("PERSONA_SEED", None)
+# Warn once if someone changes names elsewhere (helps keep judge prompts/logs aligned)
+__warned_roles = False
+def _validate_role_constants():
+    global __warned_roles
+    if __warned_roles:
+        return
+    if WEREWOLF != "Werewolf" or VILLAGER != "Worker":
+        print(f"[roles.py] WARNING: Role labels deviated: WEREWOLF={WEREWOLF}, VILLAGER={VILLAGER}")
+    __warned_roles = True
 
-# ── Role-conditioned latent priors (kept tiny; mostly placeholders)
+_validate_role_constants()
+
+# ── Seed resolution (structured config first, legacy mirrors second)
+DET_SEED     = CFG.get("determinism", {}).get("seed", None)
+GLOBAL_SEED  = CFG.get("seeds", {}).get("global", None)
+RUN_SEED_LEG = CFG.get("RUN_SEED", None)                 # legacy mirror
+
+PERSONA_SEED_CFG = (
+    CFG.get("persona", {}).get("seed", None)             # structured
+    if CFG.get("persona", {}) is not None else None
+)
+PERSONA_SEED_LEG = CFG.get("PERSONA_SEED", None)         # legacy mirror
+
+def _resolve_run_seed() -> Optional[int]:
+    for s in (DET_SEED, GLOBAL_SEED, RUN_SEED_LEG):
+        if s is not None: return int(s)
+    return None
+
+def _resolve_persona_seed() -> Optional[int]:
+    for s in (PERSONA_SEED_CFG, PERSONA_SEED_LEG, DET_SEED, GLOBAL_SEED, RUN_SEED_LEG):
+        if s is not None: return int(s)
+    return None
+
+def _rng(seed: Optional[int]) -> random.Random:
+    return random.Random(int(seed)) if seed is not None else random.Random()
+
+# ── Latent dimension aware priors
+LATENT_DIM: int = int(CFG.get("LATENT_DIM", CFG.get("model", {}).get("latent_dim", 32)))
 _ROLE_PRIORS = CFG.get("ROLE_PRIORS", {})
+
+def _mk_prior(tag: str) -> torch.Tensor:
+    mode = _ROLE_PRIORS.get(tag, "zeros")
+    return torch.ones(LATENT_DIM) if mode == "ones" else torch.zeros(LATENT_DIM)
+
 ROLE_PRIORS = {
-    WEREWOLF: torch.ones(32) if _ROLE_PRIORS.get("WEREWOLF", "ones") == "ones" else torch.zeros(32),
-    VILLAGER: torch.ones(32) if _ROLE_PRIORS.get("VILLAGER", "zeros") == "ones" else torch.zeros(32),
+    WEREWOLF: _mk_prior("WEREWOLF"),
+    VILLAGER: _mk_prior("VILLAGER"),
 }
 
-# ── Personality config
-PERSONA_ENABLED: bool = bool(CFG.get("PERSONA_ENABLED", True))
-PERSONA_SCALE: float   = float(CFG.get("PERSONA_SCALE", 0.2))
+# ── Personality config (structured first, keep legacy mirrors)
+PERSONA_ENABLED: bool = bool(
+    CFG.get("persona", {}).get("enabled", CFG.get("PERSONA_ENABLED", True))
+)
+PERSONA_SCALE: float = float(
+    CFG.get("persona", {}).get("scale", CFG.get("PERSONA_SCALE", 0.2))
+)
 
 @dataclass
 class Persona:
@@ -44,16 +86,8 @@ ROLE_PERSONA_BIASES = {
     VILLAGER: {"agreeableness": +0.05, "conscientiousness": +0.05},
 }
 
-def _clip(v: float, lo: float = -1.0, hi: float = 1.0) -> float:
+def _clip(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
-
-def _rng(seed_pref: Optional[int], fallback: Optional[int]) -> random.Random:
-    """Prefer run-level seed; otherwise persona seed; otherwise system RNG."""
-    if seed_pref is not None:
-        return random.Random(int(seed_pref))
-    if fallback is not None:
-        return random.Random(int(fallback))
-    return random.Random()
 
 def _sample_persona(rng: random.Random) -> Persona:
     s = PERSONA_SCALE
@@ -67,18 +101,27 @@ def _sample_persona(rng: random.Random) -> Persona:
 
 def _derive_effects(p: Dict[str, float]) -> Dict[str, float]:
     """
-    Small derived nudges other modules can use.
-    - speaker_temp_scale: >1 => more exploratory speech, <1 => more conservative
-    - accuse_bias: positive => more likely to accuse, negative => more conciliatory
-    - coherence_weight_bonus: nudges toward coherent statements
+    Phase-5 compatible multiplicative scales:
+      - speaker_temp_scale      in [0.7, 1.3]
+      - accuse_bias_scale       in [0.5, 1.5]  (speaker_llm uses this)
+      - coherence_weight_scale  in [0.8, 1.2]  (judge/trainer can read this)
     """
-    speaker_temp_scale = _clip(1.0 + 0.5 * (p["openness"] + p["extraversion"]), 0.7, 1.3)
-    accuse_bias = _clip(-p["agreeableness"] + 0.5 * p["extraversion"], -0.2, 0.2)
-    coherence_weight_bonus = _clip(p["conscientiousness"] - 0.5 * p["neuroticism"], -0.2, 0.2)
+    # exploration: openness + extraversion
+    temp = 1.0 + 0.5 * (p["openness"] + p["extraversion"])
+    speaker_temp_scale = _clip(temp, 0.7, 1.3)
+
+    # tendency to challenge others: lower agreeableness + some extraversion
+    accuse = 1.0 + 0.8 * (-p["agreeableness"]) + 0.4 * p["extraversion"]
+    accuse_bias_scale = _clip(accuse, 0.5, 1.5)
+
+    # keep things tidy under stress: conscientiousness vs. neuroticism
+    coh = 1.0 + 0.6 * p["conscientiousness"] - 0.4 * p["neuroticism"]
+    coherence_weight_scale = _clip(coh, 0.8, 1.2)
+
     return {
-        "speaker_temp_scale": speaker_temp_scale,
-        "accuse_bias": accuse_bias,
-        "coherence_weight_bonus": coherence_weight_bonus,
+        "speaker_temp_scale": float(speaker_temp_scale),
+        "accuse_bias_scale": float(accuse_bias_scale),
+        "coherence_weight_scale": float(coherence_weight_scale),
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -93,8 +136,8 @@ def assign_roles(agent_list: List[Any], num_werewolves: int) -> None:
         raise ValueError(f"num_werewolves={num_werewolves} out of range for n_agents={n}")
 
     # Separate RNGs so shuffling and persona sampling are reproducible
-    rng_roles   = _rng(RUN_SEED, PERSONA_SEED)
-    rng_persona = _rng(PERSONA_SEED, RUN_SEED)
+    rng_roles   = _rng(_resolve_run_seed())
+    rng_persona = _rng(_resolve_persona_seed())
 
     roles = [WEREWOLF] * num_werewolves + [VILLAGER] * (n - num_werewolves)
     rng_roles.shuffle(roles)
@@ -104,18 +147,27 @@ def assign_roles(agent_list: List[Any], num_werewolves: int) -> None:
 
         # Persona: either assign a role-biased random vector, or a neutral one
         if PERSONA_ENABLED:
-            p = _sample_persona(rng_persona)
+            p = _sample_persona(rng_persona).as_dict()
             # tiny role bias
-            for k, delta in ROLE_PERSONA_BIASES.get(role, {}).items():
-                setattr(p, k, _clip(getattr(p, k) + delta))
-            agent.persona = p.as_dict()
-            agent.persona_effects = _derive_effects(agent.persona)
+            if role == WEREWOLF:
+                p["agreeableness"]      = _clip(p["agreeableness"] - 0.05, -1.0, 1.0)
+                p["conscientiousness"]  = _clip(p["conscientiousness"] - 0.05, -1.0, 1.0)
+                p["extraversion"]       = _clip(p["extraversion"] + 0.05, -1.0, 1.0)
+            elif role == VILLAGER:
+                p["agreeableness"]      = _clip(p["agreeableness"] + 0.05, -1.0, 1.0)
+                p["conscientiousness"]  = _clip(p["conscientiousness"] + 0.05, -1.0, 1.0)
+            agent.persona = p
+            agent.persona_effects = _derive_effects(p)
         else:
             agent.persona = {
                 "extraversion": 0.0, "agreeableness": 0.0, "conscientiousness": 0.0,
                 "neuroticism": 0.0, "openness": 0.0
             }
-            agent.persona_effects = {"speaker_temp_scale": 1.0, "accuse_bias": 0.0, "coherence_weight_bonus": 0.0}
+            agent.persona_effects = {
+                "speaker_temp_scale": 1.0,
+                "accuse_bias_scale": 1.0,
+                "coherence_weight_scale": 1.0,
+            }
 
         # Stable id for logs
         agent.persona_id = f"P{rng_persona.randrange(1_000_000)}"
@@ -143,11 +195,16 @@ def roles_meta(agent_list: List[Any]) -> Dict[str, Any]:
     for a in agent_list:
         r = getattr(a, "role", "Unknown")
         counts[r] = counts.get(r, 0) + 1
+        eff = getattr(a, "persona_effects", {}) or {}
         entries.append({
             "name": a.name,
             "role": r,
             "persona_id": getattr(a, "persona_id", None),
-            "effects": getattr(a, "persona_effects", {}),
+            "effects": {
+                "speaker_temp_scale": eff.get("speaker_temp_scale", 1.0),
+                "accuse_bias_scale": eff.get("accuse_bias_scale", 1.0),
+                "coherence_weight_scale": eff.get("coherence_weight_scale", 1.0),
+            },
         })
     return {"counts": counts, "assignments": entries}
 
