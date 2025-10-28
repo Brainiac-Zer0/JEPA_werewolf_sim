@@ -1,5 +1,15 @@
 # speaker.py
+# -----------------------------------------------------------------------------
+# Phase-5 mouthpiece router:
+#   • Primary path: LLM one-liner with optional logit-bias fusion (speaker_llm)
+#   • Fallback path: local template bandit (stable, fast)
+# This file intentionally *does not* import SpeakerBandit from speaker_llm to
+# avoid circular imports; only the bias utilities are imported optionally.
+# -----------------------------------------------------------------------------
+
+from __future__ import annotations
 import os
+import json
 import yaml
 import torch
 import torch.nn as nn
@@ -10,7 +20,7 @@ from typing import List, Dict, Any, Tuple, Optional
 with open("config.yaml", "r") as f:
     CFG = yaml.safe_load(f) or {}
 
-# Default templates; you can override per-game
+# Default templates; may be overridden by config
 DEFAULT_TEMPLATES = CFG.get("DEFAULT_TEMPLATES", [
     "Accuse {target}",
     "Defend {ally}",
@@ -68,9 +78,8 @@ def _trainable_params(mod) -> List[torch.nn.Parameter]:
     except Exception:
         return []
 
-
 # =============================================================================
-# Feature builder (history + optional phase one-hot)
+# History features (lightweight context stats)
 # =============================================================================
 def make_hist_feats(recent_texts: List[str], phase_code: Optional[int] = None) -> torch.Tensor:
     """
@@ -97,9 +106,8 @@ def make_hist_feats(recent_texts: List[str], phase_code: Optional[int] = None) -
         pass
     return torch.cat([base, oh], dim=0)
 
-
 # =============================================================================
-# Bandit mouthpiece (kept; now lazy-builds to accept 2-or-5-d hist feats)
+# Local template bandit (REINFORCE) — avoids speaker_llm import cycle
 # =============================================================================
 class SpeakerBandit(nn.Module):
     """
@@ -141,7 +149,6 @@ class SpeakerBandit(nn.Module):
         phase_code: Optional[int] = None,
         **_ignored,
     ) -> Tuple[str, Dict[str, Any]]:
-        # --- ensure everything is on the module's device ---
         dev = next(self.parameters()).device
         if z_t.dim() == 1:
             z_t = z_t.unsqueeze(0)
@@ -155,7 +162,9 @@ class SpeakerBandit(nn.Module):
 
         # Persona biases (optional, light touch)
         if persona_effects:
-            accuse_bias = float(persona_effects.get("accuse_bias", 0.0))
+            accuse_bias_scale = float(persona_effects.get("accuse_bias_scale", 1.0))
+            # turn scale into additive bias for accuse/vote templates
+            accuse_bias = (accuse_bias_scale - 1.0) * 0.8  # small
             if accuse_bias != 0.0:
                 idx_accuse = [i for i, t in enumerate(templates)
                               if ("accuse" in t.lower()) or ("vote" in t.lower()) or ("propose" in t.lower())]
@@ -173,7 +182,7 @@ class SpeakerBandit(nn.Module):
                 temp_scale = float(persona_effects.get("speaker_temp_scale", 1.0))
             except Exception:
                 temp_scale = 1.0
-        temperature = max(1e-4, float(self.temperature) * temp_scale)
+        temperature = max(1e-4, float(getattr(self, "temperature", 1.0)) * temp_scale)
 
         probs = F.softmax(logits / temperature, dim=-1)
         tidx  = torch.multinomial(probs, 1).item()
@@ -228,7 +237,6 @@ class SpeakerBandit(nn.Module):
         loss.backward()
         optimizer.step()
         return {"loss": float(loss.item()), "entropy": float(ent.item()), "R_mean": float(rewards.mean().item())}
-
 
 # =============================================================================
 # Optional LLM bias adapter (trainable light head that steers a frozen LLM)
@@ -286,7 +294,6 @@ class LLMBiasAdapter(nn.Module):
         optimizer.step()
         return {"loss": float(loss.item())}
 
-
 # =============================================================================
 # Unified mouthpiece: routes between LLM and Bandit; both trainable
 # =============================================================================
@@ -339,25 +346,86 @@ class SpeakerPolicy(nn.Module):
                       role: str,
                       recent_texts: List[str],
                       z_t: torch.Tensor,
-                      persona_effects: Optional[Dict[str, Any]]) -> str:
-        if not self._llm_ok:
-            raise RuntimeError("LLM backend unavailable")
-        # Assemble a minimal proxy agent expected by llm_script functions
+                      persona_effects: Optional[Dict[str, Any]],
+                      *,
+                      prefix: Optional[str] = None,
+                      named_target_hint: Optional[str] = None,
+                      phase_code: Optional[int] = None) -> Tuple[str, Dict[str, Any]]:
+        """
+        Preferred: build a prompt via llm_script._latent_prompt_from_agent and prepend a soft prefix.
+        Fallback: use existing chatgpt_llm_* helpers (prefix not applied on fallback).
+        """
+        # Build a minimal proxy agent for llm_script helpers
         proxy_agent = type("A", (), {
             "role": role,
             "name": name,
-            "message_memory": [(n, m) for n, m in []],  # keep empty; speaker is one-liner mouthpiece
+            "message_memory": [],  # one-liner mouthpiece; context handled by latent
             "decode_z": staticmethod(lambda _z: ""),
             "persona_effects": persona_effects,
         })()
 
-        if self.bias and self.bias.head is not None and self._llm_with_bias is not None:
-            text = self._llm_with_bias(z_t, agent=proxy_agent)
-        elif self._llm_from_latent is not None:
-            text = self._llm_from_latent(z_t, agent=proxy_agent)
-        else:
-            raise RuntimeError("No suitable LLM path")
-        return text
+        # Try prompt-based route first (doesn't require self._llm_ok)
+        try:
+            from llm_script import _latent_prompt_from_agent, llm_fn_from_env  # type: ignore
+            mouth = llm_fn_from_env()  # callable LLM mouthpiece
+            tok = getattr(mouth, "tokenizer", None)
+            base_prompt = _latent_prompt_from_agent(tok, z_t, proxy_agent)
+
+            # Derive prefix if only a hint was passed
+            if prefix is None and isinstance(named_target_hint, str) and named_target_hint.startswith("Agent_"):
+                prefix = f"I think {named_target_hint} "
+
+            # Soft steer for DAY_DISCUSS (phase_code==0): end with a question/accusation (gentle)
+            if phase_code == 0:
+                steer = " End with a pointed question or a named accusation."
+            else:
+                steer = ""
+
+            final_prompt = (prefix + base_prompt) if (prefix and isinstance(prefix, str)) else base_prompt
+            final_prompt = final_prompt + steer
+
+            # Preserve bias fusion via logits processors if available
+            bias_kwargs = self.bias.get_kwargs(
+                tokenizer=getattr(mouth, "tokenizer", None),
+                z_t=z_t.squeeze(0),
+                role=role,
+                recent_texts=recent_texts,
+                persona_effects=persona_effects,
+            )
+            # Speaker defaults to improve NL hygiene (P5C)
+            default_gen = {
+                "min_new_tokens": 14,
+                "max_new_tokens": 64,
+                "temperature": 0.8,
+                "top_p": 0.92,
+            }
+            gen_kwargs = dict(default_gen)
+            if isinstance(bias_kwargs, dict):
+                gen_kwargs.update(bias_kwargs)  # let bias head override/extend
+
+            text = mouth(final_prompt, generate_kwargs=gen_kwargs)
+
+            meta = {
+                "mode": "llm",
+                "steer_phase": int(phase_code) if phase_code is not None else None,
+                "used_bias": bool(bias_kwargs),
+                "gen_kwargs": {k: gen_kwargs.get(k) for k in ("min_new_tokens","max_new_tokens","temperature","top_p")},
+            }
+            # surface any repetition_penalty if present (P5D visibility; judge will also log)
+            if "repetition_penalty" in gen_kwargs:
+                meta["repetition_penalty"] = float(gen_kwargs["repetition_penalty"])
+                meta["rp_applied"] = True
+            return text, meta
+        except Exception:
+            # Fall back to older latent→LLM helpers (require _llm_ok)
+            if self._llm_ok:
+                if self.bias and self.bias.head is not None and self._llm_with_bias is not None:
+                    txt = self._llm_with_bias(z_t, agent=proxy_agent)
+                    return txt, {"mode": "llm", "fallback": "with_bias"}
+                if self._llm_from_latent is not None:
+                    txt = self._llm_from_latent(z_t, agent=proxy_agent)
+                    return txt, {"mode": "llm", "fallback": "from_latent"}
+            raise RuntimeError("LLM backend unavailable")
 
     @torch.no_grad()
     def generate(self,
@@ -369,7 +437,10 @@ class SpeakerPolicy(nn.Module):
                  *,
                  phase_code: Optional[int] = None,
                  talk_prior: Optional[Dict[str, Any]] = None,
-                 persona_effects: Optional[Dict[str, Any]] = None) -> Tuple[str, Dict[str, Any]]:
+                 persona_effects: Optional[Dict[str, Any]] = None,
+                 # NEW: soft steer inputs
+                 prefix: Optional[str] = None,
+                 named_target_hint: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
         dev = next(self.parameters()).device
         if z_t.dim() == 1:
             z_t = z_t.unsqueeze(0)
@@ -379,7 +450,10 @@ class SpeakerPolicy(nn.Module):
         use_llm_now = self.use_llm and (self.bad_streak < self.max_bad)
         if use_llm_now:
             try:
-                text = self._llm_generate(self_name, role, recent_texts, z_t, persona_effects)
+                text, meta_llm = self._llm_generate(
+                    self_name, role, recent_texts, z_t, persona_effects,
+                    prefix=prefix, named_target_hint=named_target_hint, phase_code=phase_code
+                )
                 text = _sanitize_roles(_one_line(_early_stop(text))).strip(_BAD_QUOTES + " ")
                 if _looks_meta(text):
                     # Escalate backoff and fall through to bandit
@@ -393,6 +467,26 @@ class SpeakerPolicy(nn.Module):
                     "z": z_t.squeeze(0).detach().cpu(),
                     "phase_code": phase_code,
                 }
+                # merge llm meta (includes used_bias, gen kwargs, repetition info if any)
+                if isinstance(meta_llm, dict):
+                    meta.update(meta_llm)
+
+                # Emit probe-friendly stdout line (P5I)
+                if os.getenv("LLM_SPK_DEBUG", "1") == "1":
+                    dbg = {
+                        "mode": "llm",
+                        "role": role,
+                        "name": self_name,
+                        "phase_code": phase_code,
+                        "used_bias": meta.get("used_bias", False),
+                        "gen": meta.get("gen_kwargs", {}),
+                        "rp": {
+                            "value": meta.get("repetition_penalty", None),
+                            "applied": meta.get("rp_applied", False),
+                        },
+                        "preview": text[:120],
+                    }
+                    print("[LLM-SPK]", json.dumps(dbg), flush=True)
                 return text, meta
             except Exception:
                 # Fall back to bandit
@@ -420,6 +514,16 @@ class SpeakerPolicy(nn.Module):
             "hist_feats": hf.squeeze(0).detach().cpu(),
             "phase_code": phase_code,
         }
+        if os.getenv("LLM_SPK_DEBUG", "1") == "1":
+            dbg = {
+                "mode": "bandit",
+                "role": role,
+                "name": self_name,
+                "phase_code": phase_code,
+                "template_id": tidx,
+                "preview": text[:120],
+            }
+            print("[LLM-SPK]", json.dumps(dbg), flush=True)
         return text, meta
 
     # === Trainability / persistence ===
@@ -431,15 +535,11 @@ class SpeakerPolicy(nn.Module):
         # Bandit optimizer (may be param-less if MLP not built yet — handle lazily)
         bandit_params = _trainable_params(getattr(self, "bandit", None)) if getattr(self, "bandit", None) is not None else []
         self.bandit_opt = torch.optim.Adam(bandit_params, lr=bandit_lr) if bandit_params else None
-        if self.bandit_opt is None and os.getenv("SPEAKER_DEBUG", "0").lower() in ("1", "true", "yes"):
-            print("[SPEAKER] Bandit has no trainable params; skipping optimizer.")
 
         # Bias head optimizer (may be disabled or None)
         if self.bias and self.bias.head is not None:
             bias_params = _trainable_params(self.bias.head)
             self.bias_opt = torch.optim.Adam(bias_params, lr=bias_lr) if bias_params else None
-            if self.bias_opt is None and os.getenv("SPEAKER_DEBUG", "0").lower() in ("1", "true", "yes"):
-                print("[SPEAKER] Bias head has no trainable params; skipping optimizer.")
         else:
             self.bias_opt = None
 
@@ -488,3 +588,12 @@ class SpeakerPolicy(nn.Module):
             r = st["router"]
             self.use_llm = bool(r.get("use_llm", self.use_llm))
             self.max_bad = int(r.get("max_bad", self.max_bad))
+
+# Explicit exports
+__all__ = [
+    "SpeakerPolicy",
+    "SpeakerBandit",
+    "LLMBiasAdapter",
+    "DEFAULT_TEMPLATES",
+    "make_hist_feats",
+]

@@ -14,6 +14,10 @@ with open("config.yaml", "r") as f:
 WEREWOLF: str = CFG.get("WEREWOLF", "Werewolf")
 VILLAGER: str = CFG.get("VILLAGER", "Worker")
 
+# Optional: bit mapping for mouthpiece/encoders/logs (wolf=1, villager=0)
+ROLE_TO_BIT: Dict[str, int] = {WEREWOLF: 1, VILLAGER: 0}
+BIT_TO_ROLE: Dict[int, str] = {1: WEREWOLF, 0: VILLAGER}
+
 # Warn once if someone changes names elsewhere (helps keep judge prompts/logs aligned)
 __warned_roles = False
 def _validate_role_constants():
@@ -103,8 +107,8 @@ def _derive_effects(p: Dict[str, float]) -> Dict[str, float]:
     """
     Phase-5 compatible multiplicative scales:
       - speaker_temp_scale      in [0.7, 1.3]
-      - accuse_bias_scale       in [0.5, 1.5]  (speaker_llm uses this)
-      - coherence_weight_scale  in [0.8, 1.2]  (judge/trainer can read this)
+      - accuse_bias_scale       in [0.5, 1.5]
+      - coherence_weight_scale  in [0.8, 1.2]
     """
     # exploration: openness + extraversion
     temp = 1.0 + 0.5 * (p["openness"] + p["extraversion"])
@@ -210,7 +214,7 @@ def roles_meta(agent_list: List[Any]) -> Dict[str, Any]:
 
 def role_bit(agent: Any) -> int:
     """1 if werewolf, else 0 — handy for encoders and logs."""
-    return 1 if getattr(agent, "role", None) == WEREWOLF else 0
+    return ROLE_TO_BIT.get(getattr(agent, "role", None), 0)
 
 def team_hint(agent: Any, all_agents: List[Any]) -> List[str]:
     """List of teammate names (wolves see wolves; villagers see nobody)."""
@@ -220,6 +224,7 @@ def team_hint(agent: Any, all_agents: List[Any]) -> List[str]:
 
 __all__ = [
     "WEREWOLF", "VILLAGER",
+    "ROLE_TO_BIT", "BIT_TO_ROLE",
     "ROLE_PRIORS",
     "assign_roles", "apply_personality",
     "roles_meta", "role_bit", "team_hint",

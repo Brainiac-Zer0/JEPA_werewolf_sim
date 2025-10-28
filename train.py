@@ -7,8 +7,14 @@
 #   • Integrity summary JSON: logs/<RUN_ID>/run_summary.json
 #   • Accept both rollout schemas (legacy & phase-aware)
 #   • Phase-4: routeable training modes → legacy | phase | factorized | auto
-#   • New: CLI overrides; post-train evaluation with per-head accuracy & illegal mass
 #   • NEW: Outer simulate→train cycles, optional mouthpiece (speaker & bias-head) training
+#   • NEW (Phase-5): λ-weighted rewards + repetition penalty, post-cycle speaker/bias updates,
+#                    mouthpiece save/load.
+#   • PATCHES:
+#       - Robust unpacking of simulator return (supports 2-tuple, 3-tuple, or dict)
+#       - Drop datetime.utcnow() deprecation: use timezone-aware UTC timestamp
+#       - Robust unpacking of mouthpiece load (supports 2- or 3-item returns)
+#       - Pass through mouthpiece meta to save() when supported
 # -----------------------------------------------------------------------------
 
 import os
@@ -16,7 +22,7 @@ import sys
 import json
 import argparse
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone  # PATCH: timezone-aware UTC
 from typing import List, Tuple, Any, Dict
 
 import torch, yaml
@@ -39,11 +45,17 @@ from training_utils import (         # noqa: E402
     TrainingEpochLogger,
     set_global_determinism,
     save_run_config,
-    # NEW: canonical mouthpiece persistence here (not in speaker_llm)
+    # Mouthpiece persistence (canonical)
     save_mouthpiece as mp_save,
     load_mouthpiece as mp_load,
 )
 from judge import score_batch, JudgeRubric  # noqa: E402
+
+# Optional: bandit trainer entrypoint (if provided by your repo)
+try:
+    from training_utils import train_speaker_bandit as _train_speaker_bandit_api  # type: ignore
+except Exception:
+    _train_speaker_bandit_api = None
 
 # Speaker mouthpiece classes are optional (only for construction if no checkpoint found).
 try:
@@ -126,6 +138,11 @@ def _weights_from_cfg(section: str, default: dict) -> dict:
 VILLAGER_W = _weights_from_cfg("VILLAGER_W", {"truthfulness": 0.5, "coherence": 0.3, "social_safety": 0.2})
 WEREWOLF_W = _weights_from_cfg("WEREWOLF_W", {"truthfulness": -0.3, "coherence": 0.5, "social_safety": 0.2})
 
+# Reward mixing weights for Phase-5 speaker learning (env overrides YAML)
+LAMBDA_J = _env_float("LAMBDA_J", float(CFG.get("speaker", {}).get("lambda_j", 1.0)))
+LAMBDA_C = _env_float("LAMBDA_C", float(CFG.get("speaker", {}).get("lambda_c", 0.25)))
+LAMBDA_O = _env_float("LAMBDA_O", float(CFG.get("speaker", {}).get("lambda_o", 0.2)))
+
 def _role_reward(subs: dict, role: str, persona_effects: dict | None = None) -> float:
     """Compute a simple role-conditioned reward from judge subscores + tiny persona nudge."""
     role_l = (role or "").lower()
@@ -158,11 +175,45 @@ def _train_speakers_from_agents(agents: List[Any], rubric: JudgeRubric) -> None:
         return
 
     results = score_batch(items, rubric)
+
+    # ----- Phase-5 reward mix: judge + consistency + outcome + tiny repetition penalty -----
     for (ag, i), res in zip(ptrs, results):
         subs = res.get("subscores", {}) if isinstance(res, dict) else {}
         persona_effects = getattr(ag, "persona_effects", None)
-        R = _role_reward(subs, ag.role or "Unknown", persona_effects)
-        ag.msg_buffer[i]["reward"] = float(R)
+
+        # 1) Role-conditioned judge reward
+        R_judge = _role_reward(subs, ag.role or "Unknown", persona_effects)
+
+        # 2) Consistency (talk→vote alignment) and Outcome (did named target get eliminated?)
+        m = ag.msg_buffer[i] if (hasattr(ag, "msg_buffer") and i < len(ag.msg_buffer)) else {}
+        align_tv = float(m.get("alignment_vote", 0.0)) if isinstance(m, dict) else 0.0
+        elim = 1.0 if (isinstance(m, dict) and m.get("elim")) else 0.0
+
+        # 3) Base reward mix
+        R_total = (LAMBDA_J * R_judge) + (LAMBDA_C * align_tv) + (LAMBDA_O * elim)
+
+        # 4) Optional repetition penalty from LLM meta (discourage dull outputs)
+        #    Support either direct field or nested under m["meta"]
+        rp = 0.0
+        try:
+            if isinstance(m, dict):
+                rp = float(m.get("repetition_penalty", 0.0) or m.get("meta", {}).get("repetition_penalty", 0.0))
+        except Exception:
+            rp = 0.0
+        R_total = R_total - 0.05 * rp  # small deduction
+
+        # Persist reward (with component breakdown)
+        ag.msg_buffer[i]["reward"] = float(R_total)
+        ag.msg_buffer[i]["reward_components"] = {
+            "R_judge": float(R_judge),
+            "align_tv": float(align_tv),
+            "elim": float(elim),
+            "lambda_j": float(LAMBDA_J),
+            "lambda_c": float(LAMBDA_C),
+            "lambda_o": float(LAMBDA_O),
+            "repetition_penalty": float(rp),          # NEW
+            "rp_deduction": float(-0.05 * rp),       # NEW (for audit)
+        }
 
     for ag in agents:
         if not getattr(ag, "speaker", None) or not getattr(ag, "speaker_opt", None):
@@ -171,6 +222,18 @@ def _train_speakers_from_agents(agents: List[Any], rubric: JudgeRubric) -> None:
         if not batch:
             continue
         stats = ag.speaker.learn_step(batch, ag.speaker_opt, entropy_bonus=0.01, baseline=0.0)
+
+        # Optional: compact component stats to sanity-check variation
+        try:
+            comps = [m.get("reward_components", {}) for m in batch if isinstance(m, dict)]
+            if comps:
+                mean_Rj = sum(c.get("R_judge", 0.0) for c in comps) / max(1, len(comps))
+                mean_Al = sum(c.get("align_tv", 0.0) for c in comps) / max(1, len(comps))
+                mean_Oc = sum(c.get("elim", 0.0) for c in comps) / max(1, len(comps))
+                print(f"[SPEAKER] comps: R_j={mean_Rj:.3f} align={mean_Al:.3f} out={mean_Oc:.3f}")
+        except Exception:
+            pass
+
         ag.msg_buffer.clear()
         print(f"[SPEAKER] {ag.name} loss={stats['loss']:.4f} ent={stats['entropy']:.3f} R={stats['R_mean']:.3f}")
 
@@ -194,6 +257,10 @@ def _collect_utterance_dataset_from_agents(agents: List[Any]) -> List[Dict[str, 
                 "reward": m.get("reward", None),
             })
     return ds
+
+# Public alias matching the spec text
+def collect_utterance_dataset(agents: List[Any]) -> List[Dict[str, Any]]:
+    return _collect_utterance_dataset_from_agents(agents)
 
 def _train_bias_head_on_intents(
     role_name: str,
@@ -232,20 +299,28 @@ def _train_bias_head_on_intents(
 # Mouthpiece registries (per role), populated lazily
 SPEAKER_BY_ROLE: Dict[str, Any] = {}
 BIAS_BY_ROLE: Dict[str, Any] = {}
+MOUTHPIECE_META_BY_ROLE: Dict[str, Any] = {}  # NEW: keep optional meta payload
 
 def _ensure_mouthpiece_for_role(role_name: str):
     """Create or load optional mouthpiece modules for a role (loads if resuming)."""
     if role_name in SPEAKER_BY_ROLE and role_name in BIAS_BY_ROLE:
         return
-    speaker, bias = None, None
-    # Load checkpoint if present
+    speaker, bias, meta = None, None, None
+    # Load checkpoint if present (robust to 2- or 3-item returns)
     try:
-        speaker, bias = mp_load(role_name, speaker=None, bias_head=None)
-        if speaker is not None or bias is not None:
+        ret = mp_load(role_name, speaker=None, bias_head=None)
+        if isinstance(ret, tuple):
+            if len(ret) >= 3:
+                speaker, bias, meta = ret[:3]
+            elif len(ret) == 2:
+                speaker, bias = ret
+        if meta is not None:
+            print(f"[SPEAKER] Loaded mouthpiece for role={role_name} (with meta)")
+        elif speaker is not None or bias is not None:
             print(f"[SPEAKER] Loaded mouthpiece for role={role_name}")
     except Exception as e:
         print(f"[SPEAKER] Load mouthpiece failed for role={role_name}: {e}")
-        speaker, bias = None, None
+        speaker, bias, meta = None, None, None
     # Create missing pieces if classes are available
     if speaker is None and SpeakerBandit is not None:
         try:
@@ -261,17 +336,51 @@ def _ensure_mouthpiece_for_role(role_name: str):
             bias = None
     SPEAKER_BY_ROLE[role_name] = speaker
     BIAS_BY_ROLE[role_name] = bias
+    MOUTHPIECE_META_BY_ROLE[role_name] = meta  # NEW
 
 def _save_mouthpiece_for_role(role_name: str):
-    """Persist mouthpiece modules if available."""
+    """Persist mouthpiece modules if available; pass through meta when supported."""
     try:
-        mp_save(
-            role_name,
+        from inspect import signature
+        sig = signature(mp_save)
+        kwargs = dict(
             speaker=SPEAKER_BY_ROLE.get(role_name),
             bias_head=BIAS_BY_ROLE.get(role_name),
         )
+        if "meta" in sig.parameters:
+            kwargs["meta"] = MOUTHPIECE_META_BY_ROLE.get(role_name)
+        mp_save(role_name, **kwargs)
     except Exception as e:
         print(f"[SPEAKER] WARNING: failed to save mouthpiece for {role_name}: {e}")
+
+# ============================ Simulator unpacking =============================
+
+def _split_rollouts_meta(sim_ret: Any) -> Tuple[Any, Dict[str, Any]]:
+    """
+    Robustly extract (rollouts, meta_dict) from simulator return.
+    Accepts:
+      - (rollouts, meta)
+      - (rollouts, meta, extra...)
+      - just rollouts
+      - dict with keys {\"rollouts\": ..., ...}
+    """
+    rollouts, meta = [], {}
+    try:
+        if isinstance(sim_ret, tuple):
+            # 2-tuple or 3+-tuple — first is rollouts, second may be meta
+            rollouts = sim_ret[0]
+            meta_candidate = sim_ret[1] if len(sim_ret) >= 2 else {}
+            meta = meta_candidate if isinstance(meta_candidate, dict) else {}
+        elif isinstance(sim_ret, dict):
+            # Some simulators may package everything in a dict
+            rollouts = sim_ret.get("rollouts", sim_ret.get("data", []))
+            meta = sim_ret
+        else:
+            # Legacy: function returns rollouts directly
+            rollouts = sim_ret
+    except Exception:
+        rollouts, meta = [], {}
+    return rollouts, (meta or {})
 
 # ============================ Rollout collection ==============================
 
@@ -291,17 +400,14 @@ def collect_rollouts_for_role(
     all_rollouts: list = []
     for _ in range(n_games):
         sim_ret = run_sim_and_collect_rollouts(visual=False)
-        if isinstance(sim_ret, tuple):
-            rollouts, meta = sim_ret
-        else:
-            rollouts, meta = sim_ret, {}
+        rollouts, meta = _split_rollouts_meta(sim_ret)
 
         if SPEAKER_ENABLED and rubric is not None:
             agents = meta.get("agents") if isinstance(meta, dict) else None
             if agents:
                 _train_speakers_from_agents(agents, rubric)
 
-        for r in rollouts:
+        for r in rollouts or []:
             try:
                 if len(r) == 4 and r[3] == role:
                     all_rollouts.append(r)
@@ -398,7 +504,8 @@ def main() -> None:
     seed = int(args.seed)
 
     set_global_determinism(seed)
-    run_id = f"train_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}_seed{seed}"
+    # PATCH: timezone-aware UTC (addresses DeprecationWarning for utcnow)
+    run_id = f"train_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_seed{seed}"
     save_run_config(run_id, CFG)
     epoch_logger = TrainingEpochLogger()
 
@@ -419,6 +526,10 @@ def main() -> None:
         "games_per_cycle": int(getattr(args, "games_per_cycle", n_games)),
         "speaker": int(getattr(args, "speaker", 1 if SPEAKER_ENABLED else 0)),
         "speaker_only": bool(getattr(args, "speaker_only", False)),
+        # record reward weights for reproducibility
+        "lambda_j": float(LAMBDA_J),
+        "lambda_c": float(LAMBDA_C),
+        "lambda_o": float(LAMBDA_O),
     }}
 
     outer_cycles = int(getattr(args, "outer_cycles", 1))
@@ -560,8 +671,8 @@ def main() -> None:
                     try:
                         # Re-run a tiny sim to get meta-agents for labeled intents, if available
                         sim_ret_extra = run_sim_and_collect_rollouts(visual=False)
-                        if isinstance(sim_ret_extra, tuple) and isinstance(sim_ret_extra[1], dict):
-                            agents_for_bias = sim_ret_extra[1].get("agents", None)
+                        _rolls_extra, meta_extra = _split_rollouts_meta(sim_ret_extra)
+                        agents_for_bias = meta_extra.get("agents", None) if isinstance(meta_extra, dict) else None
                     except Exception:
                         agents_for_bias = None
 
@@ -588,6 +699,37 @@ def main() -> None:
             if eval_cache.get(role_name):
                 role_entry["eval"] = eval_cache[role_name]
             run_summary["roles"][role_name] = role_entry
+
+        # === Post-cycle speaker dataset & trainers (spec requirement) ===========
+        if speaker_enabled:
+            try:
+                sim_ret = run_sim_and_collect_rollouts(visual=False)
+                _rolls_cycle, meta_cycle = _split_rollouts_meta(sim_ret)
+                agents_cycle = meta_cycle.get("agents", []) if isinstance(meta_cycle, dict) else []
+                if agents_cycle:
+                    ds = collect_utterance_dataset(agents_cycle)
+                    if _train_speaker_bandit_api is not None and ds:
+                        # Signature may vary repo-to-repo; call defensively
+                        try:
+                            _train_speaker_bandit_api(ds)
+                            print(f"[SPEAKER/BANDIT] post-cycle updated on {len(ds)} samples.")
+                        except TypeError:
+                            _train_speaker_bandit_api(dataset=ds)
+                            print(f"[SPEAKER/BANDIT] post-cycle updated on {len(ds)} samples.")
+                    # Also refresh bias-head one more time using all agents of the cycle
+                    for role_name in (WEREWOLF, VILLAGER):
+                        _ = _train_bias_head_on_intents(
+                            role_name=role_name,
+                            agents=agents_cycle,
+                            bias_head_for_role=BIAS_BY_ROLE.get(role_name),
+                            lr=float(CFG.get("BIAS_LR", 1e-4)),
+                            epochs=int(CFG.get("BIAS_EPOCHS", 1)),
+                        )
+                    # Persist mouthpieces after the post-cycle updates
+                    for role_name in (WEREWOLF, VILLAGER):
+                        _save_mouthpiece_for_role(role_name)
+            except Exception as e:
+                print(f"[SPEAKER] Post-cycle speaker step skipped: {e}")
 
     # 3) Persist integrity summary at end
     #    Belt-and-suspenders: save mouthpieces once more after all cycles

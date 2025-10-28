@@ -54,17 +54,20 @@ def _env_float(key: str, default: float) -> float:
 # -----------------------------------------
 
 # Config values (env overrides take precedence; YAML is the fallback)
-NUM_AGENTS       = _env_int("NUM_AGENTS", int(config.get("NUM_AGENTS", 6)))
-MAX_MEMORY       = _env_int("MAX_MEMORY", int(config.get("MAX_MEMORY", 20)))
-USE_LANGUAGE     = _env_bool("USE_LANGUAGE", bool(config.get("USE_LANGUAGE", True)))
-SPEAKER_ENABLED  = _env_bool("SPEAKER_ENABLED", bool(config.get("SPEAKER_ENABLED", False)))
-SPEAKER_LR       = _env_float("SPEAKER_LR", float(config.get("SPEAKER_LR", 1e-3)))
-SPEAKER_HIST_K   = _env_int("SPEAKER_HIST_K", int(config.get("SPEAKER_HIST_K", 3)))
-NUM_TALK_CATS    = _env_int("NUM_TALK_CATS", int(config.get("NUM_TALK_CATS", 5)))
+NUM_AGENTS         = _env_int("NUM_AGENTS", int(config.get("sim", {}).get("num_agents", config.get("NUM_AGENTS", 6))))
+MAX_MEMORY         = _env_int("MAX_MEMORY", int(config.get("MAX_MEMORY", 20)))
+USE_LANGUAGE       = _env_bool("USE_LANGUAGE", bool(config.get("USE_LANGUAGE", True)))
+SPEAKER_ENABLED    = _env_bool("SPEAKER_ENABLED", bool(config.get("SPEAKER_ENABLED", False)))
+SPEAKER_LR         = _env_float("SPEAKER_LR", float(config.get("SPEAKER_LR", 1e-3)))
+SPEAKER_HIST_K     = _env_int("SPEAKER_HIST_K", int(config.get("SPEAKER_HIST_K", 3)))
+NUM_TALK_CATS      = _env_int("NUM_TALK_CATS", int(config.get("NUM_TALK_CATS", 5)))
+# Lightweight persona/style knobs (NEW)
+SPEAKER_TEMP_SCALE = _env_float("SPEAKER_TEMP_SCALE", float(config.get("SPEAKER_TEMP_SCALE", 1.0)))
+SPEAKER_BIAS_SCALE = _env_float("SPEAKER_BIAS_SCALE", float(config.get("SPEAKER_BIAS_SCALE", 1.0)))
 
 # Phase-5 knobs
-BIAS_LR          = _env_float("BIAS_LR", float(config.get("BIAS_LR", 1e-3)))
-FUSION_ALPHA_DEF = _env_float("TALK_FUSION_ALPHA", float(config.get("sim", {}).get("talk_fusion_alpha", 0.5)))
+BIAS_LR            = _env_float("BIAS_LR", float(config.get("BIAS_LR", 1e-3)))
+FUSION_ALPHA_DEF   = _env_float("TALK_FUSION_ALPHA", float(config.get("sim", {}).get("talk_fusion_alpha", 0.5)))
 
 # Phases
 PHASES = {"DISCUSS": 0, "VOTE": 1, "NIGHT": 2}
@@ -111,10 +114,14 @@ class BaseAgent:
         self.llm_tokenizer = None
 
         # Speech bookkeeping (read by sim.py)
-        self.talk_category_last: int = -1
+        self.talk_category_last: int = -1  # ← maintained for legacy fill-ins
         self.speaker_mode: str = "none"   # {"bandit","llm","none"}
         self.persona_norm: float = 0.0
         self.persona_effects: Dict[str, float] = {}  # ← exposed for steering/training
+
+        # Lightweight persona/style knobs (NEW)
+        self.speaker_temp_scale: float = float(SPEAKER_TEMP_SCALE)
+        self.bias_scale: float = float(SPEAKER_BIAS_SCALE)
 
         # JEPA sub-modules
         self.message_encoder = MessageEncoder()  # may be overwritten with shared instance by sim
@@ -139,7 +146,7 @@ class BaseAgent:
 
         # Training buffer for message-level rewards (judge fills reward later)
         # {mode,z,role_bit,hist_feats,template_id,talk_intent,text,round,phase_code,reward}
-        self.msg_buffer: List[dict] = []
+        self.msg_buffer: List[dict] = []  # ← guaranteed to exist
 
         # Minimal per-step telemetry container (sim writes CSV from this)
         self.telemetry: Dict = {}
@@ -164,11 +171,19 @@ class BaseAgent:
         except Exception:
             pass
 
+        # NEW: soft prefix / named-target hint (consumed once by speak())
+        self.named_target_hint: Optional[str] = None
+
     # ───────────────────────── pack/role helpers ─────────────────────────
     def set_role(self, role: str) -> None:
         self.role = role
         r = (role or "").lower()
         self.is_wolf = (r in ("werewolf", "wolf", "traitor"))
+
+    @property
+    def role_bit(self) -> float:
+        """Simple scalar for mouthpiece inputs: wolf=1.0, villager=0.0."""
+        return 1.0 if self.is_wolf else 0.0
 
     def set_packmates(self, names: List[str]) -> None:
         ids: Set[int] = set()
@@ -183,11 +198,62 @@ class BaseAgent:
         """Setter so sims/tests can steer personality and temperature nudges."""
         self.persona_effects = effects or {}
 
+    def set_style_knobs(self, *, speaker_temp_scale: Optional[float] = None, bias_scale: Optional[float] = None):
+        """Lightweight per-agent style knobs (NEW)."""
+        if speaker_temp_scale is not None:
+            self.speaker_temp_scale = float(speaker_temp_scale)
+        if bias_scale is not None:
+            self.bias_scale = float(bias_scale)
+
     def _self_idx(self) -> int:
         try:
             return int(self.name.split("_")[1])
         except Exception:
             return 0
+
+    # ───────────────────────── soft prefix steer / hint API ─────────────────────────
+    def set_named_target_hint(self, name: Optional[str]) -> None:
+        """
+        Store a one-shot hint like 'Agent_3' that will lightly steer the next utterance.
+        The hint is cleared immediately after speak() consumes it.
+        """
+        if isinstance(name, str) and name.startswith("Agent_"):
+            self.named_target_hint = name
+        else:
+            self.named_target_hint = None
+
+    def _prefix_from_hint(self) -> str:
+        """
+        Turn a stored target hint into a tiny, natural-language nudge.
+        Mouthpiece hygiene keeps replies single-sentence and in-world.
+        """
+        named = getattr(self, "named_target_hint", None)
+        if not named:
+            return ""
+        # Extremely light steer; no punctuation to avoid overconstraining the LLM.
+        return f"I think {named} "
+
+    def _latent_prompt_for_llm(self, z_t: torch.Tensor, agents: List["BaseAgent"], *, prefix: str = "") -> str:
+        """
+        Optional helper: reuse llm_script latent→prompt builder and add a prefix nudge.
+        Not used by default (SpeakerPolicy builds prompts), but handy for tests.
+        """
+        try:
+            from llm_script import _latent_prompt_from_agent
+            tok = getattr(self, "llm_tokenizer", None)
+            base = _latent_prompt_from_agent(tok if tok is not None else None, z_t, self)
+            return (prefix + base) if prefix else base
+        except Exception:
+            # Fallback: minimal inline prompt if llm_script is unavailable
+            heard = "\n".join(f"- {n}: {m.strip()}" for n, m in list(self.message_memory)[-3:] if m.strip()) or "- (no recent messages heard)"
+            base = (
+                "You are playing a hidden-role social deduction game. "
+                "Speak like a player in one short, natural sentence.\n"
+                f"Recent dialog:\n{heard}\n"
+                f"Your private feeling:\n- {self.decode_z(z_t)}\n"
+                f"Your name: {self.name}\n"
+            )
+            return (prefix + base) if prefix else base
 
     # ───────────────────────── legacy LLM attach shim ─────────────────────────
     def attach_llm(self, llm_callable=None, tokenizer=None, *, enabled: bool = True):
@@ -215,6 +281,45 @@ class BaseAgent:
         if not self.message_memory:
             return []
         return [m for (_, m) in list(self.message_memory)[-SPEAKER_HIST_K:] if m]
+
+    # NEW: message buffer hook used by sim.py day discussion & night chat
+    def buffer_message(
+        self,
+        speaker_name: str,
+        text: str,
+        *,
+        private: bool = False,
+        phase: str | None = None,
+    ) -> None:
+        """
+        Store a heard message into this agent's rolling memory.
+
+        - speaker_name: who said it (e.g., "Agent_3")
+        - text: the utterance (already sanitized by caller)
+        - private: True for werewolf night-chat messages
+        - phase: optional phase tag ("DISCUSS", "NIGHT", etc.) for future use
+        """
+        t = (text or "").strip()
+        if not t:
+            return
+
+        # Public conversational memory used by mouthpiece prompt builders, etc.
+        try:
+            self.message_memory.append((speaker_name, t))
+        except Exception:
+            pass
+
+        # Optional "heard last" map
+        try:
+            self.heard_messages[speaker_name] = t
+        except Exception:
+            pass
+
+        # Private night chat log (queried by smoke tests)
+        if private:
+            if not hasattr(self, "_night_log"):
+                self._night_log = []
+            self._night_log.append(t)
 
     def _alive_others(self, agents: List["BaseAgent"]) -> List["BaseAgent"]:
         return [a for a in agents if a.alive and a.name != self.name]
@@ -310,6 +415,25 @@ class BaseAgent:
             mask[idx] = bool(legal)
         return mask
 
+    # ───────────────────────── Phase normalization ─────────────────────────
+    def _normalize_phase_code(self, code) -> int:
+        """
+        Map incoming phase identifiers to our internal indices:
+          0/DISCUSS*, 1/VOTE*, 2/NIGHT*
+        Unrecognized → DISCUSS (0) so we still attempt to talk.
+        """
+        if isinstance(code, int):
+            return code if code in (0, 1, 2) else 0
+        if isinstance(code, str):
+            c = code.strip().lower()
+            if c.startswith("discuss") or c.startswith("day_discuss") or c == "talk":
+                return PHASES["DISCUSS"]
+            if c.startswith("vote"):
+                return PHASES["VOTE"]
+            if c.startswith("night") or c.startswith("kill"):
+                return PHASES["NIGHT"]
+        return PHASES["DISCUSS"]
+
     # ───────────────────────── Action selection (phase-aware) ─────────────────────────
     @torch.no_grad()
     def choose_action_by_phase(self, phase_code: int, round_num: int, agents: List["BaseAgent"]):
@@ -320,6 +444,7 @@ class BaseAgent:
           - NIGHT:   payload_idx ∈ [0..NUM_AGENTS-1], choice_type="KILL_TARGET" (wolves only)
         """
         z = self.encode_current_belief(round_num, agents)
+        phase = self._normalize_phase_code(phase_code)
 
         def _masked_argmax(logits_1d: torch.Tensor, legal_mask_1d: torch.Tensor, head: str):
             if legal_mask_1d is None:
@@ -337,7 +462,7 @@ class BaseAgent:
             legal_idx = torch.where(legal_mask_1d)[0].tolist()
             return choice, legal_idx, probs
 
-        if phase_code == PHASES["DISCUSS"]:
+        if phase == PHASES["DISCUSS"]:
             logits = self.planner_factorized.talk(z)
             if logits.dim() > 1:
                 logits = logits.squeeze(0)
@@ -354,7 +479,7 @@ class BaseAgent:
             self.talk_category_last = choice
             return choice, "TALK_INTENT"
 
-        if phase_code == PHASES["VOTE"]:
+        if phase == PHASES["VOTE"]:
             logits = self.planner_factorized.vote(z)
             if logits.dim() > 1:
                 logits = logits.squeeze(0)
@@ -373,12 +498,28 @@ class BaseAgent:
                 self.vote_history.pop(0)
             return choice, "VOTE_TARGET"
 
+        if phase == PHASES["NIGHT"]:
+            logits = self.planner_factorized.kill(z)
+            if logits.dim() > 1:
+                logits = logits.squeeze(0)
+            mask = self.build_kill_mask(agents).to(logits.device)
+            choice, legal_idx, probs = _masked_argmax(logits, mask, head="kill")
+            if choice is None:
+                return None, None
+            return choice, "KILL_TARGET"
+
+        # Fallback
+        return None, None
+
     def choose_night_target(self, agents: List["BaseAgent"]):
         candidates = [a for a in agents if a.alive and a.name != self.name]
         return candidates[0].name if candidates else None
 
     # ───────────────────────── Latent belief encoding ─────────────────────────
     def encode_current_belief(self, round_num: int, agents: List["BaseAgent"]):
+        """
+        Public belief encoder used throughout the sim (guaranteed for fallbacks).
+        """
         device = next(self.encoder.parameters()).device
 
         self_msg_embed = self.message_encoder(self.last_message).squeeze().to(device)
@@ -466,11 +607,23 @@ class BaseAgent:
           - natural, in-scenario dialogue via LLM route (with hygiene & bias)
           - stable fallback via Bandit templates
         Always logs a training record into msg_buffer for Judge/REINFORCE + bias-head.
+        Adds: soft prefix steer from a one-shot named_target_hint, then clears it.
         """
         z = self.encode_current_belief(round_num, agents)
         self._update_persona_norm_if_present()
 
         candidate_targets = [a.name for a in agents if a.alive and a.name != self.name]
+
+        # NEW: soft prefix from hint (propagated to LLM via persona_effects key `_prefix_hint`)
+        prefix_hint = self._prefix_from_hint()
+        pe = dict(self.persona_effects or {})
+        if prefix_hint:
+            pe["_prefix_hint"] = prefix_hint  # SpeakerPolicy/SpeakerLLM will prepend this if present
+
+        # NEW: provide role_bit and lightweight style knobs to mouthpiece (non-breaking via persona_effects)
+        pe["_role_bit"] = float(self.role_bit)
+        pe["_temp_scale"] = float(self.speaker_temp_scale)
+        pe["_bias_scale"] = float(self.bias_scale)
 
         text, meta = self.speaker.generate(
             z_t=z.detach(),
@@ -479,8 +632,11 @@ class BaseAgent:
             candidate_targets=candidate_targets,
             self_name=self.name,
             phase_code=phase_code,
-            persona_effects=self.persona_effects,
+            persona_effects=pe,
         )
+
+        # One-shot: clear the hint so it doesn't leak into later phases
+        self.named_target_hint = None
 
         self.last_message = text
         self.speaker_mode = meta.get("mode", "none")
@@ -505,14 +661,17 @@ class BaseAgent:
         if intent_id is None:
             intent_id = int(self._infer_talk_category(text))
 
-        # Keep local state consistent
+        # Keep local state consistent for legacy paths
         self.talk_category_last = int(intent_id)
+
+        # Default role_bit for logs if mouthpiece didn't include one
+        default_role_bit_tensor = torch.tensor(self.role_bit, dtype=torch.float32)
 
         # Record into training buffer (now with talk_intent)
         self.msg_buffer.append({
             "mode": self.speaker_mode,
             "z": meta.get("z", z.detach().cpu()),
-            "role_bit": meta.get("role_bit", torch.tensor(1.0 if (self.role or "").lower().startswith("were") else 0.0)),
+            "role_bit": meta.get("role_bit", default_role_bit_tensor),
             "hist_feats": meta.get("hist_feats", torch.tensor([0.0, 0.0])),
             "template_id": template_id,
             "talk_intent": int(intent_id),  # ← NEW: label for bias-head training
@@ -529,6 +688,9 @@ class BaseAgent:
                 "talk_intent_id": int(intent_id),  # ← optional telemetry
                 "speaker_mode": self.speaker_mode,
                 "persona_norm": float(self.persona_norm),
+                "role_bit": float(self.role_bit),
+                "temp_scale": float(self.speaker_temp_scale),
+                "bias_scale": float(self.bias_scale),
             })
         return text
 

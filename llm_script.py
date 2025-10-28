@@ -4,8 +4,10 @@ from __future__ import annotations
 # - Env > YAML > defaults; respects LLM_SPEAKER=0
 # - Exposes .tokenizer for fused-bias processors (Phase-5)
 # - Callable: llm_fn(prompt, generate_kwargs={...})
-# - Phase-5: chatgpt_llm_from_latent / chatgpt_llm_with_bias → single-line, non-meta text
+# - Phase-5: chatgpt_llm_from_latent / chatgpt_llm_with_bias → (text, meta)
 # - Heuristic de-meta + gentle early-stop + shortline selection
+# PATCH: hard guarantee that Phase-5 entrypoints ALWAYS return exactly (text, meta_dict),
+#        folding any extras into meta to avoid tuple-size mismatches at callsites.
 
 import os, re, yaml, torch
 from typing import List, Dict, Optional, Any, Tuple, TYPE_CHECKING
@@ -114,36 +116,100 @@ def _is_meta_like(text: str) -> bool:
         return True
     return False
 
+# NEW: tiny meta post-filter + referential helpers
+BAD_META_FRAGMENTS = [
+    "as an ai", "language model", "cannot", "policy", "alignment spec",
+    "sorry, i", "i cannot", "i'm unable", "i am unable"
+]
+
+def _postfilter_meta(txt: str) -> str:
+    """Truncate at the first sentence if meta-like phrases appear."""
+    t = (txt or "").strip()
+    if not t:
+        return "..."
+    low = t.lower()
+    if any(b in low for b in BAD_META_FRAGMENTS):
+        cut = t.find(".")
+        if cut != -1:
+            t = t[:cut+1].strip()
+    return t
+
+# ── NEW: stronger sanitizer against meta/AI leakage
+_SANITIZE_PATTERNS = [
+    r"\b(as\s+an\s+ai|as\s+an\s+language\s+model)\b.*?$",
+    r"\b(language\s+model|large\s+language\s+model|llm)\b",
+    r"\b(system\s+prompt|prompt|system\s+message|meta[-\s]*instruction)\b",
+    r"\b(tokens?|logprobs?|temperature|top[-\s]*p|sampling)\b",
+    r"\bpolicy\b", r"\balignment\b", r"\brefuse\b",
+]
+
+_SANITIZE_RE = re.compile("|".join(_SANITIZE_PATTERNS), flags=re.IGNORECASE)
+
+def _sanitize(text: str) -> str:
+    """
+    Strip/neutralize common meta/AI-leakage fragments.
+    Runs after _postfilter_meta and before final scoring.
+    """
+    if not text:
+        return "..."
+    # Remove matched fragments
+    cleaned = _SANITIZE_RE.sub("", text)
+    # Remove stray brackets/quotes and collapse whitespace
+    cleaned = cleaned.strip(BAD_QUOTES + " ").replace("  ", " ")
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" -–—")
+    # Avoid ending with dangling commas/colons
+    cleaned = re.sub(r"[,:;]\s*$", ".", cleaned).strip()
+    return cleaned or "..."
+
+def _recent_discussion_block(agent, max_lines: int = 6) -> str:
+    """- Agent_k: text (latest last)."""
+    if not getattr(agent, "message_memory", None):
+        return "- (no recent messages heard)"
+    lines = []
+    for n, m in list(agent.message_memory)[-max_lines:]:
+        m = (m or "").strip()
+        if not m:
+            continue
+        lines.append(f"- {n}: {m}")
+    return "\n".join(lines) if lines else "- (no recent messages heard)"
+
+def _soft_prefix_for_target(named_target: Optional[str]) -> str:
+    """Pre-seed generation with a tiny referential nudge."""
+    if not named_target:
+        return ""
+    return f"I think {named_target} "
+
 # ── Prompt builder (tokenizer required)
 def _build_prompt(tokenizer, name: str, role_str: str, heard_block: str, z_summary: str) -> str:
+    """
+    Prompt hygiene: short, in-character, referential to named agents.
+    (Patched to ensure strict role alternation: system → user → assistant)
+    """
+    merged_user = (
+        "Recent discussion (latest last):\n"
+        f"{heard_block}\n\n"
+        f"Speak as {name}{role_str} in ONE short sentence. Refer to people by name (Agent_k).\n"
+        "Acceptable shapes:\n"
+        "- \"I think Agent_k may be the werewolf because …\"\n"
+        "- \"That’s a distraction; Agent_k is the real werewolf.\"\n"
+        "- \"You’re both off; Agent_k is quietly manipulating us.\"\n"
+        "Stay in character. No out-of-game or system/meta comments.\n\n"
+        "Your private feeling (concise; do not reveal literally):\n"
+        f"- {z_summary}\n"
+    )
+
     messages = [
         {
             "role": "system",
             "content": (
                 "You are playing a hidden-role social deduction game. "
-                "Speak like a player. Output one short, natural sentence. "
-                "Do not include quotes, narration, or stage directions."
+                "Speak like a player. Output one SHORT, natural sentence. "
+                "No quotes, no narration, no stage directions, no meta."
             ),
         },
         {
             "role": "user",
-            "content": (
-                "Examples of good replies:\n"
-                "- I’m not convinced by their story.\n"
-                "- Someone’s behavior feels off to me."
-            ),
-        },
-        {"role": "assistant", "content": "I’m not convinced by their story."},
-        {"role": "user", "content": "Another example."},
-        {"role": "assistant", "content": "Someone’s behavior feels off to me."},
-        {
-            "role": "user",
-            "content": (
-                f"You are {name}{role_str} in a hidden-role deduction game.\n"
-                f"Recent dialog:\n{heard_block}\n"
-                f"Your private feeling:\n- {z_summary}\n\n"
-                "Now reply in one short, natural sentence, as if you are speaking in the game."
-            ),
+            "content": merged_user,
         },
     ]
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -155,6 +221,8 @@ _tok = None
 _model = None
 _llm_pipeline = None
 _MOUTHPIECE = None
+# NEW: public alias used by sim.py and elsewhere
+tok = None
 
 def _resolve_device() -> str:
     cfg = _env_str("LLM_DEVICE", DEVICE_CFG).strip().lower()
@@ -167,7 +235,7 @@ def _lazy_load_llm():
     Build (tokenizer, model, pipeline) exactly once.
     Respects device & model env; ensures pad token; prints a one-line device banner.
     """
-    global _tok, _model, _llm_pipeline
+    global _tok, _model, _llm_pipeline, tok
     if _llm_pipeline is not None:
         return _llm_pipeline, _tok
 
@@ -176,26 +244,26 @@ def _lazy_load_llm():
     use_gpu = device.startswith("cuda")
     torch_dtype = torch.float16 if use_gpu else torch.float32
 
-    tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
-    if tok.pad_token_id is None:
-        if tok.eos_token is not None:
-            tok.pad_token = tok.eos_token
+    tok_local = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+    if tok_local.pad_token_id is None:
+        if tok_local.eos_token is not None:
+            tok_local.pad_token = tok_local.eos_token
         else:
-            tok.add_special_tokens({"pad_token": "<|pad|>"})
-    tok.padding_side = "left"
+            tok_local.add_special_tokens({"pad_token": "<|pad|>"})
+    tok_local.padding_side = "left"
 
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         torch_dtype=torch_dtype,
         low_cpu_mem_usage=True,
     )
-    if getattr(model.config, "vocab_size", None) is not None and len(tok) != model.config.vocab_size:
+    if getattr(model.config, "vocab_size", None) is not None and len(tok_local) != model.config.vocab_size:
         try:
-            model.resize_token_embeddings(len(tok))
+            model.resize_token_embeddings(len(tok_local))
         except Exception:
             pass
     if getattr(model.config, "pad_token_id", None) is None:
-        model.config.pad_token_id = tok.pad_token_id
+        model.config.pad_token_id = tok_local.pad_token_id
 
     if device.startswith("cuda"):
         try:
@@ -205,7 +273,7 @@ def _lazy_load_llm():
     else:
         pipe_device = -1
 
-    llm_pipe = pipeline("text-generation", model=model, tokenizer=tok, device=pipe_device)
+    llm_pipe = pipeline("text-generation", model=model, tokenizer=tok_local, device=pipe_device)
 
     if use_gpu:
         try:
@@ -216,7 +284,9 @@ def _lazy_load_llm():
     else:
         print(f"[INFO] LLM loaded on {device.upper()}")
 
-    _tok, _model, _llm_pipeline = tok, model, llm_pipe
+    _tok, _model, _llm_pipeline = tok_local, model, llm_pipe
+    # keep a public alias for other modules
+    tok = _tok
     return _llm_pipeline, _tok
 
 def _lazy_mouthpiece():
@@ -228,9 +298,9 @@ def _lazy_mouthpiece():
         return _MOUTHPIECE
     if not _env_bool("LLM_SPEAKER", LLM_SPEAKER_CFG):
         raise RuntimeError("LLM mouthpiece disabled by env/config (LLM_SPEAKER=0).")
-    llm_pipe, tok = _lazy_load_llm()
+    llm_pipe, tok_local = _lazy_load_llm()
     device = _resolve_device()
-    _MOUTHPIECE = Mouthpiece(llm_pipe, tok, device)
+    _MOUTHPIECE = Mouthpiece(llm_pipe, tok_local, device)
     return _MOUTHPIECE
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -281,6 +351,22 @@ class Mouthpiece:
         return (1.0 - 0.8 * meta_pen) * (0.6 * length_score + 0.4 * punct_bonus)
 
     def _generate_one(self, prompt: str, attempt: _AttemptSpec, extra_kwargs: Dict[str, Any]) -> str:
+        """
+        Generate one candidate. Per-agent style knobs in extra_kwargs (temperature/top_p/length/etc.)
+        override attempt defaults, ensuring style is honored even with intent/bias fusion.
+        """
+        # Respect per-call style overrides
+        max_new_tokens      = int(extra_kwargs.get("max_new_tokens", attempt.max_new_tokens))
+        temperature         = float(extra_kwargs.get("temperature", attempt.temperature))
+        top_p               = float(extra_kwargs.get("top_p", attempt.top_p))
+        repetition_penalty  = float(extra_kwargs.get("repetition_penalty", attempt.repetition_penalty))
+        no_repeat_ngram     = int(extra_kwargs.get("no_repeat_ngram_size", attempt.no_repeat_ngram_size))
+
+        # Avoid passing duplicates in **extra_kwargs
+        gen_kwargs = dict(extra_kwargs or {})
+        for k in ("max_new_tokens","temperature","top_p","repetition_penalty","no_repeat_ngram_size"):
+            gen_kwargs.pop(k, None)
+
         try:
             resp = self.pipe(
                 prompt,
@@ -288,12 +374,12 @@ class Mouthpiece:
                 eos_token_id=self.tokenizer.eos_token_id,
                 do_sample=True,
                 bad_words_ids=self._bad_ids,
-                max_new_tokens=attempt.max_new_tokens,
-                temperature=attempt.temperature,
-                top_p=attempt.top_p,
-                repetition_penalty=attempt.repetition_penalty,
-                no_repeat_ngram_size=attempt.no_repeat_ngram_size,
-                **(extra_kwargs or {}),
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                no_repeat_ngram_size=no_repeat_ngram,
+                **gen_kwargs,
             )[0].get("generated_text", "")
         except Exception as e:
             print(f"[LLM ERROR/generate] {e}")
@@ -304,6 +390,8 @@ class Mouthpiece:
         cont = _one_line(cont)
         cont = _sanitize_roles(cont)
         cont = cont.strip(BAD_QUOTES + " ")
+        cont = _postfilter_meta(cont)
+        cont = _sanitize(cont)
         return cont or "..."
 
     def __call__(self, prompt: str, *, generate_kwargs: Optional[Dict[str, Any]] = None) -> str:
@@ -348,17 +436,20 @@ except Exception:
     with_fused_bias_generate_kwargs = None
     SPEAKER_HIST_K = 3
 
+# Optional repetition penalty function (if provided elsewhere)
+try:
+    # You can supply this in your project; we call it if available.
+    from repetition import repetition_penalty as _rep_penalty_fn  # type: ignore
+except Exception:
+    _rep_penalty_fn = None  # type: ignore
+
 # ── Helpers for Phase-5 single-line, in-scenario generation
 def _latent_prompt_from_agent(tokenizer, z: torch.Tensor, agent: "BaseAgent") -> str:
     role = (agent.role or "").strip()
     role_str = f", a {role}," if role in ALLOWED_ROLES else ""
     z_summary = agent.decode_z(z)
     name = agent.name
-    heard_block = (
-        "\n".join(
-            f"- {n} said: \"{m.strip()}\"" for n, m in list(agent.message_memory)[-6:] if m.strip()
-        ) or "- (no recent messages heard)"
-    )
+    heard_block = _recent_discussion_block(agent, max_lines=6)
     return _build_prompt(tokenizer, name, role_str, heard_block, z_summary)
 
 @torch.no_grad()
@@ -400,10 +491,10 @@ def _maybe_build_bias_kwargs(z: torch.Tensor, agent: "BaseAgent") -> Dict[str, A
     th_probs = _talkhead_probs_for(agent, z)
     # We only need the tokenizer; using the lazy loader here is fine because this path
     # is reached only when LLM generation is requested.
-    _, tok = _lazy_load_llm()
+    _, tok_local = _lazy_load_llm()
     try:
         return with_fused_bias_generate_kwargs(
-            tokenizer=tok,
+            tokenizer=tok_local,
             head=bias_head,
             z_t=z,
             talkhead_probs=th_probs,          # None is OK; helper handles it
@@ -416,21 +507,104 @@ def _maybe_build_bias_kwargs(z: torch.Tensor, agent: "BaseAgent") -> Dict[str, A
         print(f"[LLM WARN] fused-bias kwargs failed: {e}")
         return {}
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Phase-5 entrypoints: both return a single-line, non-meta utterance.
-# ─────────────────────────────────────────────────────────────────────────────
-def chatgpt_llm_from_latent(z: torch.Tensor, agent: "BaseAgent") -> str:
-    """Return one short, natural in-game sentence (no meta/instructions)."""
-    mouth = _lazy_mouthpiece()
-    prompt = _latent_prompt_from_agent(mouth.tokenizer, z, agent)
-    return mouth(prompt, generate_kwargs={})
+def _style_kwargs(agent: "BaseAgent") -> Dict[str, Any]:
+    """
+    Pull per-agent style knobs (temperature/top_p/length/etc.). We probe multiple
+    attribute names to stay robust across agent implementations.
+    """
+    out: Dict[str, Any] = {}
+    # Temperature
+    for k in ("llm_temperature", "temperature", "temp"):
+        v = getattr(agent, k, None)
+        if isinstance(v, (int, float)) and v > 0:
+            out["temperature"] = float(v)
+            break
+    # Top-p
+    for k in ("llm_top_p", "top_p"):
+        v = getattr(agent, k, None)
+        if isinstance(v, (int, float)) and 0 < v <= 1:
+            out["top_p"] = float(v)
+            break
+    # Max length
+    for k in ("llm_max_new_tokens", "max_new_tokens", "max_len"):
+        v = getattr(agent, k, None)
+        if isinstance(v, int) and v > 0:
+            out["max_new_tokens"] = int(v)
+            break
+    # Repetition penalty / no repeat ngram size
+    v = getattr(agent, "repetition_penalty", None)
+    if isinstance(v, (int, float)) and v > 0:
+        out["repetition_penalty"] = float(v)
+    v = getattr(agent, "no_repeat_ngram_size", None)
+    if isinstance(v, int) and v >= 0:
+        out["no_repeat_ngram_size"] = int(v)
+    return out
 
-def chatgpt_llm_with_bias(z: torch.Tensor, agent: "BaseAgent") -> str:
-    """Return one short, natural in-game sentence; uses fused TalkHead×BiasHead when available."""
+def _merge_gen_kwargs(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Merge generation kwargs with special handling for logits_processor lists.
+    Values in b override a, except logits_processor which are concatenated.
+    """
+    out = dict(a or {})
+    for k, v in (b or {}).items():
+        if k == "logits_processor":
+            la = out.get("logits_processor", [])
+            lb = v or []
+            out["logits_processor"] = list(la) + list(lb)
+        else:
+            out[k] = v
+    return out
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase-5 entrypoints: both return (text, meta) with repetition_penalty if available.
+# Hard guarantee: exactly a 2-tuple, and meta is always a dict.
+# ─────────────────────────────────────────────────────────────────────────────
+def chatgpt_llm_from_latent(z: torch.Tensor, agent: "BaseAgent", *, named_target: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
+    """Return (text, meta) — one short, natural in-game sentence (no meta/instructions)."""
     mouth = _lazy_mouthpiece()
     prompt = _latent_prompt_from_agent(mouth.tokenizer, z, agent)
+    prefix = _soft_prefix_for_target(named_target)
+    prompt = prompt + prefix
+    style = _style_kwargs(agent)
+    text = mouth(prompt, generate_kwargs=style)
+    rep = float(_rep_penalty_fn(text)) if callable(_rep_penalty_fn) else None
+
+    # Normalize meta and include lightweight debug that won't break json.dumps
+    meta: Dict[str, Any] = {}
+    meta["repetition_penalty"] = rep
+    if style:
+        # keep only simple JSON-serializable knobs
+        meta["style_used"] = {k: (float(v) if isinstance(v, (int, float)) else v) for k, v in style.items()}
+    if named_target:
+        meta["named_target"] = named_target
+    return text, meta  # STRICT 2-tuple
+
+def chatgpt_llm_with_bias(z: torch.Tensor, agent: "BaseAgent", *, named_target: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
+    """Return (text, meta) — uses fused TalkHead×BiasHead when available; honors agent style knobs."""
+    mouth = _lazy_mouthpiece()
+    prompt = _latent_prompt_from_agent(mouth.tokenizer, z, agent)
+    prefix = _soft_prefix_for_target(named_target)
+    prompt = prompt + prefix
+
     bias_kwargs = _maybe_build_bias_kwargs(z, agent)
-    return mouth(prompt, generate_kwargs=bias_kwargs)
+    style = _style_kwargs(agent)
+    gen_kwargs = _merge_gen_kwargs(bias_kwargs, style)  # ensure style survives after intent fusion
+
+    text = mouth(prompt, generate_kwargs=gen_kwargs)
+    rep = float(_rep_penalty_fn(text)) if callable(_rep_penalty_fn) else None
+
+    # Normalize meta and fold any extras under safe keys
+    meta: Dict[str, Any] = {}
+    meta["repetition_penalty"] = rep
+    meta["fused_bias_used"] = bool(bias_kwargs)
+    if style:
+        meta["style_used"] = {k: (float(v) if isinstance(v, (int, float)) else v) for k, v in style.items()}
+    if bias_kwargs:
+        # Don't dump full objects; record only presence and simple signals
+        meta["bias_keys"] = sorted(list(bias_kwargs.keys()))
+    if named_target:
+        meta["named_target"] = named_target
+    return text, meta  # STRICT 2-tuple
 
 # Optional convenience: pick mouthpiece by config/env
 def llm_fn_from_env() -> Mouthpiece:

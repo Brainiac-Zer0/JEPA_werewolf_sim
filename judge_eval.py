@@ -28,13 +28,13 @@ from judge import JudgeRubric, score_batch
 try:
     import yaml
     with open("config.yaml", "r") as _f:
-        _CFG = yaml.safe_load(_f)
+        _CFG = yaml.safe_load(_f) or {}
 except Exception:
     _CFG = {}
 
 def _logs_dir_from_cfg(default: str = "logs") -> str:
     lg = _CFG.get("logging", {}) if isinstance(_CFG.get("logging", {}), dict) else {}
-    return lg.get("dir", default)
+    return lg.get("dir", default) or default
 
 # ------------------------------- I/O utils --------------------------------
 
@@ -144,6 +144,21 @@ def _len_tokens(text: str) -> int:
     # simple whitespace token length proxy
     return len(text.split())
 
+# Fixed, schema-stable keys expected from Judge.score_batch
+_SUB_KEYS = ("coherence", "truthfulness", "role_alignment", "social_safety")
+
+def _safe_subscores(d: Dict[str, Any]) -> Dict[str, float]:
+    """Normalize subscores dict to guaranteed keys to avoid schema drift."""
+    out = {}
+    src = d if isinstance(d, dict) else {}
+    for k in _SUB_KEYS:
+        try:
+            v = float(src.get(k, 0.0))
+        except Exception:
+            v = 0.0
+        out[k] = max(0.0, min(1.0, v))
+    return out
+
 def evaluate_set(
     rubric: JudgeRubric,
     items: List[EvalItem],
@@ -184,21 +199,24 @@ def evaluate_set(
 
     # Aggregate per base
     per_item_stats: List[Dict[str, Any]] = []
-    cursor = 0
-    # build map base/pert indices
     per_base_scores: Dict[int, Dict[str, List[float]]] = {}
 
     for (bi, tag), sc in zip(meta_index, scores):
-        score = float(sc.get("score", 0.0))
-        subs = sc.get("subscores", {})
+        # Stable read from Judge output
+        try:
+            score = float(sc.get("score", 0.0))
+        except Exception:
+            score = 0.0
+        subs = _safe_subscores(sc.get("subscores", {}))
+
         rec = {
             "item_idx": bi,
             "tag": tag or "base",
             "score": score,
-            "coherence": float(subs.get("coherence", 0.0)),
-            "truthfulness": float(subs.get("truthfulness", 0.0)),
-            "role_alignment": float(subs.get("role_alignment", 0.0)),
-            "social_safety": float(subs.get("social_safety", 0.0)),
+            "coherence": subs["coherence"],
+            "truthfulness": subs["truthfulness"],
+            "role_alignment": subs["role_alignment"],
+            "social_safety": subs["social_safety"],
         }
         all_records.append(rec)
 
@@ -223,10 +241,9 @@ def evaluate_set(
     lengths = []
     scores_for_lengths = []
 
-    idx_offset = 0
     for bi, (base, perts) in enumerate(expanded):
-        base_scores = per_base_scores[bi]["base"]
-        pert_scores = per_base_scores[bi]["pert"]
+        base_scores = per_base_scores.get(bi, {}).get("base", [])
+        pert_scores = per_base_scores.get(bi, {}).get("pert", [])
 
         base_score = base_scores[0] if base_scores else 0.0
 
@@ -241,27 +258,18 @@ def evaluate_set(
         var = float(np.var(np.array(pert_scores))) if pert_scores else 0.0
         var_list.append(var)
 
-        # Length correlations
-        lens = [_len_tokens(base.context + " " + base.candidate)]
-        scrs = [base_score]
-        for p in perts:
-            if p.kind == "pad_ctx" or p.kind == "pad_cand" or p.kind.startswith("truncate"):
-                lens.append(_len_tokens(p.context + " " + p.candidate))
-                # we'll rebuild score alignment below
-
-        # Rebuild aligned lens/scrs arrays
+        # Rebuild aligned lens/scrs arrays deterministically by perturbation kind
         item_records = [r for r in all_records if r["item_idx"] == bi]
-        # base first
-        item_base_score = [r["score"] for r in item_records if r["tag"] == "base"][0]
-        # map tag to list of scores (preserves multiple seeds)
         tag_to_scores: Dict[str, List[float]] = {}
+        base_row = None
         for r in item_records:
             if r["tag"] == "base":
-                continue
-            tag_to_scores.setdefault(r["tag"], []).append(r["score"])
+                base_row = r
+            else:
+                tag_to_scores.setdefault(r["tag"], []).append(r["score"])
 
         lens = [_len_tokens(base.context + " " + base.candidate)]
-        scrs = [item_base_score]
+        scrs = [base_score]
         for kind in ("order", "truncate_75", "truncate_50", "pad_ctx", "pad_cand"):
             arr = tag_to_scores.get(kind, [])
             for sc in arr:
@@ -291,7 +299,7 @@ def evaluate_set(
             gold_mse_list.append(_mse(scrs, golds))
             gold_spr_list.append(_spearmanr(scrs, golds))
 
-        # CSV row for this item summary
+        # CSV row for this item summary (schema-stable)
         csv_rows.append({
             "item_idx": bi,
             "base_score": round(base_score, 4),
@@ -310,7 +318,7 @@ def evaluate_set(
 
     return {
         "per_item_rows": csv_rows,
-        "all_records": all_records,  # detailed rows
+        "all_records": all_records,  # detailed rows (stable schema per rec)
         "summary": {
             "n_items": len(items),
             "seeds_per_item": seeds_per_item,
@@ -383,13 +391,15 @@ def main():
     json_path = os.path.join(logs_dir, f"{args.out_prefix}_report.json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
-    # CSV detailed records
+    # CSV detailed records — schema-stable columns matching Judge subscores
     csv_path = os.path.join(logs_dir, f"{args.out_prefix}_records.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=["item_idx","tag","score","coherence","truthfulness","role_alignment","social_safety"])
         w.writeheader()
         for r in report["all_records"]:
-            w.writerow(r)
+            # Ensure only expected keys are written
+            row = {k: r.get(k, 0.0) if k != "tag" else r.get(k, "base") for k in w.fieldnames}
+            w.writerow(row)
 
     # NEW: optional audit jsonl for calibration runs (reuse judge.audit_judge_calls)
     if args.audit_jsonl:

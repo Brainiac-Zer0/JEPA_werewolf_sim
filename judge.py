@@ -48,6 +48,11 @@ RERANK_TOPK        = bool(_judge_cfg.get("rerank_topk", True))
 STORE_SUBSCORES    = bool(_judge_cfg.get("store_subscores", True))
 TALK_VOTE_ALIGN_ON = bool(_judge_cfg.get("talk_vote_alignment", True))
 
+# NEW: repetition penalty config (audit + optional scoring attenuation)
+# If weight > 0, we subtract weight * repetition_penalty(candidate) from score (clamped to [0,1]).
+JUDGE_RP_WEIGHT    = float(_judge_cfg.get("rp_weight", 0.0))
+JUDGE_RP_N         = int(_judge_cfg.get("rp_n", 2))
+
 # ────────────── Env overrides (SLURM-friendly shims) ──────────────
 JUDGE_MODEL_ID       = _env_str ("JUDGE_MODEL_ID",       JUDGE_MODEL_ID)
 JUDGE_MAX_NEW        = _env_int ("JUDGE_MAX_NEW",        JUDGE_MAX_NEW)
@@ -58,6 +63,12 @@ JUDGE_DEVICE         = _env_str ("JUDGE_DEVICE",         JUDGE_DEVICE).lower()
 JUDGE_BATCH          = max(1, _env_int("JUDGE_BATCH",    JUDGE_BATCH))
 JUDGE_DEBUG          = _env_bool("JUDGE_DEBUG",          JUDGE_DEBUG)
 JUDGE_DEBUG_DIR      = _env_str ("JUDGE_DEBUG_DIR",      JUDGE_DEBUG_DIR)
+JUDGE_RP_WEIGHT      = _env_float("JUDGE_RP_WEIGHT",     JUDGE_RP_WEIGHT)
+JUDGE_RP_N           = _env_int  ("JUDGE_RP_N",          JUDGE_RP_N)
+
+# NEW: one-time warning toggle + latch
+JUDGE_WARN_PARSE_ONCE = _env_bool("JUDGE_WARN_PARSE_ONCE", True)
+_PARSE_WARNED_ONCE = False
 
 # ────────────── NEW: audit logging routed by config.logging (add-only) ──────────────
 _LOGGING = config.get("logging", {}) if isinstance(config.get("logging", {}), dict) else {}
@@ -82,6 +93,21 @@ def _ensure_parent_dir(path: str):
     except Exception:
         pass
 
+# ────────────── Repetition penalty (lexical diversity) ──────────────
+def repetition_penalty(text: str, n: int = 2) -> float:
+    """
+    Mild lexical diversity penalty in [0,1] based on repeated n-grams.
+    Does NOT modify scoring unless JUDGE_RP_WEIGHT > 0; always logged to audit.
+    """
+    toks = [t for t in (text or "").strip().split() if t]
+    if len(toks) < n + 1:
+        return 0.0
+    grams = [" ".join(toks[i:i+n]) for i in range(len(toks) - n + 1)]
+    total = len(grams)
+    uniq = len(set(grams))
+    rep_frac = 1.0 - (uniq / max(1, total))
+    return float(min(1.0, max(0.0, rep_frac)))
+
 def audit_judge_calls(
     *,
     run_id: str,
@@ -97,6 +123,11 @@ def audit_judge_calls(
 
     Each line includes keys that line up with the sim CSV:
       run_id, round, phase, agent, context, role, candidate, subscores, score[, align_tv].
+    Also includes raw_text and json (extracted JSON text) when available.
+
+    NEW: when available, also includes:
+      - repetition_penalty (float in [0,1])
+      - rp_applied (bool) indicating whether score attenuation was applied
     """
     if not judge_logging_enabled():
         return
@@ -122,8 +153,20 @@ def audit_judge_calls(
                     "subscores": out.get("subscores", {}),
                     "score": float(out.get("score", 0.0)),
                 }
+                # Optional extras required by spec when debug is on
+                if "raw_text" in out:
+                    rec["raw_text"] = out["raw_text"]
+                if "json" in out:
+                    rec["json"] = out["json"]
                 if "align_tv" in out:
                     rec["align_tv"] = out["align_tv"]
+
+                # NEW: repetition penalty fields (pass-through from results if present)
+                if "repetition_penalty" in out:
+                    rec["repetition_penalty"] = float(out["repetition_penalty"])
+                if "rp_applied" in out:
+                    rec["rp_applied"] = bool(out["rp_applied"])
+
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception as e:
         # Never crash the caller on audit failures
@@ -389,7 +432,7 @@ def score_batch(
     for idx, out_full in enumerate(raw):
         out  = out_full[0] if isinstance(out_full, list) else out_full
         cont = out.get("generated_text", "") or out.get("text", "")
-        text = cont  # ← no re-attached '{' — parse exactly what model returned
+        text = cont  # raw judge output
 
         # 1) Try strict parse (fenced or balanced, with mild repair/auto-close)
         json_candidate = _extract_from_fence(text) or _extract_last_json(text) or _autoclose_braces(text)
@@ -406,7 +449,14 @@ def score_batch(
                     subs[k] = _bounded_float(raw_subs.get(k, 0.0))
             rationale = str(parsed.get("rationale", "") or "")
         else:
-            # 2) Heuristic salvage (regex) for truncated JSON
+            # One-time warning about parse salvage (keeps logs clean)
+            global _PARSE_WARNED_ONCE
+            if JUDGE_WARN_PARSE_ONCE and not _PARSE_WARNED_ONCE:
+                _PARSE_WARNED_ONCE = True
+                print("[JUDGE] Non-strict JSON from judge; salvaging via heuristics. "
+                      "Future parse warnings suppressed (set JUDGE_WARN_PARSE_ONCE=0 to silence).")
+
+            # 2) Heuristic salvage (regex) for truncated/loose JSON
             salvage = _heuristic_extract_scores(text, rubric)
             if salvage:
                 subs, score_hint = salvage
@@ -416,8 +466,25 @@ def score_batch(
                 rationale = "Parse failure: judge did not return valid JSON."
                 _dbg_print(f"parse_failed item#{idx} → head: {(cont[:160].replace(chr(10),' '))!r}")
 
-        score = sum(rubric.criteria[k]["w"] * subs.get(k, 0.0) for k in rubric.criteria)
-        if not INCLUDE_RATIONALE: rationale = ""
+        # Guarantee core subscores keys exist (spec requirement)
+        for k in ("coherence", "truthfulness", "role_alignment", "social_safety"):
+            subs.setdefault(k, 0.0)
+
+        # Base weighted score
+        score = sum(rubric.criteria.get(k, {"w": 0.0})["w"] * subs.get(k, 0.0) for k in rubric.criteria)
+
+        # NEW: compute repetition penalty on the CANDIDATE utterance (not on judge output)
+        cand_text = items[idx].get("candidate", "") or ""
+        rp_val = repetition_penalty(cand_text, n=max(1, int(JUDGE_RP_N)))
+        rp_applied = False
+
+        # Optionally attenuate score if configured
+        if JUDGE_RP_WEIGHT > 0.0 and rp_val > 0.0:
+            score = max(0.0, min(1.0, score - float(JUDGE_RP_WEIGHT) * float(rp_val)))
+            rp_applied = True
+
+        if not INCLUDE_RATIONALE:
+            rationale = ""
 
         # DEBUG record
         prompt_tail = prompts[idx][-400:]
@@ -432,13 +499,29 @@ def score_batch(
             "parsed_ok": parsed_ok,
             "subscores": subs,
             "score": score,
+            "repetition_penalty": rp_val,
+            "rp_applied": rp_applied,
         }
         _dbg_write(dbg)
-        _dbg_print(f"item#{idx} parsed_ok={parsed_ok} score={score:.2f}")
+        _dbg_print(f"item#{idx} parsed_ok={parsed_ok} score={score:.2f} rp={rp_val:.3f} applied={rp_applied}")
 
-        rec: Dict[str, Any] = {"subscores": subs, "score": score, "rationale": rationale}
+        # Public result (batched API): include required keys + optional align + debugging raw for audit
+        rec: Dict[str, Any] = {
+            "subscores": subs,
+            "score": score,
+            "rationale": rationale,
+            # NEW: expose penalty metrics for audit_jsonl sink
+            "repetition_penalty": rp_val,
+            "rp_applied": rp_applied,
+        }
         if TALK_VOTE_ALIGN_ON and alignment_values is not None and idx < len(alignment_values):
             rec["align_tv"] = alignment_values[idx] if alignment_values[idx] is not None else None
+
+        # Attach raw_text + json for audit trail when debugging is on
+        if judge_logging_enabled():
+            rec["raw_text"] = text
+            rec["json"] = json_candidate
+
         results.append(rec)
 
     # Persist per-candidate subscores/score for analytics & training alignment

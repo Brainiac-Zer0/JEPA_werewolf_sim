@@ -2,7 +2,7 @@
 # Trainable, lexicon-guided logit bias head for the LLM mouthpiece.
 from __future__ import annotations
 import os, json, hashlib
-from typing import Dict, List, Optional, Any, Tuple, TYPE_CHECKING
+from typing import Dict, List, Optional, Any, Tuple, TYPE_CHECKING, Callable
 
 import torch
 import torch.nn as nn
@@ -45,11 +45,11 @@ _DEFAULT_LEXICON = dict(CFG.get("DEFAULT_LEXICON", {
     "accuse":   ["accuse", "suspicious", "suspect", "lying", "deceive", "eliminate", "vote"],
     "defend":   ["defend", "innocent", "trust", "ally", "support", "clear"],
     "hedge":    ["maybe", "perhaps", "uncertain", "unsure", "might", "seems", "appears"],
-    "question": ["why", "how", "what", "who", "where", "when", "?"],
+    "question": ["why", "how", "what", "who", "where", "when", "?" ],
     "vote":     ["vote", "eliminate", "banish", "target", "lynch"],
 }))
 _CAT_ORDER       = list(CFG.get("CAT_ORDER", ["accuse", "defend", "hedge", "question", "vote"]))
-_SPEAKER_HIST_K  = int(CFG.get("SPEAKER_HIST_K", 3))  # shared with speaker.py
+_SPEAKER_HIST_K  = int(CFG.get("SPEAKER_HIST_K", 3))  # shared default
 
 # Optional extras/overrides for lexicon without touching code
 _EXTRA_LEXICON   = dict(CFG.get("EXTRA_LEXICON", {}))      # {cat: [tokens...]}
@@ -81,13 +81,31 @@ if _EXTRA_LEXICON := _EXTRA_LEXICON:
 # NEW: normalized per-category scales limited to known categories
 PER_CAT_SCALES = {k: float(v) for k, v in _PER_CAT_SCALES.items() if k in CAT_ORDER}
 
-# Pull short history features from speaker.py (shared)
-try:
-    from speaker import make_hist_feats
-except Exception:
-    def make_hist_feats(recent_texts: List[str]) -> torch.Tensor:
-        # Minimal fallback: zeros when speaker.py isn’t available.
-        return torch.tensor([0.0, 0.0], dtype=torch.float32)
+# ───────────────────────── Local history features (no imports) ─────────────────
+def make_hist_feats(recent_texts: List[str], phase_code: Optional[int] = None) -> torch.Tensor:
+    """
+    Returns a small feature vector:
+      [accusation_rate, mean_len] (+ optional one-hot phase of size 3)
+    """
+    if not recent_texts:
+        base = torch.tensor([0.0, 0.0], dtype=torch.float32)
+    else:
+        n = len(recent_texts)
+        acc = sum(int(("accuse" in t.lower()) or ("vote" in t.lower())) for t in recent_texts) / n
+        mean_len = min(1.5, sum(len(t) for t in recent_texts) / max(1, n) / 100.0)
+        base = torch.tensor([acc, mean_len], dtype=torch.float32)
+
+    if phase_code is None:
+        return base
+
+    oh = torch.zeros(3, dtype=torch.float32)
+    try:
+        pc = int(phase_code)
+        if 0 <= pc < 3:
+            oh[pc] = 1.0
+    except Exception:
+        pass
+    return torch.cat([base, oh], dim=0)
 
 # ───────────────────────── Model: LogitBiasHead ─────────────────────────
 class LogitBiasHead(nn.Module):
@@ -115,6 +133,27 @@ class LogitBiasHead(nn.Module):
         raw = self.net(x)                          # [-inf, +inf]
         bias = torch.tanh(raw) * self.bias_cap     # [-cap, +cap]
         return self.base * bias
+
+    # NEW: stable API for fused intent use — returns category logits [B, C]
+    @torch.no_grad()
+    def category_logits(
+        self,
+        z_t: torch.Tensor,
+        role_bit: Optional[torch.Tensor] = None,   # accepted for API symmetry; ignored here
+        recent_texts: Optional[List[str]] = None,
+    ) -> torch.Tensor:
+        """
+        Returns unnormalized category logits [B, C] suitable for fusion.
+        Falls back to zero history if recent_texts not provided.
+        """
+        if z_t.dim() == 1:
+            z_t = z_t.unsqueeze(0)
+        if recent_texts is None:
+            hist = torch.zeros((z_t.size(0), 2), dtype=torch.float32, device=z_t.device)
+        else:
+            hf = make_hist_feats(recent_texts).to(z_t.device)
+            hist = hf.unsqueeze(0).expand(z_t.size(0), -1) if hf.dim() == 1 else hf
+        return self.forward(z_t, hist)
 
     def regularizer(
         self,
@@ -216,6 +255,20 @@ def _normalized_entropy(p: torch.Tensor) -> torch.Tensor:
 def _uniform_prior(C: int) -> torch.Tensor:
     """Uniform prior over C categories."""
     return torch.full((C,), 1.0 / max(1, C), dtype=torch.float32)
+
+def repetition_penalty(text: str, n: int = 2) -> float:
+    """
+    Mild lexical diversity penalty in [0,1] based on repeated n-grams.
+    Caller can subtract a small multiple from reward (e.g., 0.05 * penalty).
+    """
+    toks = [t for t in (text or "").strip().split() if t]
+    if len(toks) < n + 1:
+        return 0.0
+    grams = [" ".join(toks[i:i+n]) for i in range(len(toks) - n + 1)]
+    total = len(grams)
+    uniq = len(set(grams))
+    rep_frac = 1.0 - (uniq / max(1, total))
+    return float(min(1.0, max(0.0, rep_frac)))
 
 # ───────────────────────── Generation glue ─────────────────────────
 class _CategoryBiasProcessor:
@@ -343,6 +396,241 @@ def _make_bias_vector(
 
     return token_bias, cat_strengths_out
 
+# ───────────────────────── NEW: IntentFusionProcessor ─────────────────────────
+class IntentFusionProcessor(nn.Module):
+    """
+    α-blend of intent and bias-head category logits.
+    Produces fused intent log-probs for downstream sampling/training.
+
+      log_p_fused = log( α·softmax(intent_logits) + (1−α)·softmax(bias_logits) )
+    """
+    def __init__(self, alpha: float = 0.6):
+        super().__init__()
+        self.register_buffer("_alpha", torch.tensor(float(alpha)))
+
+    @property
+    def alpha(self) -> float:
+        return float(self._alpha.item())
+
+    def forward(
+        self,
+        intent_logits: Optional[torch.Tensor],  # [B, C] (TalkHead)
+        bias_logits:   Optional[torch.Tensor],  # [B, C] (LogitBiasHead.category_logits)
+    ) -> torch.Tensor:
+        if intent_logits is None and bias_logits is None:
+            raise ValueError("Both intent_logits and bias_logits are None.")
+        if intent_logits is None:
+            return F.log_softmax(bias_logits, dim=-1)
+        if bias_logits is None:
+            return F.log_softmax(intent_logits, dim=-1)
+        p_int  = F.softmax(intent_logits, dim=-1)
+        p_bias = F.softmax(bias_logits,   dim=-1)
+        p = (self._alpha * p_int) + ((1.0 - self._alpha) * p_bias)
+        p = (p + 1e-8) / (p.sum(dim=-1, keepdim=True) + 1e-8)
+        return torch.log(p)
+
+# ───────────────────────── NEW: Two-stage SpeakerBandit ───────────────────────
+class SpeakerBandit(nn.Module):
+    """
+    Two-stage bandit for speech:
+      - cat_logits: intent category choice over templates/categories
+      - arg_logits: optional argument/target choice
+    Backward compatible: callers expecting a single tensor can use ["cat_logits"].
+    """
+    def __init__(
+        self,
+        latent_dim: int = 32,
+        num_templates: int = 32,
+        num_args: int = 16,
+        hist_dim: int = 8,
+        use_role_bit: bool = True,
+        hidden: int = 128,
+    ) -> None:
+        super().__init__()
+        in_dim = latent_dim + hist_dim + (1 if use_role_bit else 0)
+        self.use_role_bit = use_role_bit
+        self.hist_dim = hist_dim
+        self.cat_mlp = nn.Sequential(nn.Linear(in_dim, hidden), nn.ReLU(), nn.Linear(hidden, num_templates))
+        self.arg_mlp = nn.Sequential(nn.Linear(in_dim, hidden), nn.ReLU(), nn.Linear(hidden, num_args))
+
+    def _assemble_input(
+        self,
+        z: torch.Tensor,
+        role_bit: Optional[torch.Tensor],
+        hist_feats: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if z.dim() == 1:
+            z = z.unsqueeze(0)
+        B = z.size(0)
+        if self.use_role_bit:
+            if role_bit is None:
+                role_bit = torch.zeros((B, 1), dtype=z.dtype, device=z.device)
+            elif role_bit.dim() == 1:
+                role_bit = role_bit.view(B, 1)
+        else:
+            role_bit = None
+        if hist_feats is None:
+            hist_feats = torch.zeros((B, self.hist_dim), dtype=z.dtype, device=z.device)
+        elif hist_feats.dim() == 1:
+            hist_feats = hist_feats.view(B, -1)
+        return torch.cat([t for t in (z, role_bit, hist_feats) if t is not None], dim=-1)
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        *,
+        role_bit: Optional[torch.Tensor] = None,
+        hist_feats: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        x = self._assemble_input(z, role_bit, hist_feats)
+        return {"cat_logits": self.cat_mlp(x), "arg_logits": self.arg_mlp(x)}
+
+# ───────────────────────── Intent×Bias α-fusion processor (HF wrappers) ──────
+# Simple, robust pre-sampling warper (tensor-in/tensor-out) and an HF wrapper.
+
+# Accept both names; FUSION_ALPHA takes precedence for quick experiment control.
+_FUSION_ALPHA_DEFAULT = float(os.getenv("FUSION_ALPHA", os.getenv("TALK_FUSION_ALPHA", str(FUSION_ALPHA))))
+
+class IntentBiasProcessor:
+    """
+    Tensor-in, tensor-out logits preprocessor:
+      v' = v + (1-α) * w_bias_sparse + α * p_intent
+
+    - p_intent is a {0,1} mask over vocab for the chosen talk intent.
+    - w_bias_sparse is a dict[int -> float] additive per-token nudges (from BiasHead, etc).
+    - α in [0,1] blends intent mask and learned sparse bias on top of the base logits.
+    """
+    def __init__(self, tokenizer: "PreTrainedTokenizerBase", alpha: Optional[float] = None):
+        self.tok = tokenizer
+        self.alpha = _FUSION_ALPHA_DEFAULT if alpha is None else float(alpha)
+        self.alpha = max(0.0, min(1.0, self.alpha))
+
+        # Category order must match TalkHead order.
+        self.cat_names = ["accuse","defend","hedge","question","vote"]
+
+        # Tiny intent lexicons.
+        self.cat2lex = {
+            "accuse":   ["I", "think", "Agent_", "may", "be", "the", "werewolf"],
+            "defend":   ["I", "don’t", "think", "Agent_", "is", "the", "werewolf"],
+            "hedge":    ["I", "might", "be", "wrong", "but"],
+            "question": ["Why", "did", "Agent_", "do", "that", "?" ],
+            "vote":     ["We", "should", "vote", "for", "Agent_"],
+        }
+
+        # Pre-encode token ids once into sets.
+        cat2ids = {}
+        for k, ws in self.cat2lex.items():
+            ids: List[int] = []
+            for w in ws:
+                try:
+                    enc = self.tok.encode(w, add_special_tokens=False) \
+                          if hasattr(self.tok, "encode") else self.tok(w, add_special_tokens=False)["input_ids"]
+                except Exception:
+                    enc = []
+                if enc:
+                    ids.extend(enc)
+            cat2ids[k] = set(int(i) for i in ids if isinstance(i, int))
+        self.cat2ids = cat2ids
+
+    def __call__(
+        self,
+        logits: torch.Tensor,                       # [V] or [B,V]
+        talk_category_last: Optional[int],
+        w_bias: Optional[Dict[int, float]],
+    ) -> torch.Tensor:
+        v = logits
+        squeeze = False
+        if v.dim() == 1:
+            v = v.unsqueeze(0)
+            squeeze = True
+        B, V = int(v.size(0)), int(v.size(-1))
+
+        # Build intent mask
+        if talk_category_last is not None and 0 <= int(talk_category_last) < len(self.cat_names):
+            cat = self.cat_names[int(talk_category_last)]
+            ids = [i for i in self.cat2ids.get(cat, set()) if 0 <= i < V]
+        else:
+            ids = []
+        if ids:
+            intent_mask = torch.zeros(V, dtype=v.dtype, device=v.device)
+            intent_mask[int(torch.tensor(ids, device=v.device))] = 1.0
+            intent_mask = intent_mask.unsqueeze(0).expand(B, V)
+        else:
+            intent_mask = torch.zeros_like(v)
+
+        # Sparse bias (per-token)
+        if w_bias:
+            bias_vec = torch.zeros(V, dtype=v.dtype, device=v.device)
+            for tid, w in w_bias.items():
+                ti = int(tid)
+                if 0 <= ti < V:
+                    bias_vec[ti] += float(w)
+            bias_vec = bias_vec.unsqueeze(0).expand(B, V)
+            v = v + (1.0 - self.alpha) * bias_vec
+
+        # Intent boost
+        v = v + self.alpha * intent_mask
+
+        if squeeze:
+            v = v.squeeze(0)
+        return v
+
+class HFIntentBiasProcessor:
+    """
+    HF-compatible logits processor wrapper around IntentBiasProcessor.
+    You provide two callables so this stays decoupled from Agent internals:
+      - intent_getter() -> Optional[int]
+      - bias_getter()   -> Optional[Dict[int,float]]
+    """
+    def __init__(
+        self,
+        tokenizer: "PreTrainedTokenizerBase",
+        *,
+        alpha: Optional[float] = None,
+        intent_getter: Callable[[], Optional[int]],
+        bias_getter:  Callable[[], Optional[Dict[int, float]]],
+    ):
+        self.proc = IntentBiasProcessor(tokenizer, alpha=alpha)
+        self.intent_getter = intent_getter
+        self.bias_getter  = bias_getter
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        return self.proc(
+            scores,
+            talk_category_last=self.intent_getter(),
+            w_bias=self.bias_getter(),
+        )
+
+def build_alpha_fusion_processor_for_agent(
+    tokenizer: "PreTrainedTokenizerBase",
+    agent: Any,
+    alpha: Optional[float] = None
+) -> HFIntentBiasProcessor:
+    """
+    Convenience: build an HF logits processor that reads from:
+      - agent.talk_category_last : Optional[int]
+      - agent.w_bias_sparse      : Optional[Dict[int,float]]
+    """
+    return HFIntentBiasProcessor(
+        tokenizer,
+        alpha=alpha,
+        intent_getter=lambda: getattr(agent, "talk_category_last", None),
+        bias_getter=lambda: getattr(agent, "w_bias_sparse", None),
+    )
+
+def with_alpha_fusion_generate_kwargs(
+    *,
+    tokenizer: "PreTrainedTokenizerBase",
+    agent: Any,
+    alpha: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Return {'logits_processor':[...]} applying α-fusion intent×bias at each step.
+    Drop-in alternative to with_logit_bias_generate_kwargs / with_fused_bias_generate_kwargs.
+    """
+    proc = build_alpha_fusion_processor_for_agent(tokenizer, agent, alpha=alpha)
+    return {"logits_processor": [proc]}
+
 # ───────────────────────── Public APIs ─────────────────────────
 def with_logit_bias_generate_kwargs(
     *,
@@ -460,7 +748,15 @@ def with_fused_bias_generate_kwargs(
 # Optional: explicit export surface
 __all__ = [
     "LogitBiasHead",
+    "SpeakerBandit",
+    "IntentFusionProcessor",
+    "repetition_penalty",
     "with_logit_bias_generate_kwargs",
     "with_fused_bias_generate_kwargs",
     "build_processor_from_cat_weights",
+    # NEW exports
+    "IntentBiasProcessor",
+    "HFIntentBiasProcessor",
+    "build_alpha_fusion_processor_for_agent",
+    "with_alpha_fusion_generate_kwargs",
 ]

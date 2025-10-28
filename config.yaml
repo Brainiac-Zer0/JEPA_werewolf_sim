@@ -1,49 +1,41 @@
-# ================================================================
-# LEGACY KEYS (kept so existing code paths don't break)
-# ================================================================
-NUM_AGENTS: 6
-MAX_MEMORY: 5
+# ---- Top-level convenience (read by older code paths) ----
+NUM_AGENTS: 9
+NUM_WEREWOLVES: 2
 USE_LANGUAGE: true
 SPEAKER_ENABLED: true
 SPEAKER_LR: 0.001
 SPEAKER_HIST_K: 3
-
-INPUT_DIM: 808
+TURNS_DAY_DISCUSS: 2
+INPUT_DIM: 811
 LATENT_DIM: 32
 ACTION_DIM: 8
 NUM_ACTIONS: 6
-
-JUDGE_MODEL_ID: "microsoft/Phi-3-mini-4k-instruct"
+JUDGE_MODEL_ID: microsoft/Phi-3-mini-4k-instruct   # unify with judge.model_id below
 JUDGE_MAX_NEW: 128
 INCLUDE_RATIONALE: true
 ENABLE_PERSONA_STEER: false
 JUDGE_DEBUG: false
-PERSONA_CONFIG_PATH: "configs/persona_vectors.yaml"
-JUDGE_DEBUG_DIR: "logs"
-JUDGE_DEVICE: "auto"
+PERSONA_CONFIG_PATH: configs/persona_vectors.yaml
+JUDGE_DEBUG_DIR: logs
+JUDGE_DEVICE: auto
 JUDGE_BATCH: 4
-
-LLM_MODEL_ID: "meta-llama/Llama-3.1-70B-Instruct"
+LLM_MODEL_ID: meta-llama/Llama-3.1-70B-Instruct   # unify with llm.model_id below
 LLM_SPEAKER: true
-LLM_DEVICE: ""
+LLM_DEVICE: ''
+WEREWOLF: Werewolf
+VILLAGER: Worker
 
-WEREWOLF: "Werewolf"
-VILLAGER: "Worker"
 ROLE_PRIORS:
   WEREWOLF: ones
   VILLAGER: zeros
+
 PERSONA_SCALE: 0.2
 PERSONA_SEED: null
-
-# Deterministic role assignment (used by roles.py)
 RUN_SEED: 1337
 
-# World/Action embedding defaults for encoders.py (optional explicitness)
-WORLD_INPUT_MODE: "z_plus_action"   # or "z_only"
-ACTION_EMBED_KIND: "onehot"         # or "learned"
+WORLD_INPUT_MODE: z_plus_action
+ACTION_EMBED_KIND: onehot
 
-# sim.py legacy knobs
-NUM_WEREWOLVES: 1
 SCREEN_W: 1200
 SCREEN_H: 600
 FPS: 1
@@ -51,42 +43,41 @@ AGENT_R: 30
 MSG_LOG_LIMIT: 12
 MSG_BOX_W: 360
 MSG_BOX_X: 840
-RUBRIC_PATH: "judge_rubric.yaml"
+
+RUBRIC_PATH: judge_rubric.yaml
 PLANNER_TOPK: 3
 
-# speaker_llm.py (legacy-compatible globals)
 BIAS_CAP: 2.0
 BASE_STRENGTH: 1.0
 DEBUG: false
+
 DEFAULT_LEXICON:
-  accuse:   ["accuse", "suspicious", "suspect", "lying", "deceive", "eliminate", "vote"]
-  defend:   ["defend", "innocent", "trust", "ally", "support", "clear"]
-  hedge:    ["maybe", "perhaps", "uncertain", "unsure", "might", "seems", "appears"]
-  question: ["why", "how", "what", "who", "where", "when", "?"]
-  vote:     ["vote", "eliminate", "banish", "target", "lynch"]
-CAT_ORDER: ["accuse", "defend", "hedge", "question", "vote"]
+  accuse: [accuse, suspicious, suspect, lying, deceive, eliminate, vote]
+  defend: [defend, innocent, trust, ally, support, clear]
+  hedge: [maybe, perhaps, uncertain, unsure, might, seems, appears]
+  question: [why, how, what, who, where, when, '?']
+  vote: [vote, eliminate, banish, target, lynch]
 
-# ---- Phase-5 bias fusion knobs (read directly by speaker_llm.py) ----
-ENTROPY_ATTENUATION: 0.5         # 0..1; higher = more attenuation when uncertain
-PER_CAT_SCALES:                  # soft tilt per category (optional)
-  question: 1.10
+CAT_ORDER: [accuse, defend, hedge, question, vote]
+ENTROPY_ATTENUATION: 0.5
+PER_CAT_SCALES:
+  question: 1.1
   vote: 0.95
-EXTRA_LEXICON: {}                # e.g., {accuse: ["fabricating", "mislead"]}
-STRICT_LEXICON: false            # if true, ignore unknown cats in EXTRA
-TALK_FUSION_ALPHA: 0.5           # α for TalkHead vs BiasHead fusion
+EXTRA_LEXICON: {}
+STRICT_LEXICON: false
+TALK_FUSION_ALPHA: 0.5
 
-# speaker.py templates (for bandit mouthpiece)
 DEFAULT_TEMPLATES:
-  - "Accuse {target}"
-  - "Defend {ally}"
-  - "Ask {target} a question"
-  - "Express uncertainty"
-  - "Propose vote on {target}"
+  - Accuse {target}
+  - Defend {ally}
+  - Ask {target} a question
+  - Express uncertainty
+  - Propose vote on {target}
 
-# train.py (legacy mirrors still read in code)
 N_GAMES: 50
-CHECKPOINT_DIR: "checkpoints"
-JUDGE_RUBRIC_PATH: "judge_rubric.yaml"
+CHECKPOINT_DIR: checkpoints
+JUDGE_RUBRIC_PATH: judge_rubric.yaml
+
 VILLAGER_W:
   truthfulness: 0.5
   coherence: 0.3
@@ -96,39 +87,33 @@ WEREWOLF_W:
   coherence: 0.5
   social_safety: 0.2
 
-# training_utils.py (legacy knobs still honored)
-LAMBDA_BC: 0.5         # shared by vote/kill heads; used by legacy trainer too
-LAMBDA_TALK: 0.5       # new: CE weight for TalkHead
+LAMBDA_BC: 0.5
+LAMBDA_TALK: 0.5
 MAX_NORM: 1.0
-# Additional Phase-4/5 switches consumed by training_utils.py
 USE_AMP: false
-LR_SCHEDULER: "none"   # 'none' | 'cosine' | 'onecycle'
+LR_SCHEDULER: none
 SAVE_OPTIM: false
 DEBUG_MASKS: false
 STRATIFY_PHASE_BATCHES: true
 
-# ================================================================
-# MODERN STRUCTURED KEYS (existing, kept)
-# ================================================================
 seed: 1337
 
 paths:
-  checkpoints: "checkpoints/"
-  logs: "logs/"
-  rubric: "judge_rubric.yaml"
-  mouthpiece: "checkpoints/speakers/"
+  checklists: null
+  checkpoints: checkpoints/
+  logs: logs/
+  rubric: judge_rubric.yaml
+  mouthpiece: checkpoints/speakers/
 
 sim:
-  num_agents: 6
-  num_werewolves: 1
+  num_agents: 9
+  num_werewolves: 2
   planner_topk: 3
   use_language: true
-
-  # NEW: planner×judge mixing + optional Δz logs for phases
-  vote_mix_alpha: 0.0     # 0.0 = judge-only among top-k; 1.0 = planner-only
-  log_dz_talk: false      # if true, log Δz for each TALK (per speaker)
-  log_dz_kill: false      # if true, log Δz for NIGHT_KILL actor
-
+  discuss_turns: 2
+  vote_mix_alpha: 0.0
+  log_dz_talk: false
+  log_dz_kill: false
   ui:
     enabled: true
     screen_w: 1200
@@ -136,31 +121,40 @@ sim:
     fps: 1
     msg_log_limit: 12
     msg_box_w: 360
-
-  # Social influence (text → latent delta)
   social:
     enabled: true
     hidden: 64
-    scale: 0.2           # magnitude of δ_social
-    window: 6            # recent neighbor messages used
-    apply_between: "discuss_vote"  # insertion point
-
-  # Optional simple env aliases for overrides (used by sim.py env shims)
+    scale: 1.0
+    window: 6
+    K: 6
+    apply_between: discuss_vote
   env_aliases:
     SOC_ENABLED: true
-    SOC_SCALE: 0.2
+    SOC_SCALE: 1.0
     SOC_K: 6
+  night_chat:
+    enabled: true
+    turns: 2
+    judge_on: true
+    delta_social_scale: 1.0
+    ui_preview: false
+    intent_target: top1
+    talk_mask_all: true
+    use_bias_fusion: true
+  talk_fusion_alpha: 0.5
+  phases:
+    night_enabled: true
 
 model:
-  input_dim: 808
+  input_dim: 811
   latent_dim: 32
   action_dim: 8
   num_actions: 6
   encoders:
-    message_model: "sentence-transformers/all-MiniLM-L6-v2"
+    message_model: sentence-transformers/all-MiniLM-L6-v2
   phases:
-    count: 3                # DISCUSS(0) / VOTE(1) / NIGHT(2)
-    talk_categories: ["accuse", "defend", "hedge", "question", "vote"]
+    count: 3
+    talk_categories: [accuse, defend, hedge, question, vote]
     num_talk_cats: 5
   factorized_planner:
     temperature: 1.0
@@ -174,59 +168,70 @@ model:
     hidden: 64
 
 judge:
-  # You can upgrade here if desired:
-  # model_id: "meta-llama/Llama-3.1-405B-Instruct"  # OPTIONAL upgrade
-  model_id: "meta-llama/Llama-3.1-70B-Instruct"
-  device: "auto"
+  model_id: microsoft/Phi-3-mini-4k-instruct   # unified with top-level JUDGE_MODEL_ID
+  device: auto
   batch: 4
   max_new: 128
   include_rationale: true
   enable_persona_steer: false
   debug: false
-  debug_dir: "logs"
-  # Phase-5 behavior toggles:
-  rerank_topk: true           # judge re-ranks planner top-k votes
-  store_subscores: true       # log per-utterance judge subscores on TALK rows
-  talk_vote_alignment: true   # compute and log talk→vote alignment
+  debug_dir: logs
+  rerank_topk: true
+  store_subscores: true
+  talk_vote_alignment: true
 
 llm:
-  # Choose your base model here (can override with LLM_MODEL_ID env):
-  # model_id: "mistralai/Mistral-7B-Instruct-v0.2"   # lighter option
-  model_id: "meta-llama/Llama-3.1-70B-Instruct"
-  device: "auto"
-  dtype: "auto"            # "auto" | "float16" | "bfloat16" | "float32"
-  load_in_8bit: true       # prefer 8-bit to fit 70B on single high-VRAM GPU
+  model_id: meta-llama/Llama-3.1-70B-Instruct  # unified with top-level LLM_MODEL_ID
+  device: auto
+  dtype: auto
+  load_in_8bit: true
   load_in_4bit: false
   max_seq: 4096
   kv_cache: true
   speaker_enabled: true
+  # P5C hygiene & decode attempts (router tries LLM first, then bandit fallback)
   decode_attempts:
-    - {max_new_tokens: 32, temperature: 0.6, top_p: 0.9, repetition_penalty: 1.1, no_repeat_ngram_size: 3}
-    - {max_new_tokens: 28, temperature: 0.5, top_p: 0.9, repetition_penalty: 1.15, no_repeat_ngram_size: 4}
-    - {max_new_tokens: 24, temperature: 0.45, top_p: 0.85, repetition_penalty: 1.2, no_repeat_ngram_size: 5}
+    - max_new_tokens: 32
+      temperature: 0.6
+      top_p: 0.9
+      repetition_penalty: 1.1
+      no_repeat_ngram_size: 3
+    - max_new_tokens: 28
+      temperature: 0.5
+      top_p: 0.9
+      repetition_penalty: 1.15
+      no_repeat_ngram_size: 4
+    - max_new_tokens: 24
+      temperature: 0.45
+      top_p: 0.85
+      repetition_penalty: 1.2
+      no_repeat_ngram_size: 5
   bans_meta:
-    - "Use"
-    - "Do not"
-    - "Don't"
-    - "No "
-    - "Keep "
-    - "Reply"
-    - "Provide"
-    - "Follow"
-    - "Instruction"
-    - "Rule"
-    - "sentence"
-    - "third person"
-    - "grammar"
-    - "punctuation"
-    - "No narration"
-  stop_words: ["\n", "\r", "Agent_", "System:", "Narrator:"]
-  # Optional hygiene controls (future-proof; harmless if unused by code)
+    - Use
+    - Do not
+    - Don't
+    - 'No '
+    - 'Keep '
+    - Reply
+    - Provide
+    - Follow
+    - Instruction
+    - Rule
+    - sentence
+    - third person
+    - grammar
+    - punctuation
+    - No narration
+  stop_words:
+    - "\n"
+    - "\r"
+    - "Agent_"
+    - "System:"
+    - "Narrator:"
   hygiene:
     trim_quotes: true
     strip_role_words: true
 
-# Encoders (Phase-5) — dialog context, text hygiene, and regularizers
 encoders:
   context:
     window: 6
@@ -244,29 +249,31 @@ encoders:
 
 speaker:
   enabled: true
-  lr: 1.0e-3
+  lr: 0.001
   hist_k: 3
   entropy_bonus: 0.01
   hidden: 128
   warmup_steps: 100
-  # Optional logit-bias trainable head (speaker_llm)
+  fusion_alpha: 0.5
+  lambda_j: 1.0
+  lambda_c: 0.25
+  lambda_o: 0.2
   bias_head:
     latent_dim: 32
-    lr: 5.0e-4
+    lr: 0.0005
     epochs: 1
     strength_cap: 2.0
-    cat_order: ["accuse", "defend", "hedge", "question", "vote"]
-    regularizer_lambda: 0.0    # if >0, trainer may call head.regularizer(z_batch)
-  # Optional bandit/UCT exploration (for template speaker variants)
+    cat_order: [accuse, defend, hedge, question, vote]
+    regularizer_lambda: 0.0
   exploration:
     epsilon: 0.05
     ucb_c: 1.414
   templates:
-    - "Accuse {target}"
-    - "Defend {ally}"
-    - "Ask {target} a question"
-    - "Express uncertainty"
-    - "Propose vote on {target}"
+    - Accuse {target}
+    - Defend {ally}
+    - Ask {target} a question
+    - Express uncertainty
+    - Propose vote on {target}
 
 persona:
   scale: 0.2
@@ -277,17 +284,17 @@ persona:
     coherence_weight_scale: 1.0
 
 training:
-  mode: "factorized"   # "legacy" | "phase" | "factorized"
+  mode: factorized
   n_games: 10
-  outer_cycles: 5          # simulate→train loops to improve mouthpiece cohesion
+  outer_cycles: 2
   games_per_cycle: 10
-  epochs: 5
+  epochs: 2
   batch_size: 64
-  lr: 1.0e-3
+  lr: 0.001
   max_grad_norm: 1.0
   lambda_bc: 0.5
   lambda_talk: 0.5
-  device: "auto"
+  device: auto
   speaker_enabled: true
   speaker_only: false
 
@@ -299,9 +306,6 @@ ablations:
   fep_core: true
   language: true
 
-# ================================================================
-# NEW (Phase-1) — STABILIZATION + LOGGING
-# ================================================================
 determinism:
   enabled: true
   seed: 1337
@@ -310,26 +314,23 @@ determinism:
 
 telemetry:
   enabled: true
-  out_dir: "logs"
-  csv_name: "telemetry.csv"
-  judge_jsonl_name: "judge_calls.jsonl"
+  out_dir: logs
+  csv_name: telemetry.csv
+  judge_jsonl_name: judge_calls.jsonl
   snapshot_config: true
   print_summary: true
   flush_every: 1
 
 phases:
-  talk_categories: ["accuse", "defend", "hedge", "question", "vote"]
+  talk_categories: [accuse, defend, hedge, question, vote]
 
-# ================================================================
-# NEW (Phase-1) — RUNTIME & LOGGING KNOBS FOR PATCHED CODE
-# ================================================================
 logging:
-  dir: "logs"
-  metrics_csv: "logs/metrics.csv"
-  run_config: "logs/run_config.yaml"
-  run_meta: "logs/run_meta.json"
-  judge_jsonl: "logs/judge_calls.jsonl"   # consumed by patched judge.py
-  debug: false                            # allows judge.py to honor logging.debug
+  dir: logs
+  metrics_csv: logs/metrics.csv
+  run_config: logs/run_config.yaml
+  run_meta: logs/run_meta.json
+  judge_jsonl: logs/judge_calls.jsonl
+  debug: false
 
 runtime:
   save_config_snapshot: true
@@ -337,51 +338,39 @@ runtime:
 seeds:
   global: 123
 
-# ================================================================
-# NEW (Phase-1) — TRAINING TOGGLES & LEGACY-FRIENDLY MIRRORS
-# ================================================================
 PHASE_AWARE_JEPA: false
 TRAIN_PHASE_HEADS: false
 TELEMETRY_ENABLED: true
-
-TALK_CATEGORIES: ["accuse", "defend", "hedge", "question", "vote"]
+TALK_CATEGORIES: [accuse, defend, hedge, question, vote]
 NUM_TALK_CATS: 5
 PHASE_COUNT: 3
 ACTION_EMBED_DIM: 8
 
-# ================================================================
-# Language ↔ Latent coupling (consumed by training_utils.language_coupling_loss)
-# ================================================================
 LANGUAGE_COUPLING:
-  enabled: false       # set true to activate aux loss
+  enabled: false
   loss_weight: 0.05
 
-# ================================================================
-# Phase-5 mouthpiece reward + trainer knobs (consumed by training_utils.py)
-# ================================================================
 MOUTHPIECE_REWARD_WEIGHTS:
-  coherence: 0.40
-  role_alignment: 0.30          # retained; used by trainer rewards
+  coherence: 0.4
+  role_alignment: 0.3
   social_safety: 0.15
-  truthfulness_villager: 0.15   # for Villager/Worker
-  deception_wolf: 0.30          # applied as (1 - truthfulness) for wolves
-  talk_vote_alignment: 0.10     # small bonus for talk→vote consistency
+  truthfulness_villager: 0.15
+  deception_wolf: 0.3
+  talk_vote_alignment: 0.1
+
+REWARD_USE_ROLE_ALIGNMENT: false
 
 MOUTHPIECE_TRAINING:
-  speaker_bandit_lr: 5.0e-4
+  speaker_bandit_lr: 0.0005
   speaker_bandit_epochs: 1
-  speaker_bandit_entropy_coef: 0.01
+  speaker_bandit_entropy_reg: 0.01
   speaker_bandit_baseline_ema: 0.9
-  bias_head_lr: 5.0e-4
+  bias_head_lr: 0.0005
   bias_head_epochs: 1
   bias_head_entropy_reg: 0.005
   bias_head_kl_reg: 0.0
 
-# ================================================================
-# COMPAT MIRROR for current sim.py: social_influence
-# (Maps to sim.social; safe to remove once sim.py reads sim.social directly)
-# ================================================================
 social_influence:
   enabled: true
-  K: 6          # mirrors sim.social.window
-  scale: 0.2    # mirrors sim.social.scale
+  K: 6
+  scale: 1.0

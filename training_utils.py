@@ -103,16 +103,27 @@ R_ALIGN  = float(RW.get("talk_vote_alignment", 0.10))  # extra bonus
 # ── Phase-5: reward/rubric alignment guard (default False to match rubric)
 REWARD_USE_ROLE_ALIGNMENT: bool = bool(CFG.get("REWARD_USE_ROLE_ALIGNMENT", False))
 
+# ── Lambda-weighted speaker reward config (and optional night convergence bonus)
+SPK = CFG.get("speaker", {}) if isinstance(CFG.get("speaker", {}), dict) else {}
+LJ = float(SPK.get("lambda_j", 1.0))
+LC = float(SPK.get("lambda_c", 0.25))
+LO = float(SPK.get("lambda_o", 0.2))
+
 MB = CFG.get("MOUTHPIECE_TRAINING", {}) or {}
 SB_LR       = float(MB.get("speaker_bandit_lr", 5e-4))
 SB_EPOCHS   = int(MB.get("speaker_bandit_epochs", 1))
 SB_ENTROPY  = float(MB.get("speaker_bandit_entropy_coef", 0.01))
 SB_BASE_EMA = float(MB.get("speaker_bandit_baseline_ema", 0.9))
+# NEW (Phase-5): small KL to TalkHead prior and arg-aux weight
+SB_KL_TO_INTENT = float(MB.get("speaker_bandit_kl_to_intent", 0.01))
+SB_ARG_AUX_WEIGHT = float(MB.get("speaker_bandit_arg_aux_weight", 0.25))
 
 BH_LR      = float(MB.get("bias_head_lr", 5e-4))
 BH_EPOCHS  = int(MB.get("bias_head_epochs", 1))
 BH_ENT_REG = float(MB.get("bias_head_entropy_reg", 0.005))
 BH_KL_REG  = float(MB.get("bias_head_kl_reg", 0.0))
+# NEW (Phase-5): align bias categories to TalkHead prior (KL)
+BH_KL_TO_INTENT = float(MB.get("bias_head_kl_to_intent", 0.01))
 
 LANG_COUP = CFG.get("LANGUAGE_COUPLING", {}) or {}
 LC_ENABLED  = bool(LANG_COUP.get("enabled", False))
@@ -228,7 +239,7 @@ def normalize_rollouts(raw: List[Tuple]) -> List[RolloutSample]:
     """
     Accepts:
       - legacy: (z_t, a_idx, z_next, role)
-      - phase-aware: (z_t, phase_code, action_payload, z_next, role[, choice_type[, aux_meta_dict]])
+      - phase-aware: (z_t, phase_code, action_payload, z_{t+1}, role[, choice_type[, aux_meta_dict]])
     """
     out: List[RolloutSample] = []
     for tup in raw:
@@ -1097,13 +1108,18 @@ class UtteranceSample:
     template_id: Optional[int]
     talk_cat: Optional[int]
     hist_feats: Optional[torch.Tensor]   # any small embedding/feature vec (or None)
+    # NEW (Phase-5): fused TalkHead prior (intent probs) and argument id
+    p_intent: Optional[List[float]] = None   # e.g., fused intent distribution over categories
+    arg_id: Optional[int] = None             # optional argument/target chosen by the bandit
     # scored targets
-    judge_score: float
-    coherence: float
-    truthfulness: float
-    role_alignment: float
-    social_safety: float
-    align_tv: Optional[float]            # talk→vote alignment [0..1]
+    judge_score: float = 0.0
+    coherence: float = 0.0
+    truthfulness: float = 0.0
+    role_alignment: float = 0.0
+    social_safety: float = 0.0
+    align_tv: Optional[float] = None         # talk→vote alignment [0..1]
+    # optional lexical diversity penalty captured from runtime (if provided)
+    rep_penalty: Optional[float] = None
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
     try:
@@ -1118,13 +1134,15 @@ def collect_utterance_dataset(agents: List[Any]) -> List[UtteranceSample]:
     """
     Pull per-utterance training rows from agents' msg_buffer (populated in sim.py Phase-5).
     Each msg_buffer entry is expected to contain:
-      - 'z' (latent at speak time) or we fallback to agent.encode_current_belief(...) when available (rare)
+      - 'z' (latent at speak time) or we fallback to agent.encode_current_belief(...)
       - 'template_id' (int) if the speaker used a template-scaffold
       - 'judge_score' and 'judge_subscores' with keys: coherence, truthfulness, role_alignment, social_safety
       - 'alignment_vote' (float) for talk→vote alignment
       - 'talk_category' or agent.talk_category_last for intent supervision
-      - 'round' optional; fallback to 0
+      - optional 'p_intent' (List[float]) fused TalkHead prior for α-fusion logging/training
+      - optional 'arg_id' (int) chosen by two-stage bandit (argument/target)
       - optional 'hist_feats' tensor-like
+      - optional 'repetition_penalty' float in [0,1]
     """
     out: List[UtteranceSample] = []
     for ag in agents or []:
@@ -1146,6 +1164,26 @@ def collect_utterance_dataset(agents: List[Any]) -> List[UtteranceSample]:
                 except Exception:
                     continue
             j = row.get("judge_subscores", {}) or {}
+            # Capture p_intent (list of floats) if present and sane
+            p_intent = row.get("p_intent", None)
+            if isinstance(p_intent, (list, tuple)) and len(p_intent) > 0:
+                try:
+                    p_sum = float(sum(float(x) for x in p_intent))
+                    if p_sum > 0:
+                        p_intent = [float(x) / p_sum for x in p_intent]
+                    else:
+                        p_intent = None
+                except Exception:
+                    p_intent = None
+            else:
+                p_intent = None
+            # argument id (for two-stage bandit)
+            arg_id = row.get("arg_id", None)
+            try:
+                arg_id = int(arg_id) if arg_id is not None else None
+            except Exception:
+                arg_id = None
+
             out.append(UtteranceSample(
                 z_t = z.detach(),
                 role = role,
@@ -1153,12 +1191,15 @@ def collect_utterance_dataset(agents: List[Any]) -> List[UtteranceSample]:
                 template_id = int(row["template_id"]) if "template_id" in row else None,
                 talk_cat = int(row["talk_category"]) if "talk_category" in row else int(getattr(ag, "talk_category_last", -1)) if getattr(ag, "talk_category_last", -1) != -1 else None,
                 hist_feats = row.get("hist_feats", None),
+                p_intent = p_intent,
+                arg_id = arg_id,
                 judge_score = _safe_float(row.get("judge_score", 0.0)),
                 coherence = _safe_float(j.get("coherence", 0.0)),
                 truthfulness = _safe_float(j.get("truthfulness", 0.0)),
                 role_alignment = _safe_float(j.get("role_alignment", 0.0)),
                 social_safety = _safe_float(j.get("social_safety", 0.0)),
                 align_tv = _safe_float(row.get("alignment_vote", 0.0)) if "alignment_vote" in row else None,
+                rep_penalty = _safe_float(row.get("repetition_penalty", 0.0)) if "repetition_penalty" in row else None,
             ))
     return out
 
@@ -1185,6 +1226,27 @@ def _compute_reward(sample: UtteranceSample) -> float:
     # clamp to sane range
     return float(max(-1.0, min(2.0, base)))
 
+# --- Phase-5: Lambda-weighted reward assembly (+ optional night convergence) ---
+def assemble_total_reward(sample: Dict[str, Any]) -> float:
+    """
+    Compute λ-weighted total reward for a rollout/utterance sample:
+      R_total = LJ * r_judge + LC * r_consistency + LO * r_outcome
+    Optionally adds a tiny bonus for werewolves who converge during night chat.
+    """
+    r_judge = float(sample.get("r_judge", 0.0))
+    r_consistency = float(sample.get("r_consistency", 0.0))
+    r_outcome = float(sample.get("r_outcome", 0.0))
+
+    R_total = (LJ * r_judge) + (LC * r_consistency) + (LO * r_outcome)
+
+    # Optional night convergence reward (wolves only)
+    if sample.get("phase") == "NIGHT_DISCUSS" and sample.get("role") == "Werewolf":
+        r_night_consensus = float(sample.get("night_consensus", 0.0))  # 0..1 external calc if logged
+        R_total += 0.05 * r_night_consensus
+
+    sample["reward_total"] = float(R_total)
+    return float(R_total)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SpeakerBandit trainer (policy gradient with EMA baseline + entropy bonus)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1200,6 +1262,20 @@ class _BanditLogger:
         with open(self.path, "a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=["epoch","loss","reward_mean","reward_std","entropy"])
             w.writerow({"epoch": epoch, "loss": round(loss,6), "reward_mean": round(r_mean,6), "reward_std": round(r_std,6), "entropy": round(ent,6)})
+
+def _kl_categorical(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+    """
+    KL(p||q) for categorical distributions with small epsilon for numerical stability.
+    p,q are probability vectors [B,C] or [C].
+    """
+    if p.dim() == 1:
+        p = p.unsqueeze(0)
+    if q.dim() == 1:
+        q = q.unsqueeze(0)
+    eps = 1e-8
+    p = p / p.sum(dim=-1, keepdim=True).clamp_min(eps)
+    q = q / q.sum(dim=-1, keepdim=True).clamp_min(eps)
+    return (p * (p.add(eps).log() - q.add(eps).log())).sum(dim=-1).mean()
 
 def train_speaker_bandit(
     dataset: List[UtteranceSample],
@@ -1248,26 +1324,50 @@ def train_speaker_bandit(
                     h = torch.tensor(h).float()
                 hist = h.to(DEVICE).view(1, -1)
 
-            # Speaker forward should return logits over templates
-            logits = speaker(z, role_bit=role_bit, hist_feats=hist)  # [1, T]
-            probs = torch.softmax(logits, dim=-1)
-            logprobs = torch.log_softmax(logits, dim=-1)
+            # Forward: support two-stage dict outputs with backward compatibility
+            out = speaker(z, role_bit=role_bit, hist_feats=hist)
+            if isinstance(out, dict):
+                cat_logits = out.get("cat_logits", None)
+                arg_logits = out.get("arg_logits", None)
+                if cat_logits is None:  # degenerate safety
+                    cat_logits = out[list(out.keys())[0]]
+            else:
+                cat_logits, arg_logits = out, None
+
+            cat_probs = torch.softmax(cat_logits, dim=-1)
+            cat_logprobs = torch.log_softmax(cat_logits, dim=-1)
 
             # pick the actually-used template_id as the "action"
             t_id = int(s.template_id)
-            if t_id < 0 or t_id >= probs.size(-1):
+            if t_id < 0 or t_id >= cat_probs.size(-1):
                 # Skip if speaker head doesn't match dataset template space
                 continue
 
-            lp = logprobs[0, t_id]
-            ent = -(probs * logprobs).sum()
+            lp_cat = cat_logprobs[0, t_id]
+            ent_cat = -(cat_probs * cat_logprobs).sum()
 
+            # reward
             R = _compute_reward(s)
             rewards_all.append(R)
-
-            # REINFORCE loss = -(R - b) * logpi + entropy bonus
             adv = R - baseline
-            loss = -(adv * lp) - (entropy_coef * ent)
+
+            # Base REINFORCE term on categories
+            loss = -(adv * lp_cat) - (entropy_coef * ent_cat)
+
+            # Optional auxiliary REINFORCE on argument/target choice if present
+            if (arg_logits is not None) and (s.arg_id is not None):
+                a_logits = arg_logits
+                a_logprobs = torch.log_softmax(a_logits, dim=-1)
+                a_id = int(s.arg_id)
+                if 0 <= a_id < a_logits.size(-1):
+                    lp_arg = a_logprobs[0, a_id]
+                    loss = loss - (SB_ARG_AUX_WEIGHT * adv * lp_arg)  # small aux
+
+            # Small KL(π_cat || p_intent) regularizer when p_intent present
+            if s.p_intent is not None and len(s.p_intent) == cat_probs.size(-1):
+                q = torch.tensor(s.p_intent, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+                kl = _kl_categorical(cat_probs.detach(), q)  # use current probs; don't backprop through q
+                loss = loss + SB_KL_TO_INTENT * kl
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -1278,7 +1378,7 @@ def train_speaker_bandit(
             baseline = baseline_ema * baseline + (1.0 - baseline_ema) * R
 
             total_loss += float(loss.item())
-            ent_acc += float(ent.item())
+            ent_acc += float(ent_cat.item())
 
         n = max(1, len(rewards_all))
         logger.log(ep, total_loss / n, float(np.mean(rewards_all)) if rewards_all else 0.0, float(np.std(rewards_all)) if rewards_all else 0.0, ent_acc / n)
@@ -1293,12 +1393,12 @@ class _BiasLogger:
         self.path = csv_path
         if not os.path.exists(self.path):
             with open(self.path, "w", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=["epoch","ce","reward_ce","entropy","kl"])
+                w = csv.DictWriter(f, fieldnames=["epoch","ce","reward_ce","entropy","kl","kl_intent"])
                 w.writeheader()
-    def log(self, epoch: int, ce: float, rce: float, ent: float, kl: float):
+    def log(self, epoch: int, ce: float, rce: float, ent: float, kl: float, kl_intent: float):
         with open(self.path, "a", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=["epoch","ce","reward_ce","entropy","kl"])
-            w.writerow({"epoch": epoch, "ce": round(ce,6), "reward_ce": round(rce,6), "entropy": round(ent,6), "kl": round(kl,6)})
+            w = csv.DictWriter(f, fieldnames=["epoch","ce","reward_ce","entropy","kl","kl_intent"])
+            w.writerow({"epoch": epoch, "ce": round(ce,6), "reward_ce": round(rce,6), "entropy": round(ent,6), "kl": round(kl,6), "kl_intent": round(kl_intent,6)})
 
 def _entropy_categorical(logits: torch.Tensor) -> torch.Tensor:
     lp = torch.log_softmax(logits, dim=-1)
@@ -1345,7 +1445,7 @@ def train_bias_head_on_intents(
 
     for ep in range(1, max(1, epochs) + 1):
         random.shuffle(rows)
-        ce_sum = rce_sum = ent_sum = kl_sum = 0.0
+        ce_sum = rce_sum = ent_sum = kl_sum = kl_intent_sum = 0.0
         n = 0
 
         for s in rows:
@@ -1366,11 +1466,10 @@ def train_bias_head_on_intents(
 
             # Reward-weighted soft target (encourage high-judge-score categories)
             with torch.no_grad():
-                # One-hot at the observed category scaled by positive reward
                 R = max(0.0, _compute_reward(s))
-                soft = torch.zeros_like(logits).softmax(-1)
-                soft[:] = 1.0 / logits.size(-1)
-                soft[0, target.item()] = min(1.0, 0.5 + 0.5 * R)  # push toward chosen cat if reward high
+                # start near-uniform, then bump observed category proportional to reward
+                soft = torch.full_like(logits, 1.0 / logits.size(-1))
+                soft[0, target.item()] = min(1.0, 0.5 + 0.5 * R)
                 soft = (soft / soft.sum(dim=-1, keepdim=True)).detach()
 
             logp = torch.log_softmax(logits, dim=-1)
@@ -1378,9 +1477,16 @@ def train_bias_head_on_intents(
 
             # regularizers
             H = _entropy_categorical(logits)
-            KL = _kl_to_uniform(logits)
+            KL_u = _kl_to_uniform(logits)
 
-            loss = L_ce + L_rce + (-ent_reg * H) + (kl_reg * KL)
+            # KL(p_bias || p_intent) when p_intent provided
+            KL_intent = torch.tensor(0.0, device=DEVICE)
+            if s.p_intent is not None and len(s.p_intent) == logits.size(-1):
+                p_bias = torch.softmax(logits, dim=-1)
+                q = torch.tensor(s.p_intent, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+                KL_intent = _kl_categorical(p_bias, q)
+
+            loss = L_ce + L_rce + (-ent_reg * H) + (kl_reg * KL_u) + (BH_KL_TO_INTENT * KL_intent)
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -1390,12 +1496,13 @@ def train_bias_head_on_intents(
             ce_sum  += float(L_ce.item())
             rce_sum += float(L_rce.item())
             ent_sum += float(H.item())
-            kl_sum  += float(KL.item())
+            kl_sum  += float(KL_u.item())
+            kl_intent_sum += float(KL_intent.item())
             n += 1
 
         n = max(1, n)
-        logger.log(ep, ce_sum/n, rce_sum/n, ent_sum/n, kl_sum/n)
-        print(f"[BiasHead] epoch={ep} CE={ce_sum/n:.4f} RCE={rce_sum/n:.4f} H={ent_sum/n:.3f} KL={kl_sum/n:.3f}")
+        logger.log(ep, ce_sum/n, rce_sum/n, ent_sum/n, kl_sum/n, kl_intent_sum/n)
+        print(f"[BiasHead] epoch={ep} CE={ce_sum/n:.4f} RCE={rce_sum/n:.4f} H={ent_sum/n:.3f} KL_U={kl_sum/n:.3f} KL_I={kl_intent_sum/n:.3f}")
 
 # =============================================================================
 # Mouthpiece checkpoint I/O

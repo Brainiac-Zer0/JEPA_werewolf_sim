@@ -9,6 +9,25 @@ from functools import lru_cache
 from typing import List, Tuple, Optional, Dict
 import yaml
 
+__all__ = [
+    # dims/constants/helpers
+    "INPUT_DIM", "LATENT_DIM", "ACTION_DIM", "NUM_ACTIONS", "NUM_AGENTS",
+    "TALK_CATEGORIES", "NUM_TALK_CATS", "PHASES", "NUM_PHASES",
+    "phase_onehot",
+    # encoders / models
+    "MessageEncoder", "DialogContextEncoder", "SocialInfluence",
+    "social_delta_from_dialog",
+    "MLPBeliefEncoder", "ActionEncoder", "WorldModelMLP",
+    # heads/containers
+    "PlannerHead", "TalkHead", "VoteHead", "KillHead",
+    "FactorizedPlanner", "PlannerHeads",
+    # action embedding (and back-compat)
+    "PhaseAwareActionEmbedder", "PhaseActionEncoder",
+    # regularizers & feature packers
+    "talk_entropy_loss", "talk_kl_to_uniform",
+    "package_features", "package_features_with_meta",
+]
+
 # ───────────────────────────────────────────────────────────────────────────────
 # Config & constants
 # ───────────────────────────────────────────────────────────────────────────────
@@ -326,6 +345,8 @@ class PlannerHead(nn.Module):
         )
 
     def forward(self, z):
+        if z.dim() == 1:
+            z = z.unsqueeze(0)
         return self.net(z)
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -363,7 +384,7 @@ def illegal_softmax_mass(logits: torch.Tensor, legal_mask: torch.Tensor | None) 
 # Phase-aware heads (factorized)
 # ───────────────────────────────────────────────────────────────────────────────
 class TalkHead(nn.Module):
-    """Logits over talk categories (NUM_TALK_CATS)."""
+    """Logits over talk categories (NUM_TALK_CATS). Always returns (B, C)."""
     def __init__(self, latent_dim: int, num_cats: int = NUM_TALK_CATS):
         super().__init__()
         self.net = nn.Sequential(
@@ -380,11 +401,13 @@ class TalkHead(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def forward(self, z: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-        logits = self.net(z)
-        return mask_logits(logits, mask)
+        if z.dim() == 1:
+            z = z.unsqueeze(0)                 # ensure (B, D)
+        logits = self.net(z)                    # (B, C)
+        return mask_logits(logits, mask)        # (B, C) w/ mask broadcast
 
 class VoteHead(nn.Module):
-    """Logits over agent indices (mask self/dead outside before softmax)."""
+    """Logits over agent indices (mask self/dead outside before softmax). Always (B, A)."""
     def __init__(self, latent_dim: int, num_agents: int = NUM_AGENTS):
         super().__init__()
         self.net = nn.Sequential(
@@ -401,8 +424,10 @@ class VoteHead(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def forward(self, z: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-        logits = self.net(z)
-        return mask_logits(logits, mask)
+        if z.dim() == 1:
+            z = z.unsqueeze(0)                 # ensure (B, D)
+        logits = self.net(z)                    # (B, A)
+        return mask_logits(logits, mask)        # mask compat with training_utils.py
 
 class KillHead(VoteHead):
     """Identical shape to VoteHead; semantics differ (wolves only)."""
@@ -442,6 +467,8 @@ class FactorizedPlanner(nn.Module):
         vote_mask: torch.Tensor | None = None,
         kill_mask: torch.Tensor | None = None,
     ) -> dict:
+        if z.dim() == 1:
+            z = z.unsqueeze(0)  # (B,D) for consistent downstream shapes
         t_logits = self._apply_temp(self.talk(z))
         v_logits = self._apply_temp(self.vote(z))
         k_logits = self._apply_temp(self.kill(z))
@@ -455,7 +482,7 @@ class FactorizedPlanner(nn.Module):
 class PlannerHeads(nn.Module):
     """
     Talk/Vote + Kill (shared or independent coalition).
-    .forward(...) returns dict of masked logits: {'talk', 'vote', 'kill'}.
+    .forward(...) returns dict of masked logits: {'talk', 'vote', 'kill'} with (B,·) shapes.
     """
     def __init__(
         self,
@@ -503,8 +530,10 @@ class PlannerHeads(nn.Module):
         kill_mask: torch.Tensor | None = None,
         wolf_key: str | None = None,   # required if coalition_mode='independent'
     ) -> dict[str, torch.Tensor]:
-        t = self._apply_temp(self.talk(z))
-        v = self._apply_temp(self.vote(z))
+        if z.dim() == 1:
+            z = z.unsqueeze(0)
+        t = self._apply_temp(self.talk(z))     # (B,C)
+        v = self._apply_temp(self.vote(z))     # (B,A)
         t = mask_logits(t, talk_mask)
         v = mask_logits(v, vote_mask)
 
@@ -516,7 +545,7 @@ class PlannerHeads(nn.Module):
             self.ensure_wolf_head(wolf_key)
             k_raw = self._apply_temp(self.kill_independent[wolf_key](z))
 
-        k = mask_logits(k_raw, kill_mask)
+        k = mask_logits(k_raw, kill_mask)      # (B,A)
         return {"talk": t, "vote": v, "kill": k}
 
     @classmethod

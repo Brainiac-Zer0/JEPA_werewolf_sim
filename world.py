@@ -1,6 +1,7 @@
 from __future__ import annotations
 from collections import Counter
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Iterable, Any
+import math, random
 
 from roles import WEREWOLF  # canonical role name from roles/config
 
@@ -18,6 +19,122 @@ def _wolves_living(agents):
 
 def _non_wolves_living(agents):
     return [a for a in _living_agents(agents) if getattr(a, "role", None) != WEREWOLF]
+
+
+# -------------------------- night consensus helper ---------------------------
+
+def _normalize_tally(
+    tally: Dict[str, float] | Iterable[Tuple[str, float]] | Iterable[Any]
+) -> List[Tuple[str, float]]:
+    """
+    Accepts:
+      - dict  {name: count}
+      - list  [(name, count), ...]
+      - list  [name, name, ...]  (will count occurrences)
+    Returns a list of (name, count) with counts >= 0, sorted by name ASC for stability.
+    """
+    if tally is None:
+        return []
+    if isinstance(tally, dict):
+        items = [(str(k), float(v)) for k, v in tally.items()]
+    else:
+        # try sequence of pairs; if it's a flat list of names, count them
+        try:
+            first = next(iter(tally))  # type: ignore
+        except StopIteration:
+            return []
+        except TypeError:
+            # non-iterable
+            return []
+
+        # Rebuild iterator (since we consumed one element if it was iterable)
+        if isinstance(tally, list) or isinstance(tally, tuple):
+            seq = tally
+        else:
+            seq = list(tally)  # type: ignore
+
+        if seq and isinstance(seq[0], (list, tuple)) and len(seq[0]) >= 2:
+            items = [(str(a), float(b)) for (a, b, *_) in seq]  # tolerate extra columns
+        else:
+            c = Counter(str(x) for x in seq)
+            items = [(k, float(v)) for k, v in c.items()]
+
+    # sanitize & sort stable
+    cleaned = [(name, max(0.0, float(cnt))) for name, cnt in items if isinstance(name, str)]
+    cleaned.sort(key=lambda kv: kv[0])
+    return cleaned
+
+def consensus_target(
+    tally: Dict[str, float] | Iterable[Tuple[str, float]] | Iterable[Any],
+    *,
+    temperature: float = 1.0,
+    rng: Optional[random.Random] = None,
+) -> Optional[str]:
+    """
+    Pick a consensus victim from wolf night-discussion tallies.
+
+    Rule:
+      1) If a strict majority exists (> 50% of total mass), return that target deterministically.
+      2) Otherwise, draw from a softmax over counts (temperature-scaled):
+            p_i ∝ exp((count_i / max_count) / temperature)
+         If no RNG provided, uses a local deterministic RNG (seed=0).
+
+    Args:
+      tally: dict {name: count} OR list of (name, count) OR list of names (will be counted)
+      temperature: >0 => smoother; →0 approaches argmax; <=0 treated as argmax
+      rng: optional random.Random for reproducible sampling
+
+    Returns:
+      target name (str) or None if no candidates.
+    """
+    items = _normalize_tally(tally)
+    if not items:
+        return None
+
+    total = sum(v for _, v in items)
+    if total <= 0.0:
+        # all zeros → fall back to alphabetical first for stability
+        return items[0][0]
+
+    # majority check
+    # use deterministic order for tie-breaking (items sorted by name asc)
+    items_by_count = sorted(items, key=lambda kv: (-kv[1], kv[0]))
+    top_name, top_count = items_by_count[0]
+    if top_count > (0.5 * total):
+        return top_name
+
+    # softmax fallback
+    if temperature <= 0.0:
+        # deterministic argmax with name-asc tie-break
+        return top_name
+
+    max_c = max(v for _, v in items)
+    if max_c <= 0.0:
+        return items[0][0]
+
+    # compute probabilities in a numerically stable way
+    scaled = []
+    for _, v in items:
+        # normalize counts by max to keep exponents tame
+        scaled.append((v / max_c) / max(1e-6, temperature))
+
+    m = max(scaled)
+    exps = [math.exp(x - m) for x in scaled]
+    Z = sum(exps)
+    if Z <= 0.0 or not math.isfinite(Z):
+        return top_name
+
+    probs = [e / Z for e in exps]
+
+    # deterministic by default unless rng is provided by caller
+    r = rng if rng is not None else random.Random(0)
+    u = r.random()
+    acc = 0.0
+    for (name, _), p in zip(items, probs):
+        acc += p
+        if u <= acc + 1e-12:
+            return name
+    return items[-1][0]  # numeric edge case
 
 
 # -------------------------- voting (deterministic) ---------------------------
