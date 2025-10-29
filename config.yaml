@@ -10,7 +10,7 @@ INPUT_DIM: 811
 LATENT_DIM: 32
 ACTION_DIM: 8
 NUM_ACTIONS: 6
-JUDGE_MODEL_ID: microsoft/Phi-3-mini-4k-instruct   # unify with judge.model_id below
+JUDGE_MODEL_ID: microsoft/Phi-3-mini-4k-instruct # unify with judge.model_id below
 JUDGE_MAX_NEW: 128
 INCLUDE_RATIONALE: true
 ENABLE_PERSONA_STEER: false
@@ -19,23 +19,19 @@ PERSONA_CONFIG_PATH: configs/persona_vectors.yaml
 JUDGE_DEBUG_DIR: logs
 JUDGE_DEVICE: auto
 JUDGE_BATCH: 4
-LLM_MODEL_ID: meta-llama/Llama-3.1-70B-Instruct   # unify with llm.model_id below
+LLM_MODEL_ID: meta-llama/Llama-3.1-70B-Instruct # unify with llm.model_id below
 LLM_SPEAKER: true
 LLM_DEVICE: ''
 WEREWOLF: Werewolf
 VILLAGER: Worker
-
 ROLE_PRIORS:
   WEREWOLF: ones
   VILLAGER: zeros
-
 PERSONA_SCALE: 0.2
 PERSONA_SEED: null
 RUN_SEED: 1337
-
 WORLD_INPUT_MODE: z_plus_action
 ACTION_EMBED_KIND: onehot
-
 SCREEN_W: 1200
 SCREEN_H: 600
 FPS: 1
@@ -43,21 +39,17 @@ AGENT_R: 30
 MSG_LOG_LIMIT: 12
 MSG_BOX_W: 360
 MSG_BOX_X: 840
-
 RUBRIC_PATH: judge_rubric.yaml
 PLANNER_TOPK: 3
-
 BIAS_CAP: 2.0
 BASE_STRENGTH: 1.0
 DEBUG: false
-
 DEFAULT_LEXICON:
   accuse: [accuse, suspicious, suspect, lying, deceive, eliminate, vote]
   defend: [defend, innocent, trust, ally, support, clear]
   hedge: [maybe, perhaps, uncertain, unsure, might, seems, appears]
   question: [why, how, what, who, where, when, '?']
   vote: [vote, eliminate, banish, target, lynch]
-
 CAT_ORDER: [accuse, defend, hedge, question, vote]
 ENTROPY_ATTENUATION: 0.5
 PER_CAT_SCALES:
@@ -66,14 +58,12 @@ PER_CAT_SCALES:
 EXTRA_LEXICON: {}
 STRICT_LEXICON: false
 TALK_FUSION_ALPHA: 0.5
-
 DEFAULT_TEMPLATES:
   - Accuse {target}
   - Defend {ally}
   - Ask {target} a question
   - Express uncertainty
   - Propose vote on {target}
-
 N_GAMES: 50
 CHECKPOINT_DIR: checkpoints
 JUDGE_RUBRIC_PATH: judge_rubric.yaml
@@ -95,6 +85,14 @@ LR_SCHEDULER: none
 SAVE_OPTIM: false
 DEBUG_MASKS: false
 STRATIFY_PHASE_BATCHES: true
+
+# === New top-level social defaults (wired) ===
+social:
+  enabled: true
+  scale: 0.05           # step size λ_social
+  window: 1             # neighbor history window (if used)
+  lambda_reg: 1.0e-3    # optional JEPA regularizer weight
+  trust: none           # none | cosine | role_affinity
 
 seed: 1337
 
@@ -124,26 +122,28 @@ sim:
   social:
     enabled: true
     hidden: 64
-    scale: 1.0
-    window: 6
+    scale: 0.05        # ← wired to top-level default
+    window: 1          # ← wired to top-level default
     K: 6
     apply_between: discuss_vote
+    trust: none        # ← wired to top-level default
   env_aliases:
     SOC_ENABLED: true
-    SOC_SCALE: 1.0
+    SOC_SCALE: 0.05    # ← wired to top-level default
     SOC_K: 6
   night_chat:
     enabled: true
     turns: 2
     judge_on: true
-    delta_social_scale: 1.0
-    ui_preview: false
-    intent_target: top1
-    talk_mask_all: true
-    use_bias_fusion: true
+  delta_social_scale: 1.0
+  ui_preview: false
+  intent_target: top1
+  talk_mask_all: true
+  use_bias_fusion: true
   talk_fusion_alpha: 0.5
-  phases:
-    night_enabled: true
+
+phases:
+  night_enabled: true
 
 model:
   input_dim: 811
@@ -162,13 +162,14 @@ model:
       mask_self: true
       mask_dead: true
       kill_wolves_only: true
-    coalitions:
-      compare: false
-      shared_kill: true
-    hidden: 64
+
+coalitions:
+  compare: false
+  shared_kill: true
+  hidden: 64
 
 judge:
-  model_id: microsoft/Phi-3-mini-4k-instruct   # unified with top-level JUDGE_MODEL_ID
+  model_id: microsoft/Phi-3-mini-4k-instruct # unified with top-level JUDGE_MODEL_ID
   device: auto
   batch: 4
   max_new: 128
@@ -181,7 +182,7 @@ judge:
   talk_vote_alignment: true
 
 llm:
-  model_id: meta-llama/Llama-3.1-70B-Instruct  # unified with top-level LLM_MODEL_ID
+  model_id: meta-llama/Llama-3.1-70B-Instruct # unified with top-level LLM_MODEL_ID
   device: auto
   dtype: auto
   load_in_8bit: true
@@ -231,18 +232,17 @@ llm:
   hygiene:
     trim_quotes: true
     strip_role_words: true
-
-encoders:
-  context:
-    window: 6
-    decay: 0.85
-    self_gate: 1.15
-    other_gate: 1.0
-    add_role_bit: true
-    l2_norm: true
-  text:
-    l2_norm: true
-    cache_size: 8192
+  encoders:
+    context:
+      window: 6
+      decay: 0.85
+      self_gate: 1.15
+      other_gate: 1.0
+      add_role_bit: true
+      l2_norm: true
+    text:
+      l2_norm: true
+      cache_size: 8192
   regularization:
     talk_entropy_w: 0.0
     talk_kl_uniform_w: 0.0
@@ -258,22 +258,25 @@ speaker:
   lambda_j: 1.0
   lambda_c: 0.25
   lambda_o: 0.2
-  bias_head:
-    latent_dim: 32
-    lr: 0.0005
-    epochs: 1
-    strength_cap: 2.0
-    cat_order: [accuse, defend, hedge, question, vote]
-    regularizer_lambda: 0.0
-  exploration:
-    epsilon: 0.05
-    ucb_c: 1.414
-  templates:
-    - Accuse {target}
-    - Defend {ally}
-    - Ask {target} a question
-    - Express uncertainty
-    - Propose vote on {target}
+
+bias_head:
+  latent_dim: 32
+  lr: 0.0005
+  epochs: 1
+  strength_cap: 2.0
+  cat_order: [accuse, defend, hedge, question, vote]
+  regularizer_lambda: 0.0
+
+exploration:
+  epsilon: 0.05
+  ucb_c: 1.414
+
+templates:
+  - Accuse {target}
+  - Defend {ally}
+  - Ask {target} a question
+  - Express uncertainty
+  - Propose vote on {target}
 
 persona:
   scale: 0.2
@@ -357,7 +360,6 @@ MOUTHPIECE_REWARD_WEIGHTS:
   truthfulness_villager: 0.15
   deception_wolf: 0.3
   talk_vote_alignment: 0.1
-
 REWARD_USE_ROLE_ALIGNMENT: false
 
 MOUTHPIECE_TRAINING:

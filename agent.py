@@ -27,6 +27,9 @@ from encoders import (
 # NEW: unified mouthpiece (LLM router + bandit)
 from speaker import SpeakerPolicy, DEFAULT_TEMPLATES
 
+# NEW: social influence module (Stage A)
+from social import SocialInfluence
+
 # Load config once
 with open("config.yaml", "r") as f:
     config = yaml.safe_load(f) or {}
@@ -68,6 +71,16 @@ SPEAKER_BIAS_SCALE = _env_float("SPEAKER_BIAS_SCALE", float(config.get("SPEAKER_
 # Phase-5 knobs
 BIAS_LR            = _env_float("BIAS_LR", float(config.get("BIAS_LR", 1e-3)))
 FUSION_ALPHA_DEF   = _env_float("TALK_FUSION_ALPHA", float(config.get("sim", {}).get("talk_fusion_alpha", 0.5)))
+
+# --- Social influence knobs (Stage A) ---
+SOCIAL_ENABLED     = _env_bool("SOCIAL_ENABLED", bool(config.get("social", {}).get("enabled", False)))
+SOCIAL_SCALE       = _env_float("SOCIAL_SCALE",  float(config.get("social", {}).get("scale", 0.05)))
+SOCIAL_LAMBDA_REG  = _env_float("SOCIAL_LAMBDA_REG", float(config.get("social", {}).get("lambda_reg", 1e-3)))
+SOCIAL_TRUST_MODE  = str(config.get("social", {}).get("trust", "none")).lower()
+SOCIAL_TAU         = _env_float("SOCIAL_TAU", float(config.get("social", {}).get("tau", 0.5)))
+SOCIAL_MAX_STEP    = _env_float("SOCIAL_MAX_STEP", float(config.get("social", {}).get("max_step", 0.25)))
+# Optional external multiplier λ_social (applied on top of the module’s internal scale)
+SOCIAL_LAMBDA_EXT  = _env_float("SOCIAL_LAMBDA_EXT", float(config.get("social", {}).get("lambda_ext", 1.0)))
 
 # Phases
 PHASES = {"DISCUSS": 0, "VOTE": 1, "NIGHT": 2}
@@ -173,6 +186,22 @@ class BaseAgent:
 
         # NEW: soft prefix / named-target hint (consumed once by speak())
         self.named_target_hint: Optional[str] = None
+
+        # --- Social Influence (Stage A) ---
+        self.social_enabled: bool = bool(SOCIAL_ENABLED)
+        self.social_lambda_ext: float = float(SOCIAL_LAMBDA_EXT)  # external λ_social multiplier
+        self.last_delta_social_norm: float = 0.0  # telemetry
+
+        # Instantiate influence model; safe even if disabled
+        self.social: Optional[SocialInfluence] = SocialInfluence(
+            latent_dim=LATENT_DIM,
+            scale=SOCIAL_SCALE,
+            hidden=64,
+            reg_lambda=SOCIAL_LAMBDA_REG,
+            trust_mode=SOCIAL_TRUST_MODE,
+            tau=SOCIAL_TAU,
+            max_step=SOCIAL_MAX_STEP,
+        )
 
     # ───────────────────────── pack/role helpers ─────────────────────────
     def set_role(self, role: str) -> None:
@@ -576,6 +605,84 @@ class BaseAgent:
 
         return z
 
+    # ───────────────────────── Social influence update (Stage A) ─────────────────────────
+    @torch.no_grad()
+    def compute_social_update(
+        self,
+        z_self: torch.Tensor,
+        neighbors: List["BaseAgent"],
+    ) -> Optional[torch.Tensor]:
+        """
+        Stage A:
+          1) gather neighbors' most recent latents,
+          2) δ_social = self.social(z_self, z_neighbors),
+          3) z' = z_self + λ_social · δ_social,
+          4) store self.last_delta_social_norm for telemetry.
+
+        Returns z' if applied, else None (disabled or no usable neighbors).
+        """
+        # Disabled or module missing
+        if not self.social_enabled or self.social is None:
+            self.last_delta_social_norm = 0.0
+            if TELEMETRY_ENABLED:
+                self.telemetry["social_skipped"] = True
+            return None
+
+        # Collect neighbor latents (latest)
+        z_neighbors: List[torch.Tensor] = []
+        neighbor_roles: List[Optional[str]] = []
+        for a in neighbors or []:
+            if not getattr(a, "alive", False):
+                continue
+            if a.name == self.name:
+                continue
+            hist = getattr(a, "latent_history", None)
+            if hist:
+                try:
+                    z_neighbors.append(hist[-1].detach())
+                    neighbor_roles.append(getattr(a, "role", None))
+                except Exception:
+                    continue
+
+        if not z_neighbors:
+            self.last_delta_social_norm = 0.0
+            if TELEMETRY_ENABLED:
+                self.telemetry["social_no_neighbors"] = True
+            return None
+
+        # Influence step is explicitly inference-time: no grads
+        delta, info = self.social(
+            z_self=z_self.detach(),
+            z_neighbors=z_neighbors,
+            self_role=self.role,
+            neighbor_roles=neighbor_roles,
+        )
+
+        z_updated = z_self + float(self.social_lambda_ext) * delta
+
+        # Telemetry
+        self.last_delta_social_norm = float(delta.norm().item()) * float(self.social_lambda_ext)
+        if TELEMETRY_ENABLED:
+            self.telemetry.update({
+                "delta_social_norm": float(self.last_delta_social_norm),
+                "social_n_neighbors": int(info.get("n_neighbors", len(z_neighbors))),
+                "social_trust_mode": info.get("trust_mode", "none"),
+                "social_scale_internal": float(info.get("scale", 0.0)),
+                "social_lambda_ext": float(self.social_lambda_ext),
+                "social_w_entropy": float(info.get("w_entropy", 0.0)),
+                "social_mean_cosine_to_mu": float(info.get("mean_cosine_to_mu", 0.0)),
+            })
+
+        # Back-compat: if a pipeline expects in-place update (self.z_t), honor it
+        try:
+            # Some older paths store a "current latent" on the agent;
+            # update it here without breaking newer return-value users.
+            self.z_t = z_updated.detach()
+        except Exception:
+            pass
+
+        return z_updated
+
     # ───────────────────────── Rollout aux snapshot ─────────────────────────
     def make_aux(self, agents: List["BaseAgent"]) -> Dict:
         alive = [bool(a.alive) for a in agents]
@@ -607,7 +714,7 @@ class BaseAgent:
           - natural, in-scenario dialogue via LLM route (with hygiene & bias)
           - stable fallback via Bandit templates
         Always logs a training record into msg_buffer for Judge/REINFORCE + bias-head.
-        Adds: soft prefix steer from a one-shot named_target_hint, then clears it.
+        Adds: soft prefix steer from a one-shot named-target_hint, then clears it.
         """
         z = self.encode_current_belief(round_num, agents)
         self._update_persona_norm_if_present()

@@ -31,6 +31,10 @@
 #   * Private NIGHT_DISCUSS loop among wolves; compute night_consensus and record per message
 #   * Use consensus target as fallback for night_kill if needed
 #   * Ensure aux bundles recent_texts and neighbor_texts for training masks / language coupling
+# - NEW (Stage A social): After DAY_DISCUSS, apply per-agent latent social coupling:
+#   * Gather neighbor latents, call agent.compute_social_update(...)
+#   * Track ||δ_social|| per agent, mean/var across agents, and z-variance pre/post
+#   * Expose per-day stats in meta["social_stats"]
 # -----------------------------------------------------------------------------
 
 import sys
@@ -59,12 +63,11 @@ except Exception:
 
 from world import resolve_votes, eliminate_player
 from training_utils import load_role_models
-# NEW: bring in SocialInfluence (falls back cleanly if not present yet)
+# Keep MessageEncoder import; SocialInfluence no longer used here (agent owns it)
 try:
-    from encoders import MessageEncoder, SocialInfluence  # shared instance + social coupling
-except Exception:
     from encoders import MessageEncoder
-    SocialInfluence = None  # will skip δ_social if encoders.py not patched yet
+except Exception:
+    raise
 
 # Judge imports
 from judge import JudgeRubric, score_batch
@@ -157,15 +160,6 @@ HYGIENE_NS = SimpleNamespace(
     force_question_prob=float(HCFG.get("force_question_prob", 0.25)),
 )
 
-# NEW: social influence knobs
-_SOC_SECTION = SIM_CFG.get("social", None)
-if not isinstance(_SOC_SECTION, dict):
-    _SOC_SECTION = CFG.get("social_influence", {}) if isinstance(CFG.get("social_influence"), dict) else {}
-SOC_CFG = _SOC_SECTION
-SOC_ENABLED: bool = bool(SOC_CFG.get("enabled", True))
-SOC_K: int = int(SOC_CFG.get("K", 6))
-SOC_SCALE: float = float(SOC_CFG.get("scale", 1.0))
-
 # ── ENV OVERRIDES (job script shims)
 def _env_bool(name: str, default: bool) -> bool:
     v = os.getenv(name, None)
@@ -196,11 +190,6 @@ PLANNER_TOPK   = _env_int("PLANNER_TOPK", PLANNER_TOPK)
 VOTE_MIX_ALPHA = _env_float("VOTE_MIX_ALPHA", VOTE_MIX_ALPHA)
 LOG_DZ_TALK    = _env_bool("LOG_DZ_TALK", LOG_DZ_TALK)
 LOG_DZ_KILL    = _env_bool("LOG_DZ_KILL", LOG_DZ_KILL)
-
-# Social overrides
-SOC_ENABLED = _env_bool("SOC_ENABLED", SOC_ENABLED)
-SOC_K       = _env_int("SOC_K", SOC_K)
-SOC_SCALE   = _env_float("SOC_SCALE", SOC_SCALE)
 
 # ── runtime globals (populated iff visual=True)
 screen = font = font_s = clock = None
@@ -564,14 +553,6 @@ def simulate_game(visual: bool = True):
     for ag in agents:
         ag.message_encoder = shared_msg_encoder
 
-    # Social influence
-    social = None
-    if SocialInfluence is not None and hasattr(shared_msg_encoder, "output_dim"):
-        try:
-            social = SocialInfluence(text_dim=shared_msg_encoder.output_dim)
-        except Exception:
-            social = None
-
     # Attach JEPA sub-modules
     for ag in agents:
         wm, ae, planner = load_role_models(ag.role)
@@ -604,6 +585,7 @@ def simulate_game(visual: bool = True):
     metrics_rows: list[dict] = []
     phase_log: list[dict] = []
     mask_logs: list[dict] = []
+    social_stats_log: list[dict] = []  # NEW: per-day social telemetry
 
     # ───── main day/night loop ─────
     while True:
@@ -671,13 +653,12 @@ def simulate_game(visual: bool = True):
                             debug_emit_prob=LLM_DEBUG_P,
                         )
                         if dbg is not None:
-                            # Required for P5I detector
                             print(f"[LLM-SPK] {json.dumps(dbg)}", flush=True)
                         if text_routed is not None:
                             text = text_routed
                             used_router = True
                             dbg_obj = dbg
-                except Exception as _e:
+                except Exception:
                     used_router = False
                     text = None
                     dbg_obj = None
@@ -813,23 +794,69 @@ def simulate_game(visual: bool = True):
                 except Exception:
                     pass
 
-        # PRE-ACT: z_t cache, social coupling, judge vote, etc.
+        # ───────────────────────────
+        # NEW: Stage A Social Coupling (after DAY_DISCUSS)
+        # For each living agent:
+        #   - gather neighbor latents (last z from others)
+        #   - call agent.compute_social_update(z_self, neighbors)
+        #   - record ||δ_social|| per agent
+        #   - compute cross-agent z variance pre and post
+        #   - store stats in social_stats_log (returned in meta["social_stats"])
+        # ───────────────────────────
+        living = [a for a in agents if a.alive]
+        # Pre-social z map and variance across agents
+        z_pre_map: Dict[str, torch.Tensor] = {}
+        for ag in living:
+            z_pre_map[ag.name] = ag.encode_current_belief(round_num, agents).detach()
+        if z_pre_map:
+            Zpre = torch.stack([z for z in z_pre_map.values()], dim=0)  # (N, D)
+            pre_var = float(Zpre.var(dim=0, unbiased=False).mean().item())
+        else:
+            pre_var = 0.0
+
+        # Apply per-agent social updates
+        per_agent_stats: List[dict] = []
+        z_post_map: Dict[str, torch.Tensor] = {}
+        for ag in living:
+            z_self = z_pre_map[ag.name]
+            neighbors = [n for n in living if n.name != ag.name]  # neighbor agents
+            z_updated = ag.compute_social_update(z_self, neighbors)
+            if z_updated is not None and torch.isfinite(z_updated).all():
+                z_post_map[ag.name] = z_updated.detach()
+            else:
+                z_post_map[ag.name] = z_self  # unchanged if disabled/failed
+            per_agent_stats.append({
+                "agent": ag.name,
+                "role": ag.role,
+                "delta_norm": float(getattr(ag, "last_delta_social_norm", 0.0)),
+            })
+
+        # Aggregate statistics
+        if z_post_map:
+            Zpost = torch.stack([z for z in z_post_map.values()], dim=0)
+            post_var = float(Zpost.var(dim=0, unbiased=False).mean().item())
+        else:
+            post_var = pre_var
+
+        deltas = [s["delta_norm"] for s in per_agent_stats] or [0.0]
+        social_stats_log.append({
+            "round": round_num,
+            "per_agent": per_agent_stats,
+            "mean_delta": float(np.mean(deltas)),
+            "var_delta": float(np.var(deltas)),
+            "pre_variance": pre_var,
+            "post_variance": post_var,
+            "variance_drop": float(pre_var - post_var),
+            "applied_count": int(sum(1 for s in per_agent_stats if s["delta_norm"] > 0.0)),
+            "num_agents": len(per_agent_stats),
+        })
+
+        # Build z_map for subsequent phases based on post-social z
+        z_map: Dict[BaseAgent, torch.Tensor] = {ag: z_post_map.get(ag.name, z_pre_map[ag.name]) for ag in living}
+
+        # PRE-ACT: judge vote etc. (uses z_map that already includes social effect)
         pending: Dict[str, Tuple[torch.Tensor, int, torch.Tensor, str, str, dict]] = {}
         vote_map: Dict[BaseAgent, BaseAgent] = {}
-
-        z_map: Dict[BaseAgent, torch.Tensor] = {ag: ag.encode_current_belief(round_num, agents) for ag in living}
-
-        if social is not None and SOC_ENABLED:
-            for ag in living:
-                neighbors = [(n, m) for (n, m) in list(ag.message_memory)[-SOC_K:]
-                             if n != ag.name and m and m.strip()]
-                if not neighbors:
-                    continue
-                texts = [m for (_n, m) in neighbors]
-                with torch.no_grad():
-                    t_embed = shared_msg_encoder(texts).mean(dim=0)
-                    delta = social(t_embed) * SOC_SCALE
-                    z_map[ag] = (z_map[ag] + delta).detach()
 
         for ag in living:
             z_t = z_map[ag]
@@ -896,7 +923,6 @@ def simulate_game(visual: bool = True):
             )
 
             if getattr(ag, "msg_buffer", None):
-                # align_tv recorded on TALK row; we keep it here too for convenience
                 ag.msg_buffer[-1]["alignment_vote"] = float(align_tv)
 
             subs = best_j.get("subscores", {})
@@ -1005,7 +1031,6 @@ def simulate_game(visual: bool = True):
                     # 4) Private buffer to wolves only; annotate message row
                     for w2 in wolves:
                         w2.buffer_message(wolf.name, text)
-                    # NEW: print private night chat lines to stdout (prefixed)
                     try:
                         print(f"[NightChat] {wolf.name}: {text}", flush=True)
                     except Exception:
@@ -1028,7 +1053,7 @@ def simulate_game(visual: bool = True):
                     utter_judge = None
                     if NCHAT_JUDGE:
                         try:
-                            wolf_only = [(n, m) for (n, m) in list(wolf.message_memory)[-SOC_K:] if any(w.name == n for w in wolves)]
+                            wolf_only = [(n, m) for (n, m) in list(wolf.message_memory)[-6:] if any(w.name == n for w in wolves)]
                             ctx_block = "\n".join(f"- {n}: {m.strip()}" for (n, m) in wolf_only[-3:]) or "- (no wolf chat yet)"
                             j_items = [{"context": ctx_block, "role": wolf.role or "Unknown", "candidate": text}]
                             j_res = score_batch(j_items, judge_rubric, run_id=run_id, round_num=round_num, phase="NIGHT_DISCUSS", agent=wolf.name)[0]
@@ -1067,18 +1092,6 @@ def simulate_game(visual: bool = True):
                 if getattr(wolf, "msg_buffer", None) and wolf.msg_buffer:
                     wolf.msg_buffer[-1]["night_consensus"] = consensus_frac
                     wolf.msg_buffer[-1]["consensus_target"] = consensus_target
-
-            # 8) After chat, apply δ_social_night to wolves before KillHead
-            if SocialInfluence is not None and SOC_ENABLED and NCHAT_DSOC > 0.0:
-                for wolf in wolves:
-                    neighbors = [(n, m) for (n, m) in list(wolf.message_memory)[-SOC_K:] if any(w.name == n for w in wolves) and m and m.strip()]
-                    if not neighbors:
-                        continue
-                    texts = [m for (_n, m) in neighbors]
-                    with torch.no_grad():
-                        t_embed = shared_msg_encoder(texts).mean(dim=0)  # (D_text,)
-                        delta = social(t_embed) * float(NCHAT_DSOC)      # (LATENT_DIM,)
-                        z_map[wolf] = (z_map.get(wolf, wolf.encode_current_belief(round_num, agents)) + delta).detach()
         else:
             consensus_target = None
             consensus_frac = 0.0
@@ -1126,22 +1139,6 @@ def simulate_game(visual: bool = True):
                             )
                 except Exception:
                     victim = None
-
-            # Fallback: use night consensus target if available/valid
-            if victim is None and consensus_target and consensus_target in legal_targets:
-                victim = next((a for a in agents if a.name == consensus_target and a.alive), None)
-                if victim is not None:
-                    z_t_w = z_map.get(wolf, wolf.encode_current_belief(round_num, agents)).detach()
-                    aux_snap = _aux_with_texts(wolf, agents)
-                    _check_aux(aux_snap, round_num=round_num, agent=wolf.name)
-                    pending[wolf.name] = (
-                        z_t_w,
-                        2,
-                        torch.tensor(int(victim.name.split("_")[1])),
-                        wolf.role or "Unknown",
-                        "KILL_TARGET",
-                        aux_snap,
-                    )
 
             # Final fallback: random non-wolf
             if victim is None:
@@ -1255,6 +1252,7 @@ def simulate_game(visual: bool = True):
         "run_id": run_id,
         "phases": phase_log,
         "mask_logs": mask_logs,
+        "social_stats": social_stats_log,  # NEW: expose Stage A telemetry
     }
     return rollout, meta_out
 

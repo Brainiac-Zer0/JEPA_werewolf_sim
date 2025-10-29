@@ -15,6 +15,7 @@
 #       - Drop datetime.utcnow() deprecation: use timezone-aware UTC timestamp
 #       - Robust unpacking of mouthpiece load (supports 2- or 3-item returns)
 #       - Pass through mouthpiece meta to save() when supported
+#       - Phase-6: social telemetry print and jsonl logging when meta["social_stats"] is present
 # -----------------------------------------------------------------------------
 
 import os
@@ -23,7 +24,7 @@ import json
 import argparse
 from pathlib import Path
 from datetime import datetime, timezone  # PATCH: timezone-aware UTC
-from typing import List, Tuple, Any, Dict
+from typing import List, Tuple, Any, Dict, Optional
 
 import torch, yaml
 
@@ -67,6 +68,9 @@ except Exception:
 # ── Load config
 with open("config.yaml", "r") as f:
     CFG = yaml.safe_load(f) or {}
+
+# Global run-id for auxiliary logging from helpers
+RUN_ID: Optional[str] = None
 
 # --------- OS ENV SHIM HELPERS (env overrides YAML; safe parsing) ----------
 def _env_bool(key: str, default: bool) -> bool:
@@ -362,7 +366,7 @@ def _split_rollouts_meta(sim_ret: Any) -> Tuple[Any, Dict[str, Any]]:
       - (rollouts, meta)
       - (rollouts, meta, extra...)
       - just rollouts
-      - dict with keys {\"rollouts\": ..., ...}
+      - dict with keys {"rollouts": ..., ...}
     """
     rollouts, meta = [], {}
     try:
@@ -381,6 +385,29 @@ def _split_rollouts_meta(sim_ret: Any) -> Tuple[Any, Dict[str, Any]]:
     except Exception:
         rollouts, meta = [], {}
     return rollouts, (meta or {})
+
+# ============================ Social stats logging ============================
+
+def _log_social_stats_if_any(meta: Dict[str, Any]) -> None:
+    """Best-effort print + jsonl write for meta['social_stats']."""
+    try:
+        if not isinstance(meta, dict):
+            return
+        ss = meta.get("social_stats")
+        if not ss:
+            return
+        mean = ss.get("delta_norm_mean", ss.get("mean_norm", 0.0))
+        var  = ss.get("delta_norm_var", ss.get("var_norm", 0.0))
+        n    = ss.get("n", ss.get("count", 0))
+        print(f"[SOCIAL] ||δ_social|| mean={float(mean):.4f}, var={float(var):.4f}, n={int(n)}")
+        # Write to logs/<RUN_ID>/social_stats.jsonl (or logs/social_stats.jsonl if run id missing)
+        out_dir = os.path.join("logs", RUN_ID) if RUN_ID else "logs"
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, "social_stats.jsonl"), "a", encoding="utf-8") as f:
+            json.dump(ss, f)
+            f.write("\n")
+    except Exception:
+        pass
 
 # ============================ Rollout collection ==============================
 
@@ -401,6 +428,8 @@ def collect_rollouts_for_role(
     for _ in range(n_games):
         sim_ret = run_sim_and_collect_rollouts(visual=False)
         rollouts, meta = _split_rollouts_meta(sim_ret)
+        # Optional social telemetry print/write
+        _log_social_stats_if_any(meta)
 
         if SPEAKER_ENABLED and rubric is not None:
             agents = meta.get("agents") if isinstance(meta, dict) else None
@@ -507,6 +536,9 @@ def main() -> None:
     # PATCH: timezone-aware UTC (addresses DeprecationWarning for utcnow)
     run_id = f"train_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_seed{seed}"
     save_run_config(run_id, CFG)
+    # Expose run id to helpers for social telemetry logging
+    global RUN_ID
+    RUN_ID = run_id
     epoch_logger = TrainingEpochLogger()
 
     # 1) Judge rubric (for optional speaker learning)
@@ -672,6 +704,7 @@ def main() -> None:
                         # Re-run a tiny sim to get meta-agents for labeled intents, if available
                         sim_ret_extra = run_sim_and_collect_rollouts(visual=False)
                         _rolls_extra, meta_extra = _split_rollouts_meta(sim_ret_extra)
+                        _log_social_stats_if_any(meta_extra)
                         agents_for_bias = meta_extra.get("agents", None) if isinstance(meta_extra, dict) else None
                     except Exception:
                         agents_for_bias = None
@@ -705,6 +738,7 @@ def main() -> None:
             try:
                 sim_ret = run_sim_and_collect_rollouts(visual=False)
                 _rolls_cycle, meta_cycle = _split_rollouts_meta(sim_ret)
+                _log_social_stats_if_any(meta_cycle)
                 agents_cycle = meta_cycle.get("agents", []) if isinstance(meta_cycle, dict) else []
                 if agents_cycle:
                     ds = collect_utterance_dataset(agents_cycle)

@@ -56,11 +56,19 @@ except Exception:
     LogitBiasHead = None  # type: ignore
 
 # Optional language coupling helpers (only used if present)
+# Prefer SocialInfluence from social.py; fall back to encoders for BC
 try:
-    from encoders import MessageEncoder, SocialInfluence
+    from social import SocialInfluence  # type: ignore
+except Exception:
+    try:
+        from encoders import SocialInfluence  # type: ignore
+    except Exception:
+        SocialInfluence = None  # type: ignore
+
+try:
+    from encoders import MessageEncoder  # type: ignore
 except Exception:
     MessageEncoder = None  # type: ignore
-    SocialInfluence = None  # type: ignore
 
 CHECKPOINT_DIR = "checkpoints"
 LOGS_DIR = "logs"
@@ -573,7 +581,24 @@ def train_jepa_phaseaware(
                                 msg_encoder=msg_enc, social=soc, weight=LC_WEIGHT
                             )
 
-                loss = L_mse + LAMBDA_BC * L_bc + L_lc
+                # ---- Optional Stage-A social JEPA regularizer -----------------
+                L_soc = torch.tensor(0.0, device=DEVICE)
+                try:
+                    lambda_reg = float(CFG.get("social", {}).get("lambda_reg", 0.0))
+                except Exception:
+                    lambda_reg = 0.0
+                if lambda_reg > 0.0:
+                    vals = []
+                    for r in batch:
+                        if r.aux and ("delta_social_norm2" in r.aux):
+                            try:
+                                vals.append(float(r.aux["delta_social_norm2"]))
+                            except Exception:
+                                pass
+                    if vals:
+                        L_soc = torch.tensor(sum(vals)/len(vals), device=DEVICE)
+
+                loss = L_mse + LAMBDA_BC * L_bc + L_lc + (lambda_reg * L_soc)
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -857,7 +882,24 @@ def train_jepa_factorized(
                                 msg_encoder=msg_enc, social=soc, weight=LC_WEIGHT
                             )
 
-                loss = L_mse + (LAMBDA_TALK * L_talk) + (LAMBDA_BC * (L_vote + L_kill)) + L_lc
+                # ---- Optional Stage-A social JEPA regularizer -----------------
+                L_soc = torch.tensor(0.0, device=DEVICE)
+                try:
+                    lambda_reg = float(CFG.get("social", {}).get("lambda_reg", 0.0))
+                except Exception:
+                    lambda_reg = 0.0
+                if lambda_reg > 0.0:
+                    vals = []
+                    for r in batch:
+                        if r.aux and ("delta_social_norm2" in r.aux):
+                            try:
+                                vals.append(float(r.aux["delta_social_norm2"]))
+                            except Exception:
+                                pass
+                    if vals:
+                        L_soc = torch.tensor(sum(vals)/len(vals), device=DEVICE)
+
+                loss = L_mse + (LAMBDA_TALK * L_talk) + (LAMBDA_BC * (L_vote + L_kill)) + L_lc + (lambda_reg * L_soc)
 
             # Backprop
             optimizer.zero_grad(set_to_none=True)
