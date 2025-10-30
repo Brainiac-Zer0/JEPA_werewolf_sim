@@ -73,6 +73,7 @@ BIAS_LR            = _env_float("BIAS_LR", float(config.get("BIAS_LR", 1e-3)))
 FUSION_ALPHA_DEF   = _env_float("TALK_FUSION_ALPHA", float(config.get("sim", {}).get("talk_fusion_alpha", 0.5)))
 
 # --- Social influence knobs (Stage A) ---
+# Base social toggle from root "social.enabled"
 SOCIAL_ENABLED     = _env_bool("SOCIAL_ENABLED", bool(config.get("social", {}).get("enabled", False)))
 SOCIAL_SCALE       = _env_float("SOCIAL_SCALE",  float(config.get("social", {}).get("scale", 0.05)))
 SOCIAL_LAMBDA_REG  = _env_float("SOCIAL_LAMBDA_REG", float(config.get("social", {}).get("lambda_reg", 1e-3)))
@@ -81,6 +82,13 @@ SOCIAL_TAU         = _env_float("SOCIAL_TAU", float(config.get("social", {}).get
 SOCIAL_MAX_STEP    = _env_float("SOCIAL_MAX_STEP", float(config.get("social", {}).get("max_step", 0.25)))
 # Optional external multiplier λ_social (applied on top of the module’s internal scale)
 SOCIAL_LAMBDA_EXT  = _env_float("SOCIAL_LAMBDA_EXT", float(config.get("social", {}).get("lambda_ext", 1.0)))
+
+# Prefer more-specific sim.social.enabled if present (env > YAML)
+_SIM_SOCIAL_ENABLED_YAML = config.get("sim", {}).get("social", {})
+if not isinstance(_SIM_SOCIAL_ENABLED_YAML, dict):
+    _SIM_SOCIAL_ENABLED_YAML = {}
+SIM_SOCIAL_ENABLED_CFG = _SIM_SOCIAL_ENABLED_YAML.get("enabled", None)
+SIM_SOCIAL_ENABLED = _env_bool("SIM_SOCIAL_ENABLED", bool(SIM_SOCIAL_ENABLED_CFG)) if SIM_SOCIAL_ENABLED_CFG is not None else None
 
 # Phases
 PHASES = {"DISCUSS": 0, "VOTE": 1, "NIGHT": 2}
@@ -175,8 +183,10 @@ class BaseAgent:
         self.speaker = SpeakerPolicy(latent_dim=LATENT_DIM, templates=DEFAULT_TEMPLATES)
         self.speaker.attach_optimizers(bandit_lr=SPEAKER_LR, bias_lr=BIAS_LR)
 
-        # Back-compat alias used by some older pipelines (expects a bias head on the agent)
+        # Back-compat aliases used by external/fusion paths
         self.llm_bias_head = getattr(self.speaker.bias, "head", None)
+        # NEW: expose bias_head (used by sim.py for fused intent)
+        self.bias_head = getattr(self.speaker.bias, "head", None)
 
         # Optional: honor env toggle to enable/disable LLM route at init
         try:
@@ -188,9 +198,19 @@ class BaseAgent:
         self.named_target_hint: Optional[str] = None
 
         # --- Social Influence (Stage A) ---
-        self.social_enabled: bool = bool(SOCIAL_ENABLED)
+        # Prefer sim.social.enabled if explicitly set; else fall back to SOCIAL_ENABLED
+        if SIM_SOCIAL_ENABLED is not None:
+            self.social_enabled: bool = bool(SIM_SOCIAL_ENABLED)
+        else:
+            self.social_enabled: bool = bool(SOCIAL_ENABLED)
+
         self.social_lambda_ext: float = float(SOCIAL_LAMBDA_EXT)  # external λ_social multiplier
         self.last_delta_social_norm: float = 0.0  # telemetry
+        self._last_social: Dict[str, object] = {  # for tests/invariants
+            "delta": None,
+            "info": {},
+            "disabled": not self.social_enabled,
+        }
 
         # Instantiate influence model; safe even if disabled
         self.social: Optional[SocialInfluence] = SocialInfluence(
@@ -309,7 +329,7 @@ class BaseAgent:
     def _recent_texts(self) -> List[str]:
         if not self.message_memory:
             return []
-        return [m for (_, m) in list(self.message_memory)[-SPEAKER_HIST_K:] if m]
+        return [m for (_, m) in list(self.message_memory)[-SPEAKER_HIST_K:] if m and m.strip()]
 
     # NEW: message buffer hook used by sim.py day discussion & night chat
     def buffer_message(
@@ -332,11 +352,18 @@ class BaseAgent:
         if not t:
             return
 
-        # Public conversational memory used by mouthpiece prompt builders, etc.
+        # Avoid immediate duplicates from the same speaker
         try:
-            self.message_memory.append((speaker_name, t))
+            if self.message_memory and self.message_memory[-1][0] == speaker_name and self.message_memory[-1][1] == t:
+                pass
+            else:
+                self.message_memory.append((speaker_name, t))
         except Exception:
-            pass
+            # Fallback append without dedupe
+            try:
+                self.message_memory.append((speaker_name, t))
+            except Exception:
+                pass
 
         # Optional "heard last" map
         try:
@@ -409,12 +436,23 @@ class BaseAgent:
 
     # ───────────────────────── Perception ─────────────────────────
     def observe(self, agents: List["BaseAgent"]):
+        """
+        Pull visible last_message snippets from others.
+        Hygiene: only record non-empty messages and avoid immediate duplicates.
+        """
         observed: List[tuple[str, str]] = []
         for a in agents:
-            if a.alive and a.name != self.name:
-                observed.append((a.name, a.last_message))
-                self.heard_messages[a.name] = a.last_message
-                self.message_memory.append((a.name, a.last_message))
+            if not a.alive or a.name == self.name:
+                continue
+            msg = (a.last_message or "").strip()
+            if not msg:
+                continue
+            observed.append((a.name, msg))
+            self.heard_messages[a.name] = msg
+            # Deduplicate consecutive repeats per speaker
+            if self.message_memory and self.message_memory[-1][0] == a.name and self.message_memory[-1][1] == msg:
+                continue
+            self.message_memory.append((a.name, msg))
         return observed
 
     # ───────────────────────── Mask builders ─────────────────────────
@@ -440,6 +478,7 @@ class BaseAgent:
                 idx = int(a.name.split("_")[1])
             except Exception:
                 continue
+            # Legal if alive, not self, and not a wolf
             legal = a.alive and a.name != self.name and (idx not in self.wolf_ids)
             mask[idx] = bool(legal)
         return mask
@@ -611,7 +650,7 @@ class BaseAgent:
         self,
         z_self: torch.Tensor,
         neighbors: List["BaseAgent"],
-    ) -> Optional[torch.Tensor]:
+    ):
         """
         Stage A:
           1) gather neighbors' most recent latents,
@@ -619,16 +658,30 @@ class BaseAgent:
           3) z' = z_self + λ_social · δ_social,
           4) store self.last_delta_social_norm for telemetry.
 
-        Returns z' if applied, else None (disabled or no usable neighbors).
+        Returns (z_updated, info_dict). If disabled or no neighbors, returns (z_self, info_zero).
+        Also records details for tests in self._last_social = {"delta","info","disabled"}.
         """
-        # Disabled or module missing
-        if not self.social_enabled or self.social is None:
+        device = z_self.device
+
+        # If social is disabled or module missing, produce a zero-delta tuple and a clean flag.
+        if not getattr(self, "social_enabled", False) or self.social is None:
+            zero = torch.zeros_like(z_self)
             self.last_delta_social_norm = 0.0
+            info_zero = {
+                "delta_norm": 0.0,
+                "delta_norms": [],
+                "trust_mode": "none",
+                "n_neighbors": 0,
+                "disabled": True,
+                "scale": float(getattr(self.social, "scale", 0.0)) if self.social is not None else 0.0,
+            }
+            self._last_social = {"delta": zero.detach().clone(), "info": dict(info_zero), "disabled": True}
             if TELEMETRY_ENABLED:
                 self.telemetry["social_skipped"] = True
-            return None
+                self.telemetry["social_disabled_invariants"] = True
+            return z_self, info_zero
 
-        # Collect neighbor latents (latest)
+        # Collect neighbor latents (latest), align to device
         z_neighbors: List[torch.Tensor] = []
         neighbor_roles: List[Optional[str]] = []
         for a in neighbors or []:
@@ -639,49 +692,69 @@ class BaseAgent:
             hist = getattr(a, "latent_history", None)
             if hist:
                 try:
-                    z_neighbors.append(hist[-1].detach())
+                    z_neighbors.append(hist[-1].detach().to(device))
                     neighbor_roles.append(getattr(a, "role", None))
                 except Exception:
                     continue
 
+        # If no usable neighbors, behave like a clean zero-delta step (not disabled).
         if not z_neighbors:
+            zero = torch.zeros_like(z_self)
             self.last_delta_social_norm = 0.0
+            info_zero = {
+                "delta_norm": 0.0,
+                "delta_norms": [],
+                "trust_mode": getattr(self.social, "trust_mode", "none"),
+                "n_neighbors": 0,
+                "no_neighbors": True,
+                "scale": float(getattr(self.social, "scale", 0.0)),
+            }
+            self._last_social = {"delta": zero.detach().clone(), "info": dict(info_zero), "disabled": False}
             if TELEMETRY_ENABLED:
                 self.telemetry["social_no_neighbors"] = True
-            return None
+            return z_self, info_zero
 
         # Influence step is explicitly inference-time: no grads
         delta, info = self.social(
-            z_self=z_self.detach(),
+            z_self=z_self.detach().to(device),
             z_neighbors=z_neighbors,
             self_role=self.role,
             neighbor_roles=neighbor_roles,
         )
 
-        z_updated = z_self + float(self.social_lambda_ext) * delta
+        lam = float(self.social_lambda_ext)
+        z_updated = z_self + lam * delta
 
-        # Telemetry
-        self.last_delta_social_norm = float(delta.norm().item()) * float(self.social_lambda_ext)
+        # Telemetry and info dict expected by sim logger
+        dn = float(delta.norm().item()) * lam
+        self.last_delta_social_norm = dn
+        info_out = dict(info or {})
+        info_out.setdefault("trust_mode", getattr(self.social, "trust_mode", "none"))
+        info_out.setdefault("scale", float(getattr(self.social, "scale", 0.0)))
+        info_out["n_neighbors"] = info_out.get("n_neighbors", len(z_neighbors))
+        info_out["delta_norm"] = dn
+        info_out["lambda_ext"] = lam
+
+        # Persist for tests/telemetry
+        self._last_social = {"delta": delta.detach().clone(), "info": dict(info_out), "disabled": False}
         if TELEMETRY_ENABLED:
             self.telemetry.update({
-                "delta_social_norm": float(self.last_delta_social_norm),
-                "social_n_neighbors": int(info.get("n_neighbors", len(z_neighbors))),
-                "social_trust_mode": info.get("trust_mode", "none"),
-                "social_scale_internal": float(info.get("scale", 0.0)),
-                "social_lambda_ext": float(self.social_lambda_ext),
-                "social_w_entropy": float(info.get("w_entropy", 0.0)),
-                "social_mean_cosine_to_mu": float(info.get("mean_cosine_to_mu", 0.0)),
+                "delta_social_norm": dn,
+                "social_n_neighbors": int(info_out["n_neighbors"]),
+                "social_trust_mode": info_out["trust_mode"],
+                "social_scale_internal": float(info_out["scale"]),
+                "social_lambda_ext": lam,
+                "social_w_entropy": float(info_out.get("w_entropy", 0.0)),
+                "social_mean_cosine_to_mu": float(info_out.get("mean_cosine_to_mu", 0.0)),
             })
 
         # Back-compat: if a pipeline expects in-place update (self.z_t), honor it
         try:
-            # Some older paths store a "current latent" on the agent;
-            # update it here without breaking newer return-value users.
             self.z_t = z_updated.detach()
         except Exception:
             pass
 
-        return z_updated
+        return z_updated, info_out
 
     # ───────────────────────── Rollout aux snapshot ─────────────────────────
     def make_aux(self, agents: List["BaseAgent"]) -> Dict:

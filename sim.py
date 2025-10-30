@@ -146,6 +146,13 @@ VOTE_MIX_ALPHA: float = float(SIM_CFG.get("vote_mix_alpha", 0.0))
 LOG_DZ_TALK: bool = bool(SIM_CFG.get("log_dz_talk", False))
 LOG_DZ_KILL: bool = bool(SIM_CFG.get("log_dz_kill", False))
 
+# ── Social on/off must respect BOTH top-level and sim.social
+def _social_enabled_from_cfg(cfg: dict) -> bool:
+    top  = bool((cfg.get("social", {}) or {}).get("enabled", True))
+    sims = bool(((cfg.get("sim", {}) or {}).get("social", {}) or {}).get("enabled", True))
+    return bool(top and sims)
+SOCIAL_ENABLED_CFG = _social_enabled_from_cfg(CFG)
+
 # NEW (P5I/P5C): LLM speaker route + hygiene config
 LLM_CFG = CFG.get("llm", {}) if isinstance(CFG.get("llm"), dict) else {}
 LLM_SPK_ENABLED: bool = bool(LLM_CFG.get("speaker_enabled", True))
@@ -291,6 +298,22 @@ def _recent_texts_of(ag, k: int = 3) -> list[str]:
         return [m for (_n, m) in list(ag.message_memory)[-k:] if m and m.strip()]
     except Exception:
         return []
+
+# Finite guards
+def _finite(t: torch.Tensor) -> torch.Tensor:
+    """
+    Clamp/repair non-finite values so variance and cosine math never returns NaN.
+    Keeps magnitudes bounded but preserves direction as much as possible.
+    """
+    if not torch.is_tensor(t):
+        return torch.tensor([], dtype=torch.float32)
+    return torch.nan_to_num(t, nan=0.0, posinf=1e6, neginf=-1e6)
+
+def _finite_mean(xs: List[float]) -> float:
+    vals = [float(v) for v in xs if np.isfinite(v)]
+    if not vals:
+        return float("nan")
+    return float(sum(vals) / len(vals))
 
 # NEW: category fusion (TalkHead × BiasHead) to produce fused prior and sample
 @torch.no_grad()
@@ -547,6 +570,10 @@ def simulate_game(visual: bool = True):
     if apply_personality is not None:
         apply_personality(agents)
     print("▶ Assigned roles:", ", ".join(f"{a.name}:{a.role}" for a in agents))
+    # Ensure clean per-run social telemetry on agents
+    for ag in agents:
+        ag.last_delta_social_norm = 0.0
+        ag.social_enabled = bool(SOCIAL_ENABLED_CFG)
 
     # Shared encoder
     shared_msg_encoder = MessageEncoder()
@@ -599,12 +626,12 @@ def simulate_game(visual: bool = True):
         z_pre_talk: Dict[str, torch.Tensor] = {}
         if LOG_DZ_TALK:
             for ag in living:
-                z_pre_talk[ag.name] = ag.encode_current_belief(round_num, agents).detach()
+                z_pre_talk[ag.name] = _finite(ag.encode_current_belief(round_num, agents).detach())
 
         # DISCUSS: compute heads, fuse intent, (router→LLM), hygiene, judge, push rows
         for ag in living:
             try:
-                z_t_discuss = ag.encode_current_belief(round_num, agents).detach()
+                z_t_discuss = _finite(ag.encode_current_belief(round_num, agents).detach())
                 recent_texts = [m for (_n, m) in list(ag.message_memory)[-3:]] if getattr(ag, "message_memory", None) else []
                 fused = _fused_intent_for_agent(ag, z_t_discuss, recent_texts=recent_texts)
                 cat_id = int(fused["cat_id"].item())
@@ -748,9 +775,11 @@ def simulate_game(visual: bool = True):
                 # optional Δz(TALK)
                 if LOG_DZ_TALK and ag.name in z_pre_talk:
                     try:
-                        z_post = ag.encode_current_belief(round_num, agents).detach()
-                        dz_l2 = float(torch.norm(z_post - z_pre_talk[ag.name]).item())
-                        dz_1mcos = float(1.0 - F.cosine_similarity(z_post.unsqueeze(0), z_pre_talk[ag.name].unsqueeze(0)).item())
+                        z_post = _finite(ag.encode_current_belief(round_num, agents).detach())
+                        base = _finite(z_pre_talk[ag.name])
+                        dz_l2 = float(torch.norm(z_post - base).item())
+                        cosv = F.cosine_similarity(z_post.unsqueeze(0), base.unsqueeze(0))
+                        dz_1mcos = float(1.0 - float(cosv.item()) if torch.isfinite(cosv).all() else 1.0)
                         for row in reversed(metrics_rows):
                             if row["round"] != round_num:
                                 break
@@ -764,7 +793,7 @@ def simulate_game(visual: bool = True):
                 # TALK rollout tuple
                 try:
                     z_talk_pre = z_pre_talk.get(ag.name, z_t_discuss)
-                    z_talk_post = ag.encode_current_belief(round_num, agents).detach()
+                    z_talk_post = _finite(ag.encode_current_belief(round_num, agents).detach())
                     talk_payload_t = torch.tensor(int(cat_id))
                     talk_aux = _aux_with_texts(ag, agents)
                     _check_aux(talk_aux, round_num=round_num, agent=ag.name)
@@ -796,70 +825,151 @@ def simulate_game(visual: bool = True):
 
         # ───────────────────────────
         # NEW: Stage A Social Coupling (after DAY_DISCUSS)
-        # For each living agent:
-        #   - gather neighbor latents (last z from others)
-        #   - call agent.compute_social_update(z_self, neighbors)
-        #   - record ||δ_social|| per agent
-        #   - compute cross-agent z variance pre and post
-        #   - store stats in social_stats_log (returned in meta["social_stats"])
+        # When disabled, we skip updates and log clean zeros (no leakage).
+        # Guarantees: per-agent delta_norm, and daily aggregates:
+        # - mean_delta_norm (uses fallback ||z_updated - z_self|| if agent didn't supply)
+        # - dz_var_pre/dz_var_post as POPULATION variance across living agents (finite)
         # ───────────────────────────
         living = [a for a in agents if a.alive]
-        # Pre-social z map and variance across agents
+
+        # Pre-social snapshot
         z_pre_map: Dict[str, torch.Tensor] = {}
         for ag in living:
-            z_pre_map[ag.name] = ag.encode_current_belief(round_num, agents).detach()
-        if z_pre_map:
-            Zpre = torch.stack([z for z in z_pre_map.values()], dim=0)  # (N, D)
-            pre_var = float(Zpre.var(dim=0, unbiased=False).mean().item())
-        else:
-            pre_var = 0.0
+            z_pre_map[ag.name] = _finite(ag.encode_current_belief(round_num, agents).detach())
 
-        # Apply per-agent social updates
+        per_agent_deltas: List[float] = []
         per_agent_stats: List[dict] = []
         z_post_map: Dict[str, torch.Tensor] = {}
-        for ag in living:
-            z_self = z_pre_map[ag.name]
-            neighbors = [n for n in living if n.name != ag.name]  # neighbor agents
-            z_updated = ag.compute_social_update(z_self, neighbors)
-            if z_updated is not None and torch.isfinite(z_updated).all():
-                z_post_map[ag.name] = z_updated.detach()
-            else:
-                z_post_map[ag.name] = z_self  # unchanged if disabled/failed
-            per_agent_stats.append({
-                "agent": ag.name,
-                "role": ag.role,
-                "delta_norm": float(getattr(ag, "last_delta_social_norm", 0.0)),
-            })
 
-        # Aggregate statistics
-        if z_post_map:
-            Zpost = torch.stack([z for z in z_post_map.values()], dim=0)
-            post_var = float(Zpost.var(dim=0, unbiased=False).mean().item())
+        EPS = 1e-12
+
+        if SOCIAL_ENABLED_CFG:
+            for ag in living:
+                z_self = _finite(z_pre_map[ag.name])
+
+                # neighbors
+                neighbors = [n for n in living if n.name != ag.name]
+
+                # compute social update; support legacy and new signatures
+                info = {}
+                try:
+                    res = ag.compute_social_update(z_self, neighbors)
+                    if isinstance(res, tuple) and len(res) >= 2:
+                        z_updated, info = res[0], (res[1] or {})
+                    else:
+                        z_updated, info = res, {}
+                except Exception:
+                    z_updated, info = z_self, {}
+
+                # apply + store (finite-guard)
+                if z_updated is None or not torch.is_tensor(z_updated) or not torch.isfinite(z_updated).all():
+                    z_updated = z_self
+                z_updated = _finite(z_updated).detach()
+                z_post_map[ag.name] = z_updated
+
+                # delta_norm with robust fallback
+                dn_from_info = float(info.get("delta_norm", 0.0) or 0.0)
+                dn_fallback = float(torch.norm(z_updated - z_self).item())
+                delta_norm = dn_from_info if dn_from_info > EPS else dn_fallback
+
+                ag.last_delta_social_norm = delta_norm
+                ag.social_enabled = True
+                per_agent_deltas.append(delta_norm)
+
+                # --- NaN-proof per-agent within-vector variance (debug) ---
+                try:
+                    zj = _finite(z_self)
+                    if zj.numel() == 0:
+                        var_pre = float("nan")
+                    else:
+                        v = (zj + 1e-8 * torch.randn_like(zj)).var(unbiased=False)
+                        v = torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+                        var_pre = float(v.item())
+                except Exception:
+                    var_pre = float("nan")
+
+                try:
+                    zj_post = _finite(z_updated)
+                    if zj_post.numel() == 0:
+                        var_post = float("nan")
+                    else:
+                        v_post = (zj_post + 1e-8 * torch.randn_like(zj_post)).var(unbiased=False)
+                        v_post = torch.nan_to_num(v_post, nan=0.0, posinf=0.0, neginf=0.0)
+                        var_post = float(v_post.item())
+                except Exception:
+                    var_post = float("nan")
+
+                per_agent_stats.append({
+                    "agent": ag.name,
+                    "role": ag.role,
+                    "delta_norm": delta_norm,
+                    "var_pre": var_pre,
+                    "var_post": var_post,
+                })
         else:
-            post_var = pre_var
+            # Disabled path: identity update, clean zeros, no calls into agent social
+            for ag in living:
+                z_post_map[ag.name] = z_pre_map[ag.name]
+                ag.last_delta_social_norm = 0.0
+                ag.social_enabled = False
+                per_agent_deltas.append(0.0)
+                per_agent_stats.append({
+                    "agent": ag.name,
+                    "role": ag.role,
+                    "delta_norm": 0.0,
+                    "var_pre": float("nan"),
+                    "var_post": float("nan"),
+                })
 
-        deltas = [s["delta_norm"] for s in per_agent_stats] or [0.0]
+        # Population variance across living agents (finite, no NaNs) with jitter
+        try:
+            def _pop_var_mean(stack: torch.Tensor) -> float:
+                if stack.numel() == 0:
+                    return 0.0
+                vs = (stack + 1e-8 * torch.randn_like(stack)).var(dim=0, unbiased=False)
+                vs = torch.nan_to_num(vs, nan=0.0, posinf=0.0, neginf=0.0)
+                return float(vs.mean().item())
+
+            if len(living) > 0:
+                pre_stack  = torch.stack([_finite(z_pre_map[a.name])  for a in living],  dim=0)  # [N,D]
+                post_stack = torch.stack([_finite(z_post_map[a.name]) for a in living],  dim=0)  # [N,D]
+                dz_var_pre  = _pop_var_mean(pre_stack)
+                dz_var_post = _pop_var_mean(post_stack)
+            else:
+                dz_var_pre, dz_var_post = 0.0, 0.0
+        except Exception:
+            dz_var_pre, dz_var_post = 0.0, 0.0
+
+        # Daily aggregates (always present, finite)
+        def _finite_mean_list(xs: List[float]) -> float:
+            vals = [float(v) for v in xs if np.isfinite(v)]
+            return float(sum(vals) / max(1, len(vals))) if vals else 0.0
+
+        mean_delta = _finite_mean_list(per_agent_deltas)
+        applied_count = int(sum(1 for d in per_agent_deltas if d > EPS))
+
         social_stats_log.append({
             "round": round_num,
             "per_agent": per_agent_stats,
-            "mean_delta": float(np.mean(deltas)),
-            "var_delta": float(np.var(deltas)),
-            "pre_variance": pre_var,
-            "post_variance": post_var,
-            "variance_drop": float(pre_var - post_var),
-            "applied_count": int(sum(1 for s in per_agent_stats if s["delta_norm"] > 0.0)),
+            "dz_var_pre": dz_var_pre,
+            "dz_var_post": dz_var_post,
+            "mean_delta_norm": mean_delta,
+            "applied_count": applied_count,
             "num_agents": len(per_agent_stats),
+            "enabled": bool(SOCIAL_ENABLED_CFG),
         })
 
-        # Build z_map for subsequent phases based on post-social z
-        z_map: Dict[BaseAgent, torch.Tensor] = {ag: z_post_map.get(ag.name, z_pre_map[ag.name]) for ag in living}
+        # Build z_map for subsequent phases using post-social z
+        z_map: Dict[BaseAgent, torch.Tensor] = {
+            ag: z_post_map.get(ag.name, z_pre_map[ag.name]) for ag in living
+        }
 
         # PRE-ACT: judge vote etc. (uses z_map that already includes social effect)
         pending: Dict[str, Tuple[torch.Tensor, int, torch.Tensor, str, str, dict]] = {}
         vote_map: Dict[BaseAgent, BaseAgent] = {}
 
         for ag in living:
-            z_t = z_map[ag]
+            z_t = _finite(z_map[ag])
             topk = _vote_topk_for_agent(ag, z_t, living, PLANNER_TOPK)
             if not topk:
                 continue
@@ -1188,7 +1298,7 @@ def simulate_game(visual: bool = True):
 
         for ag in agents:
             if ag.name in pending:
-                z_next = ag.encode_current_belief(round_num + 1, agents).detach()
+                z_next = _finite(ag.encode_current_belief(round_num + 1, agents).detach())
                 z_t, ph_code, payload_idx, role, choice_type, aux = pending[ag.name]
                 _check_aux(aux, round_num=round_num, agent=ag.name)
                 rollout.append((
@@ -1200,16 +1310,17 @@ def simulate_game(visual: bool = True):
                     choice_type,
                     aux,
                 ))
-                l2 = torch.norm(z_next - z_t).item()
+                l2 = torch.norm(_finite(z_next) - _finite(z_t)).item()
                 z_deltas.append(l2)
-                cos_val = F.cosine_similarity(z_next.unsqueeze(0), z_t.unsqueeze(0)).item()
+                cos_val_t = F.cosine_similarity(_finite(z_next).unsqueeze(0), _finite(z_t).unsqueeze(0))
+                cos_val = float(cos_val_t.item()) if torch.isfinite(cos_val_t).all() else 0.0
                 cos_deltas.append(1.0 - cos_val)
                 dz_by_agent[ag.name] = l2
                 cos_by_agent[ag.name] = 1.0 - cos_val
 
         if z_deltas:
-            mean_l2 = sum(z_deltas) / len(z_deltas)
-            mean_1mcos = (sum(cos_deltas) / len(cos_deltas)) if cos_deltas else 0.0
+            mean_l2 = _finite_mean(z_deltas)
+            mean_1mcos = _finite_mean(cos_deltas) if cos_deltas else 0.0
             print(f"[Δz] L2={mean_l2:.4f}  (1-cos)={mean_1mcos:.4f}")
 
             for row in reversed(metrics_rows):
@@ -1218,8 +1329,8 @@ def simulate_game(visual: bool = True):
                 if row["phase"] == "DAY_VOTE":
                     ag_name = row["agent"]
                     if ag_name in dz_by_agent:
-                        row["dz_l2"] = f"{dz_by_agent[ag_name]:.6f}"
-                        row["dz_1mcos"] = f"{cos_by_agent[ag_name]:.6f}"
+                        row["dz_l2"] = f"{dz_by_agent.get(ag_name, 0.0):.6f}"
+                        row["dz_1mcos"] = f"{cos_by_agent.get(ag_name, 0.0):.6f}"
 
             if LOG_DZ_KILL:
                 for row in reversed(metrics_rows):
@@ -1228,8 +1339,8 @@ def simulate_game(visual: bool = True):
                     if row["phase"] == "NIGHT_KILL":
                         ag_name = row["agent"]
                         if ag_name in dz_by_agent:
-                            row["dz_l2"] = f"{dz_by_agent[ag_name]:.6f}"
-                            row["dz_1mcos"] = f"{cos_by_agent[ag_name]:.6f}"
+                            row["dz_l2"] = f"{dz_by_agent.get(ag_name, 0.0):.6f}"
+                            row["dz_1mcos"] = f"{cos_by_agent.get(ag_name, 0.0):.6f}"
 
         # win check
         wolves_alive = [a for a in agents if a.alive and a.role == WEREWOLF]
@@ -1246,15 +1357,52 @@ def simulate_game(visual: bool = True):
     print("[SUMMARY] rows:", len(metrics_rows), "by_phase:", by_phase)
 
     executor.shutdown(wait=True)
+
+    # ensure meta has social_stats with required fields even if empty
+    _social_stats = social_stats_log if social_stats_log else [{
+        "round": 0,
+        "per_agent": [],
+        "dz_var_pre": float("nan"),
+        "dz_var_post": float("nan"),
+        "mean_delta_norm": 0.0,
+        "applied_count": 0,
+        "num_agents": 0,
+    }]
+
     meta_out = {
         "rounds": round_num,
         "agents": agents,
         "run_id": run_id,
         "phases": phase_log,
         "mask_logs": mask_logs,
-        "social_stats": social_stats_log,  # NEW: expose Stage A telemetry
+        "social_stats": _social_stats,  # NEW: Stage A telemetry (guaranteed keys)
     }
     return rollout, meta_out
+
+
+# ───────────────────────── SAFE WRAPPER ─────────────────────────
+def safe_simulate_game(visual: bool = True):
+    """
+    Guaranteed to return (rollouts, meta_dict).
+    If simulate_game() returns a list or other type,
+    it wraps it into {'agents': ..., 'social_stats': []}.
+    """
+    try:
+        result = simulate_game(visual=visual)
+    except Exception as e:
+        print(f"[SAFE_SIM] simulate_game crashed: {e}")
+        return [], {"agents": [], "social_stats": []}
+
+    if isinstance(result, tuple) and len(result) == 2:
+        rollouts, meta = result
+    else:
+        rollouts, meta = [], result
+
+    if not isinstance(meta, dict):
+        meta = {"agents": meta if isinstance(meta, list) else [], "social_stats": []}
+    meta.setdefault("agents", [])
+    meta.setdefault("social_stats", [])
+    return rollouts, meta
 
 
 # ───────────────────────── CLI ─────────────────────────
