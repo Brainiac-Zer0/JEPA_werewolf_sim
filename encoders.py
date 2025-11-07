@@ -552,15 +552,15 @@ class PlannerHeads(nn.Module):
     def from_config(cls, cfg: dict) -> "PlannerHeads":
         """
         Build from unified config:
-          model.latent_dim / .num_actions or .num_agents / .num_talk_cats
+          model.latent_dim / .num_agents / .num_talk_cats
           planner.coalitions ('shared'|'independent')
           planner.temperature
         """
         mcfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
         pconf = cfg.get("planner", {}) if isinstance(cfg, dict) else {}
         latent = int(mcfg.get("latent_dim", LATENT_DIM))
-        # prefer explicit num_agents; else fall back to num_actions; else global NUM_AGENTS
-        num_agents = int(mcfg.get("num_agents", mcfg.get("num_actions", NUM_AGENTS)))
+        # IMPORTANT: do NOT fall back to model.num_actions here — that caused 6 vs 9 bugs.
+        num_agents = int(mcfg.get("num_agents", config.get("NUM_AGENTS", NUM_AGENTS)))
         num_talk  = int(mcfg.get("num_talk_cats", NUM_TALK_CATS))
         coalitions = (pconf.get("coalitions", "shared") or "shared").lower()
         temp = float(pconf.get("temperature", 1.0))

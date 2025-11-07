@@ -1,4 +1,4 @@
-# roles.py
+# roles.py (Phase-7: persona → backend-aware variability)
 from __future__ import annotations
 import random
 from dataclasses import dataclass, asdict
@@ -54,6 +54,9 @@ def _resolve_persona_seed() -> Optional[int]:
 def _rng(seed: Optional[int]) -> random.Random:
     return random.Random(int(seed)) if seed is not None else random.Random()
 
+# ── Backend provider (controls how "temperature" effects are routed)
+LLM_PROVIDER: str = str(CFG.get("llm", {}).get("provider", "openai")).lower()
+
 # ── Latent dimension aware priors
 LATENT_DIM: int = int(CFG.get("LATENT_DIM", CFG.get("model", {}).get("latent_dim", 32)))
 _ROLE_PRIORS = CFG.get("ROLE_PRIORS", {})
@@ -103,16 +106,29 @@ def _sample_persona(rng: random.Random) -> Persona:
         openness          = rng.uniform(-s, s),
     )
 
+def _scale_to_bucket(scale: float) -> int:
+    """
+    Map a temperature-like scale (≈0.7..1.3) to a small discrete bucket {0,1,2}
+    used for prompt-side entropy choices (templates/markers).
+    """
+    if scale < 0.9:  # cooler
+        return 0
+    if scale > 1.1:  # hotter
+        return 2
+    return 1
+
 def _derive_effects(p: Dict[str, float]) -> Dict[str, float]:
     """
-    Phase-5 compatible multiplicative scales:
-      - speaker_temp_scale      in [0.7, 1.3]
-      - accuse_bias_scale       in [0.5, 1.5]
-      - coherence_weight_scale  in [0.8, 1.2]
+    Phase-5 compatible multiplicative scales + Phase-7 backend-aware routing.
+
+    Always compute a 'raw' exploration factor from persona, but:
+      - If LLM_PROVIDER == 'hf': forward it as speaker_temp_scale (HF decoding will use it)
+      - If LLM_PROVIDER == 'openai': DO NOT rely on API temperature; convert to prompt-side
+        variability knobs (template entropy, hedging, discourse variety).
     """
     # exploration: openness + extraversion
-    temp = 1.0 + 0.5 * (p["openness"] + p["extraversion"])
-    speaker_temp_scale = _clip(temp, 0.7, 1.3)
+    temp_raw = 1.0 + 0.5 * (p["openness"] + p["extraversion"])  # ~[0.5, 1.5] before clip
+    temp_raw = _clip(temp_raw, 0.7, 1.3)
 
     # tendency to challenge others: lower agreeableness + some extraversion
     accuse = 1.0 + 0.8 * (-p["agreeableness"]) + 0.4 * p["extraversion"]
@@ -122,11 +138,42 @@ def _derive_effects(p: Dict[str, float]) -> Dict[str, float]:
     coh = 1.0 + 0.6 * p["conscientiousness"] - 0.4 * p["neuroticism"]
     coherence_weight_scale = _clip(coh, 0.8, 1.2)
 
-    return {
-        "speaker_temp_scale": float(speaker_temp_scale),
+    effects: Dict[str, Any] = {
         "accuse_bias_scale": float(accuse_bias_scale),
         "coherence_weight_scale": float(coherence_weight_scale),
     }
+
+    if LLM_PROVIDER == "hf":
+        # HF path: allow decode temperature scaling directly
+        effects["speaker_temp_scale"] = float(temp_raw)
+        # legacy underscore alias for back-compat
+        effects["_temp_scale"] = float(temp_raw)
+        # Also expose a mild prompt-side nudge; HF callers may ignore these.
+        effects["prompt_entropy_bucket"] = int(_scale_to_bucket(temp_raw))
+        effects["hedge_prob_boost"] = float(_clip((temp_raw - 1.0) * 0.25, -0.08, 0.12))
+        effects["discourse_variety_w"] = float(_clip((temp_raw - 1.0) * 1.2 + 1.0, 0.8, 1.3))
+    else:
+        # OpenAI path: DO NOT alter API temperature — convert to prompt-side variability only
+        # Keep scale fields neutral so downstream sanitize never forwards them.
+        effects["speaker_temp_scale"] = 1.0
+        effects["_temp_scale"] = 1.0
+
+        # Prompt-side variability knobs (used by speaker/sim planners):
+        # - template selection entropy (0=conservative, 2=spicy)
+        bucket = _scale_to_bucket(temp_raw)
+        effects["prompt_entropy_bucket"] = int(bucket)
+
+        # - hedging verbs probability boost (keeps OpenAI path within prompt-only changes)
+        #   map 0.7..1.3 → approx -0.08..+0.12
+        effects["hedge_prob_boost"] = float(_clip((temp_raw - 1.0) * 0.25, -0.08, 0.12))
+
+        # - discourse marker variety weight (used to pick from a larger set of markers)
+        effects["discourse_variety_w"] = float(_clip((temp_raw - 1.0) * 1.2 + 1.0, 0.8, 1.3))
+
+        # - optional seed noise (downstream can sample a synonym / opener from this range)
+        effects["seed_noise"] = float(_clip((temp_raw - 1.0) * 3.0, -0.9, 0.9))
+
+    return effects
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -167,10 +214,16 @@ def assign_roles(agent_list: List[Any], num_werewolves: int) -> None:
                 "extraversion": 0.0, "agreeableness": 0.0, "conscientiousness": 0.0,
                 "neuroticism": 0.0, "openness": 0.0
             }
+            # Neutral effects; temperature-related fields are safe defaults
             agent.persona_effects = {
                 "speaker_temp_scale": 1.0,
+                "_temp_scale": 1.0,
                 "accuse_bias_scale": 1.0,
                 "coherence_weight_scale": 1.0,
+                "prompt_entropy_bucket": 1,
+                "hedge_prob_boost": 0.0,
+                "discourse_variety_w": 1.0,
+                "seed_noise": 0.0,
             }
 
         # Stable id for logs
@@ -208,6 +261,9 @@ def roles_meta(agent_list: List[Any]) -> Dict[str, Any]:
                 "speaker_temp_scale": eff.get("speaker_temp_scale", 1.0),
                 "accuse_bias_scale": eff.get("accuse_bias_scale", 1.0),
                 "coherence_weight_scale": eff.get("coherence_weight_scale", 1.0),
+                "prompt_entropy_bucket": eff.get("prompt_entropy_bucket", 1),
+                "hedge_prob_boost": eff.get("hedge_prob_boost", 0.0),
+                "discourse_variety_w": eff.get("discourse_variety_w", 1.0),
             },
         })
     return {"counts": counts, "assignments": entries}

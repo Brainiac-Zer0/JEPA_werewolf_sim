@@ -1,13 +1,19 @@
 # judge_eval.py
-# Bias & stability harness for LLM-as-Judge (Phase 1)
-# - Loads a calibration set of items: JSONL with {"context","role","candidate", ["gold":0..1]}
+# Bias & stability harness for LLM-as-Judge (Phase 7 metrics, strict-vote optional)
+# - Loads a calibration set of items: JSONL with {"context","role","candidate", ["gold":0..1], ["vote_candidates":[...]]}
+# - Two modes:
+#     (A) Rubric mode (default): uses judge.score_batch(...) on candidate text
+#     (B) Strict-vote mode (--strict or presence of vote_candidates): uses judge.strict_vote_decision(...)
+#         • exact JSON keys: vote_target, confidence, rationale
+#         • one retry with terse reminder, then fail-fast
+#         • per-call records include strict_ok and retry_count
 # - Applies perturbations (order shuffle, truncation, padding) to each base item
-# - Scores all with judge.score_batch(...) and computes:
-#     * consistency@eps (fraction of perturbed scores within eps of base)
-#     * per-item variance and global variance
-#     * length-bias index (Pearson r between token length and score) per item and overall
-#     * optional agreement with gold labels (MSE / Spearman, if "gold" present)
-# - Saves results to logs/judge_eval_report.json and logs/judge_eval_records.csv
+#   (strict-vote mode perturbs ONLY context; candidate list stays verbatim)
+# - Computes, then writes JSON and CSV:
+#     * consistency@eps (rubric: score deltas; strict: confidence deltas)
+#     * per-item variance, and global variance
+#     * length-bias index (Pearson r between token length and score/confidence)
+#     * optional agreement with gold labels (MSE, and Spearman, if "gold" present; rubric only)
 from __future__ import annotations
 
 import os
@@ -21,7 +27,7 @@ from typing import List, Dict, Any, Optional, Tuple
 
 import numpy as np
 
-from judge import JudgeRubric, score_batch
+from judge import JudgeRubric, score_batch, strict_vote_decision
 
 # ------------------------------- config-aware logs dir ---------------------
 
@@ -64,9 +70,9 @@ class EvalItem:
     role: str
     candidate: str
     gold: Optional[float] = None
+    vote_candidates: Optional[List[str]] = None  # when provided, switches to strict-vote flow
 
 def _split_context_lines(ctx: str) -> List[str]:
-    # Split by newline, keep non-empty
     return [ln.strip() for ln in ctx.splitlines() if ln.strip()]
 
 def _shuffle_order(ctx: str, seed: int) -> str:
@@ -83,7 +89,6 @@ def _truncate_context(ctx: str, frac: float) -> str:
     return "\n".join(lines[:k])
 
 def _pad_context(ctx: str, pad_reps: int = 1) -> str:
-    # Add neutral filler lines that should not change the content
     pad = ["- (idle)"] * max(0, pad_reps)
     lines = _split_context_lines(ctx) + pad
     return "\n".join(lines)
@@ -101,18 +106,15 @@ class Perturbed:
     role: str
     candidate: str
 
-def make_perturbations(base: EvalItem, seeds: List[int]) -> List[Perturbed]:
+def make_perturbations(base: EvalItem, seeds: List[int], *, strict_vote: bool) -> List[Perturbed]:
     outs: List[Perturbed] = []
     for s in seeds:
-        # Order shuffle
         outs.append(Perturbed("order", s, _shuffle_order(base.context, s), base.role, base.candidate))
-        # Truncations
         for frac in (0.75, 0.5):
             outs.append(Perturbed(f"truncate_{int(frac*100)}", s, _truncate_context(base.context, frac), base.role, base.candidate))
-        # Padding (context)
         outs.append(Perturbed("pad_ctx", s, _pad_context(base.context, pad_reps=2), base.role, base.candidate))
-        # Padding (candidate length)
-        outs.append(Perturbed("pad_cand", s, base.context, base.role, _pad_candidate(base.candidate, pad_reps=3)))
+        if not strict_vote:
+            outs.append(Perturbed("pad_cand", s, base.context, base.role, _pad_candidate(base.candidate, pad_reps=3)))
     return outs
 
 # ------------------------------- Metrics ----------------------------------
@@ -138,17 +140,12 @@ def _mse(a: List[float], b: List[float]) -> float:
     diff = np.array(a) - np.array(b)
     return float(np.mean(diff * diff))
 
-# --------------------------- Scoring & Evaluation -------------------------
-
 def _len_tokens(text: str) -> int:
-    # simple whitespace token length proxy
-    return len(text.split())
+    return len((text or "").split())
 
-# Fixed, schema-stable keys expected from Judge.score_batch
 _SUB_KEYS = ("coherence", "truthfulness", "role_alignment", "social_safety")
 
 def _safe_subscores(d: Dict[str, Any]) -> Dict[str, float]:
-    """Normalize subscores dict to guaranteed keys to avoid schema drift."""
     out = {}
     src = d if isinstance(d, dict) else {}
     for k in _SUB_KEYS:
@@ -159,199 +156,292 @@ def _safe_subscores(d: Dict[str, Any]) -> Dict[str, float]:
         out[k] = max(0.0, min(1.0, v))
     return out
 
+def _is_strict_mode(items: List[EvalItem], cli_force: bool) -> bool:
+    if cli_force:
+        return True
+    return any(it.vote_candidates for it in items)
+
+def _variance(xs: List[float]) -> float:
+    if not xs:
+        return 0.0
+    arr = np.array(xs, dtype=float)
+    return float(np.var(arr))
+
+def _consistency_at_eps(vals: List[float], eps: float) -> float:
+    """
+    Fraction of pairwise deltas within eps.
+    """
+    if len(vals) < 2:
+        return 1.0
+    n = 0
+    ok = 0
+    for i in range(len(vals)):
+        for j in range(i + 1, len(vals)):
+            n += 1
+            if abs(vals[i] - vals[j]) <= eps:
+                ok += 1
+    return float(ok / n) if n else 1.0
+
+# --------------------------- Evaluation Core ------------------------------
+
 def evaluate_set(
     rubric: JudgeRubric,
     items: List[EvalItem],
     *,
     seeds_per_item: int = 3,
     eps_consistency: float = 0.05,
+    strict_vote: bool = False,
 ) -> Dict[str, Any]:
-    """
-    For each base item:
-      - score base
-      - generate perturbations (N seeds)
-      - score perturbed
-      - compute consistency@eps, variance, length correlation
-    """
     rng = random.Random(1337)
     all_records: List[Dict[str, Any]] = []
-
-    # Build full scoring batch for efficiency
     batch_inputs: List[Dict[str, str]] = []
-    meta_index: List[Tuple[int, Optional[str]]] = []  # (global_idx, tag) tag=None for base
+    meta_index: List[Tuple[int, Optional[str], Dict[str, Any]]] = []
 
     expanded: List[Tuple[EvalItem, List[Perturbed]]] = []
     for it in items:
         seeds = [rng.randint(0, 1_000_000) for _ in range(seeds_per_item)]
-        pert = make_perturbations(it, seeds)
+        pert = make_perturbations(it, seeds, strict_vote=strict_vote)
         expanded.append((it, pert))
 
-    # Prepare batch: base first, then all perts
+    # --- Strict-vote path ---
+    if strict_vote:
+        # Per-item aggregates
+        per_item_conf_vals: List[List[float]] = []
+        per_item_ctx_lens: List[List[int]] = []
+
+        for bi, (base, perts) in enumerate(expanded):
+            # base
+            idx, base_rec = strict_vote_decision(
+                context=base.context,
+                role=base.role,
+                candidates=base.vote_candidates or [],
+                run_id="eval",
+                round_num=-1,
+                phase="EVAL",
+                agent="__eval__",
+            )
+            base_rec = {
+                "item_idx": bi,
+                "tag": "base",
+                "context": base.context,
+                "role": base.role,
+                "candidate": base.candidate,
+                **base_rec,
+            }
+            all_records.append(base_rec)
+            confs = [float(base_rec.get("confidence"))] if base_rec.get("confidence") is not None else []
+            ctxlens = [_len_tokens(base.context)]
+
+            # perts
+            for p in perts:
+                _idx, rec = strict_vote_decision(
+                    context=p.context,
+                    role=p.role,
+                    candidates=base.vote_candidates or [],
+                    run_id="eval",
+                    round_num=-1,
+                    phase="EVAL",
+                    agent="__eval__",
+                )
+                rec = {
+                    "item_idx": bi,
+                    "tag": p.kind,
+                    "context": p.context,
+                    "role": p.role,
+                    "candidate": base.candidate,
+                    **rec,
+                }
+                all_records.append(rec)
+                if rec.get("confidence") is not None:
+                    confs.append(float(rec["confidence"]))
+                ctxlens.append(_len_tokens(p.context))
+
+            per_item_conf_vals.append(confs)
+            per_item_ctx_lens.append(ctxlens)
+
+        # Metrics
+        flat_conf = [float(r["confidence"]) for r in all_records if r.get("confidence") is not None]
+        flat_ctx_len = [_len_tokens(r.get("context", "")) for r in all_records]
+        conf_len_r = _pearsonr(flat_ctx_len[:len(flat_conf)], flat_conf) if flat_conf else 0.0
+
+        item_variances = [_variance(vs) for vs in per_item_conf_vals if vs]
+        item_consistency = [_consistency_at_eps(vs, eps_consistency) for vs in per_item_conf_vals if vs]
+
+        redo_counts = [r.get("retry_count", 0) for r in all_records if isinstance(r.get("retry_count"), (int, float))]
+        strict_oks = [r.get("strict_ok", 0) for r in all_records]
+        talk_vote_matches = [r.get("talk_vote_match", 0) for r in all_records]
+        redo_p95 = float(np.percentile(redo_counts, 95)) if redo_counts else 0.0
+        strict_ok_rate = float(np.mean(strict_oks)) if strict_oks else 0.0
+        vote_align_rate = float(np.mean(talk_vote_matches)) if talk_vote_matches else 0.0
+
+        return {
+            "mode": "strict_vote",
+            "summary": {
+                "n_items": len(items),
+                "redo_p95": round(redo_p95, 3),
+                "strict_ok_rate": round(strict_ok_rate, 3),
+                "vote_alignment_rate": round(vote_align_rate, 3),
+                "consistency_at_eps": round(float(np.mean(item_consistency)) if item_consistency else 0.0, 3),
+                "per_item_var_mean": round(float(np.mean(item_variances)) if item_variances else 0.0, 3),
+                "global_var": round(_variance(flat_conf), 3) if flat_conf else 0.0,
+                "length_bias_r": round(conf_len_r, 3),
+                "ask_rate": None,
+                "name_mention_rate": None,
+            },
+            "all_records": all_records,
+        }
+
+    # --- Rubric (language) path ---
+    # Build batches, and keep metadata so we can tie outputs back to inputs
     for bi, (base, perts) in enumerate(expanded):
         batch_inputs.append({"context": base.context, "role": base.role, "candidate": base.candidate})
-        meta_index.append((bi, None))
+        meta_index.append((bi, "base", {"context": base.context, "role": base.role, "candidate": base.candidate}))
         for p in perts:
             batch_inputs.append({"context": p.context, "role": p.role, "candidate": p.candidate})
-            meta_index.append((bi, p.kind))
+            meta_index.append((bi, p.kind, {"context": p.context, "role": p.role, "candidate": p.candidate}))
 
-    # Score
     scores = score_batch(batch_inputs, rubric)
 
-    # Aggregate per base
-    per_item_stats: List[Dict[str, Any]] = []
-    per_base_scores: Dict[int, Dict[str, List[float]]] = {}
-
-    for (bi, tag), sc in zip(meta_index, scores):
-        # Stable read from Judge output
-        try:
-            score = float(sc.get("score", 0.0))
-        except Exception:
-            score = 0.0
-        subs = _safe_subscores(sc.get("subscores", {}))
-
+    # Collect records with metadata
+    for (bi, tag, meta), sc in zip(meta_index, scores):
         rec = {
             "item_idx": bi,
             "tag": tag or "base",
-            "score": score,
-            "coherence": subs["coherence"],
-            "truthfulness": subs["truthfulness"],
-            "role_alignment": subs["role_alignment"],
-            "social_safety": subs["social_safety"],
+            **meta,
+            **sc,
         }
         all_records.append(rec)
 
-        if bi not in per_base_scores:
-            per_base_scores[bi] = {"base": [], "pert": []}
-        if tag is None:
-            per_base_scores[bi]["base"].append(score)
-        else:
-            per_base_scores[bi]["pert"].append(score)
+    # --- Metrics for rubric mode ---
+    # Per-item score collections
+    per_item_scores: Dict[int, List[float]] = {}
+    per_item_cand_lens: Dict[int, List[int]] = {}
+    gold_scores: List[float] = []
+    pred_scores_for_gold: List[float] = []
 
-    # Compute metrics
-    consist_list = []
-    var_list = []
-    len_corr_list = []
-    gold_mse_list = []
-    gold_spr_list = []
+    for r in all_records:
+        bi = int(r["item_idx"])
+        sc = r.get("score")
+        if sc is not None:
+            per_item_scores.setdefault(bi, []).append(float(sc))
+            cand_len = _len_tokens(r.get("candidate", ""))
+            per_item_cand_lens.setdefault(bi, []).append(cand_len)
 
-    # We also keep per-item CSV-friendly rows
-    csv_rows: List[Dict[str, Any]] = []
+    # Flatten for global metrics
+    flat_scores = [s for arr in per_item_scores.values() for s in arr]
+    flat_cand_len = [l for arr in per_item_cand_lens.values() for l in arr]
 
-    # length bias: record len tokens for context+candidate
-    lengths = []
-    scores_for_lengths = []
+    # Consistency, and variance
+    item_consistency = [_consistency_at_eps(vs, eps_consistency) for vs in per_item_scores.values() if vs]
+    item_variances = [_variance(vs) for vs in per_item_scores.values() if vs]
+    global_var = _variance(flat_scores)
 
-    for bi, (base, perts) in enumerate(expanded):
-        base_scores = per_base_scores.get(bi, {}).get("base", [])
-        pert_scores = per_base_scores.get(bi, {}).get("pert", [])
+    # Length-bias
+    length_bias_r = _pearsonr(flat_cand_len, flat_scores) if flat_scores and flat_cand_len else 0.0
 
-        base_score = base_scores[0] if base_scores else 0.0
+    # Agreement with gold, if provided
+    # We use the base item score when available
+    for i, (it, _perts) in enumerate(expanded):
+        if it.gold is None:
+            continue
+        # pick base record
+        base_recs = [r for r in all_records if r["item_idx"] == i and r["tag"] == "base" and r.get("score") is not None]
+        if not base_recs:
+            continue
+        pred_scores_for_gold.append(float(base_recs[0]["score"]))
+        try:
+            gold_scores.append(float(it.gold))
+        except Exception:
+            continue
 
-        # Consistency@eps: fraction of pert scores within eps of base
-        cons = 0.0
-        if pert_scores:
-            close = [abs(ps - base_score) <= eps_consistency for ps in pert_scores]
-            cons = float(sum(close)) / len(pert_scores)
-        consist_list.append(cons)
+    gold_mse = _mse(pred_scores_for_gold, gold_scores) if gold_scores and pred_scores_for_gold else 0.0
+    gold_spearman = _spearmanr(gold_scores, pred_scores_for_gold) if gold_scores and pred_scores_for_gold else 0.0
 
-        # Variance across perts
-        var = float(np.var(np.array(pert_scores))) if pert_scores else 0.0
-        var_list.append(var)
-
-        # Rebuild aligned lens/scrs arrays deterministically by perturbation kind
-        item_records = [r for r in all_records if r["item_idx"] == bi]
-        tag_to_scores: Dict[str, List[float]] = {}
-        base_row = None
-        for r in item_records:
-            if r["tag"] == "base":
-                base_row = r
-            else:
-                tag_to_scores.setdefault(r["tag"], []).append(r["score"])
-
-        lens = [_len_tokens(base.context + " " + base.candidate)]
-        scrs = [base_score]
-        for kind in ("order", "truncate_75", "truncate_50", "pad_ctx", "pad_cand"):
-            arr = tag_to_scores.get(kind, [])
-            for sc in arr:
-                # approximate length for this kind using a representative transform
-                if kind == "order":
-                    L = _len_tokens(base.context + " " + base.candidate)
-                elif kind == "truncate_75":
-                    L = _len_tokens(_truncate_context(base.context, 0.75) + " " + base.candidate)
-                elif kind == "truncate_50":
-                    L = _len_tokens(_truncate_context(base.context, 0.5) + " " + base.candidate)
-                elif kind == "pad_ctx":
-                    L = _len_tokens(_pad_context(base.context, 2) + " " + base.candidate)
-                else:  # pad_cand
-                    L = _len_tokens(base.context + " " + _pad_candidate(base.candidate, 3))
-                lens.append(L)
-                scrs.append(sc)
-
-        r_len = _pearsonr(lens, scrs)
-        len_corr_list.append(r_len)
-
-        lengths.extend(lens)
-        scores_for_lengths.extend(scrs)
-
-        # Gold agreement if present
-        if base.gold is not None:
-            golds = [float(base.gold)] * len(scrs)
-            gold_mse_list.append(_mse(scrs, golds))
-            gold_spr_list.append(_spearmanr(scrs, golds))
-
-        # CSV row for this item summary (schema-stable)
-        csv_rows.append({
-            "item_idx": bi,
-            "base_score": round(base_score, 4),
-            "consistency_at_eps": round(cons, 4),
-            "variance": round(var, 6),
-            "length_corr": round(r_len, 4),
-            "has_gold": int(base.gold is not None),
-        })
-
-    overall_len_corr = _pearsonr(lengths, scores_for_lengths) if lengths else 0.0
-    mean_consistency = float(np.mean(consist_list)) if consist_list else 0.0
-    mean_variance = float(np.mean(var_list)) if var_list else 0.0
-    mean_len_corr = float(np.mean(len_corr_list)) if len_corr_list else 0.0
-    mean_gold_mse = float(np.mean(gold_mse_list)) if gold_mse_list else None
-    mean_gold_spr = float(np.mean(gold_spr_list)) if gold_spr_list else None
+    # Language-pattern summaries
+    texts = [r.get("raw_text", "") or r.get("candidate", "") for r in all_records]
+    ask_rate = float(np.mean([("?" in t) for t in texts])) if texts else 0.0
+    name_mentions = [r.get("name_mentioned", 0) for r in all_records if "name_mentioned" in r]
+    name_mention_rate = float(np.mean(name_mentions)) if name_mentions else 0.0
+    vote_matches = [r.get("talk_vote_match", 0) for r in all_records if "talk_vote_match" in r]
+    vote_alignment_rate = float(np.mean(vote_matches)) if vote_matches else 0.0
+    redo_counts = [r.get("retry_count", 0) for r in all_records if isinstance(r.get("retry_count"), (int, float))]
+    redo_p95 = float(np.percentile(redo_counts, 95)) if redo_counts else 0.0
+    strict_oks = [r.get("strict_ok", 0) for r in all_records]
+    strict_ok_rate = float(np.mean(strict_oks)) if strict_oks else 0.0
 
     return {
-        "per_item_rows": csv_rows,
-        "all_records": all_records,  # detailed rows (stable schema per rec)
+        "mode": "rubric",
         "summary": {
             "n_items": len(items),
-            "seeds_per_item": seeds_per_item,
-            "eps_consistency": eps_consistency,
-            "mean_consistency_at_eps": round(mean_consistency, 4),
-            "mean_variance": round(mean_variance, 6),
-            "mean_length_corr": round(mean_len_corr, 4),
-            "overall_length_corr": round(overall_len_corr, 4),
-            "mean_gold_mse": None if mean_gold_mse is None else round(mean_gold_mse, 4),
-            "mean_gold_spearman": None if mean_gold_spr is None else round(mean_gold_spr, 4),
+            "ask_rate": round(ask_rate, 3),
+            "name_mention_rate": round(name_mention_rate, 3),
+            "vote_alignment_rate": round(vote_alignment_rate, 3),
+            "redo_p95": round(redo_p95, 3),
+            "strict_ok_rate": round(strict_ok_rate, 3),
+            "consistency_at_eps": round(float(np.mean(item_consistency)) if item_consistency else 0.0, 3),
+            "per_item_var_mean": round(float(np.mean(item_variances)) if item_variances else 0.0, 3),
+            "global_var": round(global_var, 3),
+            "length_bias_r": round(length_bias_r, 3),
+            "gold_mse": round(gold_mse, 4),
+            "gold_spearman": round(gold_spearman, 3),
         },
+        "all_records": all_records,
     }
+
+# ------------------------------- CSV writer --------------------------------
+
+def _write_csv(records: List[Dict[str, Any]], path: str) -> None:
+    if not records:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            f.write("")
+        return
+    # Collect stable field order
+    core = [
+        "item_idx", "tag", "role", "vote_target", "confidence", "score",
+        "rationale", "strict_ok", "retry_count", "redo_count",
+        "name_mentioned", "talk_vote_match", "specificity", "repetition_penalty",
+    ]
+    aux = [
+        "context", "candidate", "raw_text", "json", "error",
+    ]
+    # Include subscores if present
+    sub_keys = set()
+    for r in records:
+        if isinstance(r.get("subscores"), dict):
+            sub_keys.update(r["subscores"].keys())
+    sub_fields = [f"sub_{k}" for k in sorted(sub_keys)]
+
+    # Build rows
+    rows = []
+    for r in records:
+        row = {k: r.get(k) for k in core}
+        row.update({k: r.get(k) for k in aux})
+        # flatten subscores
+        if isinstance(r.get("subscores"), dict):
+            for k in sub_keys:
+                row[f"sub_{k}"] = r["subscores"].get(k)
+        rows.append(row)
+
+    # Final header
+    header = core + aux + sub_fields
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
 
 # ------------------------------- CLI entry --------------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="Judge bias/stability evaluation")
-    ap.add_argument("--rubric", default="rubrics/judge_rubric.yaml", help="Rubric YAML/JSON path")
-    ap.add_argument(
-        "--examples",
-        required=False,
-        help="Calibration set (JSONL). Lines with: {context, role, candidate, [gold]}"
-    )
-    ap.add_argument("--seeds", type=int, default=3, help="Seeds per item for perturbations")
-    ap.add_argument("--eps", type=float, default=0.05, help="Consistency epsilon")
-    ap.add_argument("--out_prefix", default="judge_eval", help="Output file prefix in logs/")
-    ap.add_argument("--audit_jsonl", action="store_true",
-                    help="If set, write per-call judge audit JSONL alongside report.")
+    ap = argparse.ArgumentParser(description="Judge bias, and stability evaluation")
+    ap.add_argument("--rubric", default="rubrics/judge_rubric.yaml")
+    ap.add_argument("--examples", required=False)
+    ap.add_argument("--seeds", type=int, default=3)
+    ap.add_argument("--eps", type=float, default=0.05)
+    ap.add_argument("--strict", action="store_true")
     args = ap.parse_args()
 
-    rubric = JudgeRubric.load(args.rubric)
-
-    # Load examples or use a tiny default set
     if args.examples and os.path.exists(args.examples):
         raw = _read_jsonl(args.examples)
         items = [EvalItem(
@@ -359,89 +449,32 @@ def main():
             role=r.get("role","Worker"),
             candidate=r.get("candidate",""),
             gold=r.get("gold", None),
+            vote_candidates=r.get("vote_candidates", None),
         ) for r in raw]
     else:
-        # Minimal fallback examples
-        fallback = [
-            {
-                "context": "- Agent_2: I saw Agent_4 near the scene.\n- Agent_4: I was with Agent_1 the whole time.\n- Agent_1: That’s not true.",
-                "role": "Worker",
-                "candidate": "I think Agent_4 is lying about being with Agent_1.",
-                "gold": 0.8,
-            },
-            {
-                "context": "- Agent_3: We should vote quickly.\n- Agent_5: Rushing helps the wolves.\n- Agent_0: Let’s gather more info.",
-                "role": "Werewolf",
-                "candidate": "We should vote now before they change their minds.",
-                "gold": 0.7,
-            },
-        ]
-        items = [EvalItem(**x) for x in fallback]
+        items = [EvalItem(
+            context="- Agent_1: Hello\n- Agent_2: I suspect Agent_3",
+            role="Worker",
+            candidate="Agent_3 seems off to me?",
+        )]
 
-    # Build and score
-    report = evaluate_set(
-        rubric=rubric,
-        items=items,
-        seeds_per_item=args.seeds,
-        eps_consistency=args.eps,
-    )
+    strict_mode = _is_strict_mode(items, args.strict)
+    rubric = JudgeRubric.load(args.rubric) if not strict_mode else JudgeRubric(criteria={"coherence":{"w":1.0,"def":""}})
+    report = evaluate_set(rubric, items, seeds_per_item=args.seeds, eps_consistency=args.eps, strict_vote=strict_mode)
 
-    logs_dir = _ensure_logs_dir()
-    # JSON report
-    json_path = os.path.join(logs_dir, f"{args.out_prefix}_report.json")
-    with open(json_path, "w", encoding="utf-8") as f:
+    out_dir = _ensure_logs_dir()
+    out_json = os.path.join(out_dir, "judge_eval_report.json")
+    with open(out_json, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
-    # CSV detailed records — schema-stable columns matching Judge subscores
-    csv_path = os.path.join(logs_dir, f"{args.out_prefix}_records.csv")
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["item_idx","tag","score","coherence","truthfulness","role_alignment","social_safety"])
-        w.writeheader()
-        for r in report["all_records"]:
-            # Ensure only expected keys are written
-            row = {k: r.get(k, 0.0) if k != "tag" else r.get(k, "base") for k in w.fieldnames}
-            w.writerow(row)
 
-    # NEW: optional audit jsonl for calibration runs (reuse judge.audit_judge_calls)
-    if args.audit_jsonl:
-        from datetime import datetime
-        run_id = f"judge_eval_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}"
-        audit_path = os.path.join(logs_dir, "judge_eval_calls.jsonl")
-        try:
-            # Re-score in chunks to capture inputs+outputs with shared helper
-            from judge import audit_judge_calls
-            # Recreate the flat batch used inside evaluate_set
-            flat_inputs: List[Dict[str, str]] = []
-            rng = random.Random(1337)
-            for it in items:
-                seeds = [rng.randint(0, 1_000_000) for _ in range(args.seeds)]
-                perts = make_perturbations(it, seeds)
-                flat_inputs.append({"context": it.context, "role": it.role, "candidate": it.candidate})
-                for p in perts:
-                    flat_inputs.append({"context": p.context, "role": p.role, "candidate": p.candidate})
+    out_csv = os.path.join(out_dir, "judge_eval_records.csv")
+    _write_csv(report.get("all_records", []), out_csv)
 
-            # Score again (deterministic judge) to align lengths safely
-            scores = score_batch(flat_inputs, rubric)
-            CHUNK = 256
-            for i in range(0, len(flat_inputs), CHUNK):
-                audit_judge_calls(
-                    run_id=run_id,
-                    round_num=-1,       # not a sim round; mark as -1
-                    phase="EVAL",
-                    agent="__eval__",
-                    items=flat_inputs[i:i+CHUNK],
-                    results=scores[i:i+CHUNK],
-                    jsonl_path=audit_path,
-                )
-        except Exception as e:
-            print("[judge_eval] audit_jsonl failed:", e)
-
-    # Console summary
-    s = report["summary"]
     print("\n=== Judge Eval Summary ===")
-    for k, v in s.items():
+    for k, v in report["summary"].items():
         print(f"{k}: {v}")
-    print(f"\nSaved JSON → {json_path}")
-    print(f"Saved CSV  → {csv_path}")
+    print(f"\nSaved JSON -> {out_json}")
+    print(f"Saved CSV -> {out_csv}")
 
 if __name__ == "__main__":
     main()

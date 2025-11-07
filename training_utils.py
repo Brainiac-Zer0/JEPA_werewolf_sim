@@ -5,6 +5,7 @@ import os
 import random
 import math
 import csv
+import atexit
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Any, Optional, Iterable, DefaultDict
 from collections import defaultdict
@@ -193,6 +194,156 @@ class TrainingEpochLogger:
                 ],
             )
             w.writerow(row)
+
+# =============================================================================
+# NEW: Lightweight language metrics CSV (buffered)
+# =============================================================================
+
+class _LangMetricsWriter:
+    """
+    Buffered writer for per-utterance language metrics.
+
+    • File: logs/lang_metrics.csv
+    • Always includes run_id and seed
+    • Call lang_metrics_write_utterances(...) anywhere (agent/sim/speaker/judge/llm_script)
+    • Call lang_metrics_flush() at *episode end* (or any time you want a disk flush)
+
+    Columns (schema-stable & compact):
+        run_id, seed, round, phase, agent, role, speaker_mode, choice_type,
+        template_id, talk_cat, arg_id,
+        judge_score, coherence, truthfulness, role_alignment, social_safety,
+        align_tv, rep_penalty
+    """
+    def __init__(self, path: str = os.path.join(LOGS_DIR, "lang_metrics.csv")):
+        self.path = path
+        self._buffer: List[Dict[str, Any]] = []
+        self._header = [
+            "run_id","seed","round","phase","agent","role","speaker_mode","choice_type",
+            "template_id","talk_cat","arg_id",
+            "judge_score","coherence","truthfulness","role_alignment","social_safety",
+            "align_tv","rep_penalty",
+        ]
+        self._ensure_header()
+
+    def _ensure_header(self):
+        if not os.path.exists(self.path):
+            with open(self.path, "w", newline="", encoding="utf-8") as f:
+                csv.DictWriter(f, fieldnames=self._header).writeheader()
+
+    def write(self, row: Dict[str, Any]):
+        # Minimal sanitation and field projection
+        clean = {k: row.get(k, "") for k in self._header}
+        self._buffer.append(clean)
+
+    def write_many(self, rows: List[Dict[str, Any]]):
+        for r in rows:
+            self.write(r)
+
+    def flush(self):
+        if not self._buffer:
+            return
+        with open(self.path, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=self._header)
+            w.writerows(self._buffer)
+        self._buffer.clear()
+
+# Module-level singleton & helpers
+_LANG_WRITER: Optional[_LangMetricsWriter] = _LangMetricsWriter()
+
+def lang_metrics_write_utterances(
+    *,
+    run_id: str,
+    seed: int,
+    phase: str,
+    speaker_mode: str,
+    agent_name: str,
+    utterances: List["UtteranceSample"],
+) -> None:
+    """
+    Convenience adapter to log a batch of UtteranceSample rows
+    from anywhere (sim/agent/speaker_llm/judge/llm_script).
+    """
+    if not utterances or _LANG_WRITER is None:
+        return
+    rows = []
+    for s in utterances:
+        rows.append({
+            "run_id": run_id,
+            "seed": seed,
+            "round": int(getattr(s, "round_num", 0)),
+            "phase": str(phase),
+            "agent": str(agent_name),
+            "role": str(getattr(s, "role", "")),
+            "speaker_mode": str(speaker_mode),
+            "choice_type": "TALK_INTENT",  # UtteranceSample is for talk rows
+            "template_id": int(s.template_id) if s.template_id is not None else "",
+            "talk_cat": int(s.talk_cat) if s.talk_cat is not None else "",
+            "arg_id": int(s.arg_id) if s.arg_id is not None else "",
+            "judge_score": float(s.judge_score),
+            "coherence": float(s.coherence),
+            "truthfulness": float(s.truthfulness),
+            "role_alignment": float(s.role_alignment),
+            "social_safety": float(s.social_safety),
+            "align_tv": "" if s.align_tv is None else float(s.align_tv),
+            "rep_penalty": "" if s.rep_penalty is None else float(s.rep_penalty),
+        })
+    _LANG_WRITER.write_many(rows)
+
+def lang_metrics_write_generic(
+    *,
+    run_id: str,
+    seed: int,
+    round_num: int,
+    phase: str,
+    agent: str,
+    role: str,
+    speaker_mode: str,
+    choice_type: str,
+    judge_score: float = 0.0,
+    coherence: float = 0.0,
+    truthfulness: float = 0.0,
+    role_alignment: float = 0.0,
+    social_safety: float = 0.0,
+    template_id: Optional[int] = None,
+    talk_cat: Optional[int] = None,
+    arg_id: Optional[int] = None,
+    align_tv: Optional[float] = None,
+    rep_penalty: Optional[float] = None,
+) -> None:
+    """
+    Generic rows (e.g., vote/kill language explanations or judge_eval/judge traces).
+    Keeps the same CSV schema.
+    """
+    if _LANG_WRITER is None:
+        return
+    _LANG_WRITER.write({
+        "run_id": run_id,
+        "seed": seed,
+        "round": int(round_num),
+        "phase": str(phase),
+        "agent": str(agent),
+        "role": str(role),
+        "speaker_mode": str(speaker_mode),
+        "choice_type": str(choice_type),
+        "template_id": "" if template_id is None else int(template_id),
+        "talk_cat": "" if talk_cat is None else int(talk_cat),
+        "arg_id": "" if arg_id is None else int(arg_id),
+        "judge_score": float(judge_score),
+        "coherence": float(coherence),
+        "truthfulness": float(truthfulness),
+        "role_alignment": float(role_alignment),
+        "social_safety": float(social_safety),
+        "align_tv": "" if align_tv is None else float(align_tv),
+        "rep_penalty": "" if rep_penalty is None else float(rep_penalty),
+    })
+
+def lang_metrics_flush() -> None:
+    """Manually flush buffered rows to disk (call this at EPISODE END)."""
+    if _LANG_WRITER is not None:
+        _LANG_WRITER.flush()
+
+# Always flush at process exit as a safety net
+atexit.register(lang_metrics_flush)
 
 # =============================================================================
 # Metrics helpers (acc & illegal mass)

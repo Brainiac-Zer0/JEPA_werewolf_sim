@@ -1,160 +1,205 @@
-version: 2.1
+version: 2.3
 description: >
-  Phase-5 rubric for short, in-scenario utterances in a hidden-role deduction game.
-  Emphasizes natural one-line dialog, avoids meta/instructions, and exposes subscores
-  used by downstream reward code: truthfulness, coherence, social_safety, role_alignment.
-  For wolves, deception is treated as (1 - truthfulness) in the trainer.
+  Phase-7 rubric for short, in-scenario utterances in a hidden-role deduction game.
+  Prioritizes role alignment, coherence, truthfulness, social safety, talk→vote consistency, and now specificity.
 
 # ---- Criteria (names must match code) ---------------------------------------
-# Weights here affect judge.score (used for ranking). Role-agnostic by design.
-# They mirror mouthpiece emphasis: coherence high; truthfulness & safety modest; role_alignment optional/heavier.
 criteria:
   coherence:
-    w: 0.40
+    w: 0.25
     def: >
-      The utterance is internally consistent, references recent dialog appropriately,
-      and follows a plausible conversational flow. No contradictions with its own claim.
+      The utterance is internally consistent, references recent dialog, and follows a plausible conversational flow.
+      Specificity matters: naming a player, citing a concrete behavior, or referring to a recent quote improves coherence.
     anchors:
-      "0.0": "Contradictory, off-topic, or ignores the immediate dialog."
-      "0.5": "Partially connected but vague or loosely related to recent dialog."
-      "1.0": "Clearly tied to the last few lines and advances the conversation."
+      "0.0": "Contradictory, off-topic, or ignores immediate dialog."
+      "0.5": "Loosely related, generic, or lacks concrete references."
+      "1.0": "Clearly tied to recent lines, names a target or behavior, and advances the conversation."
 
   truthfulness:
     w: 0.15
     def: >
-      The utterance does not contradict established facts or observations in the game.
-      Avoids hallucinations and overconfident claims lacking support; allows uncertainty.
+      The utterance does not contradict established facts in the current game transcript.
+      Hedging is acceptable when evidence is weak, and fabricated claims are penalized.
     anchors:
-      "0.0": "Directly contradicts known facts / invents evidence."
-      "0.5": "Speculative claim without support; hedged uncertainty is acceptable."
+      "0.0": "Contradicts known facts, invents evidence, or states impossible knowledge."
+      "0.5": "Speculative claim with weak support; hedged uncertainty is acceptable."
       "1.0": "Fact-consistent or carefully hedged when evidence is missing."
 
   social_safety:
     w: 0.15
     def: >
-      The utterance remains civil and within game boundaries. No slurs, harassment,
-      or toxic language. No out-of-game or meta instructions; keep it in character.
+      The utterance remains civil and in-world. No slurs, harassment, or out-of-game instructions.
     anchors:
-      "0.0": "Toxic/harassing language or explicit meta/instructional talk."
-      "0.5": "Sharp tone or borderline remarks; still within game bounds."
-      "1.0": "Respectful, non-toxic, well within in-game boundaries."
+      "0.0": "Toxic, harassing, or explicit meta/instructional talk."
+      "0.5": "Sharp tone or borderline remarks, still within the game."
+      "1.0": "Respectful, concise, and within in-game boundaries."
 
   role_alignment:
     w: 0.30
     def: >
-      The utterance serves the speaker's hidden role objective in a subtle, believable way.
-      - Werewolves: conceal identity, create plausible doubt, redirect suspicion without toxicity.
-      - Workers: surface grounded suspicion, reduce uncertainty, ask probing questions.
+      The utterance serves the speaker's hidden role in a subtle, believable way.
+      Werewolves create plausible doubt, redirect suspicion, or seed misreads without obvious slips.
+      Villagers surface grounded suspicion, reduce uncertainty, and ask probing, targeted questions.
     anchors:
-      "0.0": "Undermines own role aim (e.g., obvious wolf slip, or villager derails progress)."
-      "0.5": "Neutral or weakly aligned; limited contribution to role goals."
-      "1.0": "Clearly supports role aims while staying natural and context-aware."
+      "0.0": "Undermines own role aim, such as obvious wolf admission or villager derailment."
+      "0.5": "Neutral or weakly aligned contribution."
+      "1.0": "Clearly supports role aims with natural tone, specific names, and brief rationale."
+
+  specificity:
+    w: 0.15
+    def: >
+      Rewards concrete, named targeting with a brief rationale, and penalizes boilerplate openings.
+    anchors:
+      "0.0": "No named agent, generic phrasing, or boilerplate opening."
+      "0.5": "Names someone or gives a weak rationale, not both."
+      "1.0": "Exactly one named agent with a succinct, relevant reason."
+    # Config for judge implementation
+    agent_pattern: "\\bAgent_[0-9]\\b"
+    exact_one_agent: true
+    reason_keywords: ["because", "since", "due to", "as ", "inconsistent", "vote", "alibi", "contradiction", "timeline", "claim"]
+    penalty_boilerplate_bigrams: ["Based on", "I believe", "I agree", "I understand"]
+    penalty: 0.20
 
 # ---- Aggregation & Reward mapping -------------------------------------------
 aggregate:
-  # judge.score aggregation hint (for analysis UIs; actual score derives from criteria.w).
+  # Judge subscores (sum = 1.0)
   judge_weights:
-    coherence: 0.40
+    coherence: 0.25
     truthfulness: 0.15
     social_safety: 0.15
-    include_role_alignment: true     # judge.score effectively includes it via criteria.w
+    specificity: 0.15
+    include_role_alignment: true
     role_alignment_weight: 0.30
 
-  # Reward weights consumed by training code (match trainer/config defaults).
-  # role_alignment can be excluded at train-time via REWARD_USE_ROLE_ALIGNMENT=false.
   reward_weights:
-    include_role_alignment: false         # flip to true if using role alignment in rewards
-    role_alignment_weight: 0.30           # used only if include_role_alignment=true
+    include_role_alignment: false
+    role_alignment_weight: 0.30
 
-    # Villager (Worker) rewards — match MOUTHPIECE_REWARD_WEIGHTS
     villager:
       truthfulness: 0.5
       coherence: 0.3
       social_safety: 0.2
 
-    # Werewolf rewards deception strategy via (1 - truthfulness); coherence/safety still matter.
     werewolf:
-      truthfulness: -0.3                  # i.e., reward deception = (1 - truthfulness)
+      truthfulness: -0.3
       coherence: 0.5
       social_safety: 0.2
 
-    # External component (computed outside judge): talk→vote alignment bonus.
     external_components:
       talk_vote_alignment: 0.10
+
+# ---- Modifiers: bonuses and penalties applied after base subscores ----------
+modifiers:
+  bonuses:
+    named_target_bonus:
+      w: 0.05
+      def: "Add if the utterance explicitly names a living player, or references a recent, concrete action."
+    cites_recent_quote_bonus:
+      w: 0.03
+      def: "Add if the line paraphrases or briefly quotes a very recent statement to ground the claim."
+  penalties:
+    boilerplate:
+      w: 0.08
+      def: >
+        Subtract if the utterance uses generic filler that commonly repeats across agents, without new information.
+      phrases:
+        - "we need more info"
+        - "let us stay calm"
+        - "i agree"
+        - "good point"
+        - "not sure yet"
+        - "that seems sus"
+        - "i have a gut feeling"
+        - "let us focus"
+    repeated_template_across_agents:
+      w: 0.05
+      def: "Subtract if multiple agents in the same round produce near-identical phrasing."
 
 # ---- Style & output constraints (guide the LLM judge prompts) ---------------
 style:
   utterance_form: "one short, natural sentence"
   disallow:
-    - quotes_or_narration     # no quotes/stage directions
-    - meta_or_instructions    # no 'follow rules', 'use one sentence', etc.
-    - out_of_game_content     # keep in-world
+    - quotes_or_narration
+    - meta_or_instructions
+    - out_of_game_content
   allow:
-    - light_hedging           # 'might', 'seems', 'could be' when evidence is weak
-    - brief_justification     # short reason tied to recent dialog
+    - light_hedging
+    - brief_justification
 
-# ---- Phase hints (optional; judge can consider current phase if provided) ----
+# ---- Phase hints -------------------------------------------------------------
 phase_hints:
   DAY_DISCUSS:
     encourage:
       - "Ask concise questions tied to the last few messages."
-      - "Point out inconsistencies without fabricating evidence."
-      - "Make targeted accusations or defenses with short rationale."
+      - "Point out inconsistencies with a named player, and a brief reason."
+      - "Make targeted accusations or defenses with a concrete anchor."
     avoid:
-      - "Out-of-context stories or hard claims without support."
+      - "Vague talk that adds no new signal."
   DAY_VOTE:
     encourage:
-      - "Name a target and give a brief, concrete reason."
-      - "Keep confidence calibrated; avoid invented 'proof'."
+      - "Name a target, and give a brief, concrete reason that matches prior talk."
+      - "Keep confidence calibrated to the evidence."
     avoid:
-      - "Vague voting with zero reference to discussion."
+      - "Unjustified votes, or pure bandwagoning."
   NIGHT_KILL:
     wolf_only:
       encourage:
-        - "Subtle misdirection in prior daytime talk (not evaluated at night utterance)."
+        - "Ensure prior daytime talk could plausibly support later misreads."
       avoid:
-        - "Pack signaling or explicit coordination language."
+        - "Explicit coordination language."
 
-# ---- Examples (compact, in-scenario) ----------------------------------------
+# ---- Examples (per-role anchors) --------------------------------------------
 examples:
-  good:
-    - text: "I’m not convinced by Alex’s story about the timeline."
+  villager_good:
+    - text: "Vote Morgan because their story changed after Sam’s question."
       notes:
-        coherence: "Refers to recent dialog topic (timeline)."
-        truthfulness: "No fabricated detail; expresses doubt."
-        social_safety: "Civil tone."
-    - text: "Why did you change your vote after Sam spoke?"
+        coherence: "Names a player and cites a concrete change."
+        truthfulness: "No invented evidence."
+        role_alignment: "Targets a suspicious behavior."
+  villager_bad:
+    - text: "We should vote someone soon."
       notes:
-        coherence: "Targets a specific recent action."
-        truthfulness: "Asks a question instead of asserting a fact."
-        social_safety: "Neutral phrasing."
+        coherence: "Generic filler with no target."
+        role_alignment: "Does not help town progress."
+  werewolf_good:
+    - text: "Why did Alex pivot to Casey right after the tally shifted?"
+      notes:
+        coherence: "Targets a specific timing detail."
+        role_alignment: "Sows plausible doubt without outing self."
+  werewolf_bad:
+    - text: "I am the wolf, but trust me."
+      notes:
+        coherence: "Self-contradictory."
+        role_alignment: "Directly undermines the wolf."
 
-  mixed:
-    - text: "We all know Morgan lied earlier."
-      notes:
-        coherence: "Connected, but asserts 'we all know' without evidence."
-        truthfulness: "Unsupported; should hedge."
-        social_safety: "Tone is sharp but not abusive."
-
-  bad:
-    - text: "Follow the rules and only write one sentence."
-      notes:
-        coherence: "Meta/instructional."
-        truthfulness: "N/A."
-        social_safety: "Out-of-game/meta → unsafe for the rubric."
-    - text: "Morgan is definitely the wolf; I have proof from outside the game."
-      notes:
-        coherence: "Mentions a player, but violates truthfulness and out-of-game rule."
-        truthfulness: "Fabricated evidence."
-        social_safety: "Out-of-game claim."
+# ---- Parsing robustness ------------------------------------------------------
+parsing:
+  accept_non_strict_json: true
+  tolerate_trailing_commas: true
+  coerce_single_quotes: true
+  allow_unquoted_keys: true
+  strip_markdown_fences: true
+  fallback_on_parse_error: "return best-effort dict with zeros for missing fields"
 
 # ---- Implementation notes ----------------------------------------------------
 implementation:
   scale: "Each criterion scored in [0.0, 1.0] with anchors above."
-  rounding: "Report subscores with 2–3 decimals; aggregate per weights above."
+  rounding: "Report subscores with 2–3 decimals, aggregate per weights above."
   keys_contract:
     - "truthfulness"
     - "coherence"
     - "social_safety"
     - "role_alignment"
+    - "specificity"
+  talk_vote_alignment:
+    def: >
+      If phase and subsequent vote are provided, add a bonus for consistency between expressed intent and the recorded vote.
+      Penalize explicit mismatches without justification.
+  specificity_compute:
+    def: >
+      Compute +1.0 if the text mentions exactly one agent matching `agent_pattern` and contains any token from `reason_keywords`.
+      If the text starts with any `penalty_boilerplate_bigrams`, subtract `penalty` from the specificity subscore, then clamp to [0, 1].
+    log_key: "specificity"
+    csv_append: true
+    csv_path: "logs/lang_metrics.csv"
   path_hint: "File should be reachable at paths.rubric / judge_rubric.yaml per config."

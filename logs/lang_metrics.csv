@@ -1,0 +1,10 @@
+run_id,seed,round,phase,agent,role,speaker_mode,choice_type,template_id,talk_cat,arg_id,judge_score,coherence,truthfulness,role_alignment,social_safety,align_tv,rep_penalty
+run_1762556842_dc76e1,123,1,DAY_DISCUSS,Agent_0,,,,,,,,,,,,,
+run_1762556842_dc76e1,123,1,DAY_DISCUSS,Agent_1,,,,,,,,,,,,,
+run_1762556842_dc76e1,123,1,DAY_DISCUSS,Agent_2,,,,,,,,,,,,,
+run_1762556842_dc76e1,123,1,DAY_DISCUSS,Agent_3,,,,,,,,,,,,,
+run_1762556842_dc76e1,123,1,DAY_DISCUSS,Agent_4,,,,,,,,,,,,,
+run_1762556842_dc76e1,123,1,DAY_DISCUSS,Agent_5,,,,,,,,,,,,,
+run_1762556842_dc76e1,123,1,DAY_DISCUSS,Agent_6,,,,,,,,,,,,,
+run_1762556842_dc76e1,123,1,DAY_DISCUSS,Agent_7,,,,,,,,,,,,,
+run_1762556842_dc76e1,123,1,DAY_DISCUSS,Agent_8,,,,,,,,,,,,,
