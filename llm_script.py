@@ -379,6 +379,37 @@ def _inject_named_target_if_generic(t: str, named_target: Optional[str]) -> str:
     t = _GENERIC_AGENT_WORD_RE.sub(named_target, t)
     return t
 
+# Deduplicate possessives like: "Agent_6's's" → "Agent_6's"
+_DEDUP_POSSESSIVE_RE = re.compile(r"\b([A-Za-z_0-9]+)'s's\b")
+def _dedupe_possessives(text: str) -> str:
+    if not text:
+        return text
+    return _DEDUP_POSSESSIVE_RE.sub(r"\1's", text)
+
+# Trim simple repeated bigrams within short utterances to reduce boilerplate stutter
+def _squelch_repetition(text: str) -> str:
+    if not text:
+        return text
+    toks = text.split()
+    if len(toks) < 6:
+        return text
+    bigrams = []
+    out = []
+    i = 0
+    while i < len(toks) - 1:
+        bg = (toks[i].lower(), toks[i+1].lower())
+        if bigrams and bg == bigrams[-1]:
+            i += 2
+            continue
+        bigrams.append(bg)
+        out.append(toks[i])
+        i += 1
+    if i == len(toks) - 1:
+        out.append(toks[-1])
+    s = " ".join(out)
+    s = re.sub(r"\b(\w+)(\s+\1){2,}\b", r"\1\1", s, flags=re.IGNORECASE)
+    return s
+
 def _ground_entities(text: str, agent, *, named_target: Optional[str]) -> str:
     if not text:
         return text
@@ -495,7 +526,6 @@ def _build_messages(
         rule_bits.append("Do not mention night.")
     rule = (" [" + " ".join(rule_bits) + "]") if rule_bits else ""
 
-    # If we have recent context, require citing one concrete detail from it.
     k = int(PROMPTING.get("include_context_window", 0) or 0)
     has_ctx = bool(k and recent_lines)
 
@@ -567,7 +597,7 @@ def get_openai_client() -> Any:
     _OA_CLIENT = OpenAI(api_key=api_key)  # type: ignore
     return _OA_CLIENT
 
-# Only allow Responses-API knobs. Removed 'stop' to avoid unexpected keyword error.
+# Only allow Responses-API knobs. Keep minimal to avoid invalid_request_error.
 _ALLOWED_RESPONSES_KW = {"max_output_tokens"}
 
 def _filter_responses_kwargs(kwargs: dict) -> dict:
@@ -583,7 +613,6 @@ def build_openai_args(model_id: str, cfg_block: dict) -> Dict[str, Any]:
     llm_cfg = cfg_block.get("llm", {}) if isinstance(cfg_block, dict) else {}
     oai = llm_cfg.get("openai", {}) if isinstance(llm_cfg, dict) else {}
     out: Dict[str, Any] = {}
-    # Allow explicit cap if provided in openai block, otherwise defer to call-site
     if isinstance(oai.get("max_output_tokens", None), int):
         out["max_output_tokens"] = int(oai["max_output_tokens"])
     return _filter_responses_kwargs(out)
@@ -644,15 +673,15 @@ class _TokShimOpenAI:
 class _OpenAIPipe:
     """
     HF-like callable wrapper around OpenAI via Responses API.
-    Returns: [{ 'generated_text': anchored_prompt + completion }]
+    For compatibility with judge.py, this returns a plain string completion,
+    not a list. Speaker code detects this class and handles the return type.
     """
     def __init__(self, model: str, client: Any, system_fallback: str = "You are a concise in-world speaker."):
         self.model = model
         self.client = client
         self.system_fallback = system_fallback
 
-    def __call__(self, anchored_prompt: str, **kwargs) -> List[Dict[str, str]]:
-        # Compute output token cap (support HF-style alias), then merge with llm.openai.* only.
+    def __call__(self, anchored_prompt: str, **kwargs) -> str:
         max_output_tokens = int(kwargs.get("max_output_tokens", kwargs.get("max_new_tokens", 64)))
 
         messages = [
@@ -660,9 +689,7 @@ class _OpenAIPipe:
             {"role": "user", "content": anchored_prompt},
         ]
 
-        # Restrict cfg to llm.openai.*, never the top-level llm.* knobs.
         oai_args = build_openai_args(self.model, CFG)
-        # Call through centralized helper
         text_out = llm_complete(
             self.model,
             messages,
@@ -671,9 +698,8 @@ class _OpenAIPipe:
                 "max_output_tokens": max_output_tokens if max_output_tokens else oai_args.get("max_output_tokens"),
             }),
         )
-
         generated = (anchored_prompt or "") + (text_out or "")
-        return [{"generated_text": generated}]
+        return generated
 
 def _using_openai_provider() -> bool:
     provider = PROVIDER_DEFAULT
@@ -681,6 +707,36 @@ def _using_openai_provider() -> bool:
         return True
     mid = _env_str("LLM_MODEL_ID", MODEL_ID_DEFAULT).strip().lower()
     return mid.startswith(("gpt-", "o", "chatgpt"))
+
+# Optional factory used by some callers (e.g., older judge variants).
+def llm_pipe(*, model_id: Optional[str] = None, provider: Optional[str] = None, system_fallback: Optional[str] = None):
+    use_oai = False
+    if provider:
+        use_oai = provider.strip().lower() in ("openai", "oai")
+    else:
+        use_oai = _using_openai_provider()
+    model = model_id or _env_str("LLM_MODEL_ID", MODEL_ID_DEFAULT)
+    if use_oai:
+        client = get_openai_client()
+        return _OpenAIPipe(model=model, client=client, system_fallback=system_fallback or "You are a concise in-world speaker.")
+    # HF fallback
+    tok_local = AutoTokenizer.from_pretrained(model, use_fast=True)
+    if tok_local.pad_token_id is None:
+        if tok_local.eos_token is not None:
+            tok_local.pad_token = tok_local.eos_token
+        else:
+            tok_local.add_special_tokens({"pad_token": "<|pad|>"})
+    tok_local.padding_side = "left"
+    mdl = AutoModelForCausalLM.from_pretrained(model, torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32, low_cpu_mem_usage=True)
+    if getattr(mdl.config, "vocab_size", None) is not None and len(tok_local) != mdl.config.vocab_size:
+        try: mdl.resize_token_embeddings(len(tok_local))
+        except Exception: pass
+    pipe = pipeline("text-generation", model=mdl, tokenizer=tok_local, device=0 if torch.cuda.is_available() else -1)
+    class _HFPipe:
+        def __call__(self, anchored_prompt: str, **kwargs):
+            out = pipe(anchored_prompt, max_new_tokens=int(kwargs.get("max_new_tokens", 64)), do_sample=True)
+            return [{"generated_text": anchored_prompt + (out[0].get("generated_text","") or "")}]
+    return _HFPipe()
 
 # ── Lazy loader (HF or OpenAI) ───────────────────────────────────────────────
 def _lazy_load_llm():
@@ -696,9 +752,9 @@ def _lazy_load_llm():
     if use_openai:
         client = get_openai_client()
         tok_local = _TokShimOpenAI()
-        llm_pipe = _OpenAIPipe(model=model_id, client=client)
+        llm_pipe_local = _OpenAIPipe(model=model_id, client=client)
         print(f"[INFO] OpenAI mouthpiece ready (Responses): model={model_id}")
-        _tok, _model, _llm_pipeline = tok_local, None, llm_pipe
+        _tok, _model, _llm_pipeline = tok_local, None, llm_pipe_local
         tok = _tok
         return _llm_pipeline, _tok
 
@@ -728,7 +784,7 @@ def _lazy_load_llm():
         model.config.pad_token_id = tok_local.pad_token_id
 
     pipe_device = 0 if device == "cuda" else (int(device.split(":")[1]) if device.startswith("cuda:") else -1)
-    llm_pipe = pipeline("text-generation", model=model, tokenizer=tok_local, device=pipe_device)
+    llm_pipe_local = pipeline("text-generation", model=model, tokenizer=tok_local, device=pipe_device)
 
     if use_gpu:
         try:
@@ -739,7 +795,7 @@ def _lazy_load_llm():
     else:
         print(f"[INFO] LLM loaded on {device.upper()}")
 
-    _tok, _model, _llm_pipeline = tok_local, model, llm_pipe
+    _tok, _model, _llm_pipeline = tok_local, model, llm_pipe_local
     tok = _tok
     return _llm_pipeline, _tok
 
@@ -770,9 +826,9 @@ def _lazy_mouthpiece():
             raise RuntimeError("LLM mouthpiece disabled by resolved gate, strict debug on.")
         _MOUTHPIECE = _MouthStub()
         return _MOUTHPIECE
-    llm_pipe, tok_local = _lazy_load_llm()
+    llm_pipe_local, tok_local = _lazy_load_llm()
     device = _resolve_device()
-    _MOUTHPIECE = Mouthpiece(llm_pipe, tok_local, device)
+    _MOUTHPIECE = Mouthpiece(llm_pipe_local, tok_local, device)
     return _MOUTHPIECE
 
 def _anchor_prompt(txt: str) -> str:
@@ -863,20 +919,17 @@ class Mouthpiece:
         if max_new_tokens < min_new_tokens:
             max_new_tokens = max(min_new_tokens, 24)
 
-        anchored = _anchor_prompt(prompt)  # anchor BEFORE the call
+        anchored = _anchor_prompt(prompt)
 
         try:
-            # Detect OpenAI pipe and avoid passing HF-only decoding knobs.
             if isinstance(self.pipe, _OpenAIPipe):
-                # Merge cfg-based OpenAI kwargs, and force our token cap.
                 cfg_args = build_openai_args(self.pipe.model, CFG)
                 cfg_args["max_output_tokens"] = max_new_tokens
                 resp = self.pipe(
                     anchored,
                     **_filter_responses_kwargs(cfg_args),
-                )[0].get("generated_text", "")
+                )
             else:
-                # HF path: include decoding knobs.
                 gen_kwargs = dict(extra_kwargs or {})
                 for k in ("max_new_tokens","temperature","top_p","repetition_penalty","no_repeat_ngram_size","min_new_tokens"):
                     gen_kwargs.pop(k, None)
@@ -898,7 +951,6 @@ class Mouthpiece:
             print(f"[LLM ERROR/generate] {e}")
             return SAFE_FALLBACK
 
-        # Post-call early-stop and hygiene
         cont = resp[len(anchored):] if resp.startswith(anchored) else resp
         cont = _early_stop(cont)
         cont = _one_line(cont)
@@ -907,6 +959,8 @@ class Mouthpiece:
         cont = _postfilter_meta(cont)
         cont = _sanitize(cont)
         cont = normalize_contractions(strip_parentheticals(cont))
+        cont = _dedupe_possessives(cont)
+        cont = _squelch_repetition(cont)
         return cont or SAFE_FALLBACK
 
     def __call__(self, prompt: str, *, generate_kwargs: Optional[Dict[str, Any]] = None) -> str:
@@ -1208,6 +1262,8 @@ def chatgpt_llm_with_bias(
 
     text = _ground_entities(text, agent, named_target=named_target)
     text = _collapse_odd_artifacts(text)
+    text = _dedupe_possessives(text)
+    text = _squelch_repetition(text)
 
     text, guard_meta = _enforce_utterance_constraints(text, phase=phase)
 
@@ -1261,4 +1317,6 @@ __all__ = [
     "llm_text",
     "llm_complete",
     "build_openai_args",
+    "_OpenAIPipe",
+    "llm_pipe",
 ]

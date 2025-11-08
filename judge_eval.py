@@ -42,6 +42,13 @@ def _logs_dir_from_cfg(default: str = "logs") -> str:
     lg = _CFG.get("logging", {}) if isinstance(_CFG.get("logging", {}), dict) else {}
     return lg.get("dir", default) or default
 
+# Pick rubric default from config if available, else fall back to repo root file.
+RUBRIC_DEFAULT = (
+    (_CFG.get("JUDGE_RUBRIC_PATH") if isinstance(_CFG, dict) else None)
+    or (_CFG.get("RUBRIC_PATH") if isinstance(_CFG, dict) else None)
+    or "judge_rubric.yaml"
+)
+
 # ------------------------------- I/O utils --------------------------------
 
 def _read_jsonl(path: str) -> List[Dict[str, Any]]:
@@ -260,9 +267,20 @@ def evaluate_set(
             per_item_ctx_lens.append(ctxlens)
 
         # Metrics
-        flat_conf = [float(r["confidence"]) for r in all_records if r.get("confidence") is not None]
-        flat_ctx_len = [_len_tokens(r.get("context", "")) for r in all_records]
-        conf_len_r = _pearsonr(flat_ctx_len[:len(flat_conf)], flat_conf) if flat_conf else 0.0
+        # Pair context length and confidence only where confidence exists.
+        pairs = [
+            (_len_tokens(r.get("context", "")), float(r["confidence"]))
+            for r in all_records
+            if r.get("confidence") is not None
+        ]
+        if pairs:
+            flat_ctx_len = [p[0] for p in pairs]
+            flat_conf = [p[1] for p in pairs]
+            conf_len_r = _pearsonr(flat_ctx_len, flat_conf)
+        else:
+            flat_ctx_len = []
+            flat_conf = []
+            conf_len_r = 0.0
 
         item_variances = [_variance(vs) for vs in per_item_conf_vals if vs]
         item_consistency = [_consistency_at_eps(vs, eps_consistency) for vs in per_item_conf_vals if vs]
@@ -435,7 +453,7 @@ def _write_csv(records: List[Dict[str, Any]], path: str) -> None:
 
 def main():
     ap = argparse.ArgumentParser(description="Judge bias, and stability evaluation")
-    ap.add_argument("--rubric", default="rubrics/judge_rubric.yaml")
+    ap.add_argument("--rubric", default=RUBRIC_DEFAULT)
     ap.add_argument("--examples", required=False)
     ap.add_argument("--seeds", type=int, default=3)
     ap.add_argument("--eps", type=float, default=0.05)

@@ -11,7 +11,7 @@ def _env_bool(name: str, default: bool) -> bool:
     if v is None or (isinstance(v, str) and v.strip() == ""):
         return default
     try:
-        return str(v).strip().lower() in ("1","true","yes","y","on")
+        return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
     except Exception:
         return default
 
@@ -222,19 +222,41 @@ def _dbg_write(record: Dict[str, Any]):
     except Exception as e:
         print("[JUDGE-DBG] write failed:", e, file=sys.stderr)
 
-# ────────────── LLM wrapper (shared mouth from llm_script) ──────────────
+# ────────────── LLM wrapper (judge uses ungated pipe) ──────────────
 _mouth = None
 def _get_mouth():
+    """
+    Build an ungated JSON-only pipe for the judge, independent of the speaker gate.
+    If using the OpenAI provider, construct a strict Responses-based pipe with its own system message.
+    Otherwise, fall back to llm_script.llm_fn_from_env().
+    """
     global _mouth
     if _mouth is not None:
         return _mouth
+
+    # Prefer OpenAI strict JSON path
+    if _using_openai_provider():
+        try:
+            from llm_script import get_openai_client, _OpenAIPipe  # type: ignore
+            sysmsg = (
+                "You are a strict JSON judge. Reply with exactly one JSON object with keys "
+                '"subscores", "score", and "rationale". No extra text, no comments, no code fences.'
+            )
+            client = get_openai_client()
+            _mouth = _OpenAIPipe(model=JUDGE_MODEL_ID, client=client, system_fallback=sysmsg)
+            return _mouth
+        except Exception as e:
+            if JUDGE_DEBUG:
+                print("[JUDGE-DBG] OpenAI judge pipe init failed; falling back:", e, file=sys.stderr)
+
+    # Fallback: legacy function (HF or gated env path)
     try:
         from llm_script import llm_fn_from_env
         _mouth = llm_fn_from_env()
         return _mouth
-    except Exception as e:
+    except Exception as e2:
         _mouth = None
-        raise RuntimeError(f"judge mouth init failed: {e}")
+        raise RuntimeError(f"judge mouth init failed: {e2}")
 
 # ────────────── Prompt builders ──────────────
 def _rubric_lines(rubric: JudgeRubric) -> str:
@@ -339,8 +361,24 @@ def _repair_json_mild(s: str) -> str:
     return s
 
 def _safe_parse_json(text: Optional[str]) -> Optional[dict]:
+    """
+    Parse possibly messy model output into JSON.
+    Accepts strings, bytes, lists of strings, or arbitrary objects, and coerces to string first.
+    """
     if not text:
         return None
+    # Coerce non-strings to a usable string before any regex
+    if isinstance(text, list):
+        flat = [t for t in text if isinstance(t, str) and t.strip()]
+        text = flat[-1] if flat else " ".join(map(str, text))
+    elif isinstance(text, bytes):
+        try:
+            text = text.decode("utf-8", errors="ignore")
+        except Exception:
+            text = text.decode("latin-1", errors="ignore")
+    elif not isinstance(text, str):
+        text = str(text)
+
     candidate = _extract_from_fence(text) or _extract_last_json(text) or text
     for variant in (candidate, _repair_json_mild(candidate), _repair_json_mild(_autoclose_braces(candidate))):
         try:
