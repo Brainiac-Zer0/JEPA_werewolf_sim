@@ -116,7 +116,7 @@ def leaks_hidden_info(text: str, role: str, phase: str, *, allow_seer: bool = Fa
     return False
 
 # ── Config values (env → YAML → defaults)
-MODEL_ID_DEFAULT = CFG.get("LLM_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2")
+MODEL_ID_DEFAULT = CFG.get("LLM_MODEL_ID", "o4-mini")
 DEVICE_CFG       = str(CFG.get("LLM_DEVICE", "")).strip().lower()
 PROVIDER_DEFAULT = _env_str("LLM_PROVIDER", "hf").strip().lower()
 
@@ -598,7 +598,7 @@ def get_openai_client() -> Any:
     return _OA_CLIENT
 
 # Only allow Responses-API knobs. Keep minimal to avoid invalid_request_error.
-_ALLOWED_RESPONSES_KW = {"max_output_tokens"}
+_ALLOWED_RESPONSES_KW = {"max_output_tokens", "response_format"}
 
 def _filter_responses_kwargs(kwargs: dict) -> dict:
     if not isinstance(kwargs, dict):
@@ -615,6 +615,9 @@ def build_openai_args(model_id: str, cfg_block: dict) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     if isinstance(oai.get("max_output_tokens", None), int):
         out["max_output_tokens"] = int(oai["max_output_tokens"])
+    # Allow opt-in JSON mode, primarily for judge.py which calls llm_complete directly.
+    if isinstance(oai.get("response_format", None), dict):
+        out["response_format"] = oai["response_format"]
     return _filter_responses_kwargs(out)
 
 def llm_text(resp: Any) -> str:
@@ -698,8 +701,8 @@ class _OpenAIPipe:
                 "max_output_tokens": max_output_tokens if max_output_tokens else oai_args.get("max_output_tokens"),
             }),
         )
-        generated = (anchored_prompt or "") + (text_out or "")
-        return generated
+        # Return only model output. Never echo the prompt back into downstream parsers.
+        return text_out or ""
 
 def _using_openai_provider() -> bool:
     provider = PROVIDER_DEFAULT

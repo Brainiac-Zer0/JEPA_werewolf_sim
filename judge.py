@@ -50,6 +50,12 @@ def _using_openai_provider() -> bool:
     mid = LLM_MODEL_ID.lower()
     return mid.startswith(("gpt-", "o", "chatgpt"))
 
+def _is_o_family(model: str) -> bool:
+    try:
+        return model.lower().startswith("o")
+    except Exception:
+        return False
+
 # ────────────── Base config values (from file) ──────────────
 JUDGE_MODEL_ID       = config.get("JUDGE_MODEL_ID", "microsoft/Phi-3-mini-4k-instruct")
 JUDGE_MAX_NEW        = int(config.get("JUDGE_MAX_NEW", 128))
@@ -66,7 +72,7 @@ RERANK_TOPK         = bool(_judge_cfg.get("rerank_topk", True))
 STORE_SUBSCORES     = bool(_judge_cfg.get("store_subscores", True))
 TALK_VOTE_ALIGN_ON  = bool(_judge_cfg.get("talk_vote_alignment", True))
 
-# NEW: repetition penalty config (audit, and optional scoring attenuation)
+# NEW: repetition penalty config
 JUDGE_RP_WEIGHT     = float(_judge_cfg.get("rp_weight", 0.0))
 JUDGE_RP_N          = int(_judge_cfg.get("rp_n", 2))
 
@@ -81,7 +87,7 @@ JUDGE_DEBUG_DIR      = _env_str ("JUDGE_DEBUG_DIR",      JUDGE_DEBUG_DIR)
 JUDGE_RP_WEIGHT      = _env_float("JUDGE_RP_WEIGHT",     JUDGE_RP_WEIGHT)
 JUDGE_RP_N           = _env_int  ("JUDGE_RP_N",          JUDGE_RP_N)
 
-# NEW: strict vote path toggle (optional runtime control for choose_best)
+# NEW: strict vote path toggle
 JUDGE_VOTE_STRICT     = _env_bool("JUDGE_VOTE_STRICT", False)
 JUDGE_WARN_PARSE_ONCE = _env_bool("JUDGE_WARN_PARSE_ONCE", True)
 _PARSE_WARNED_ONCE    = False
@@ -110,12 +116,34 @@ def _mentions_name(s: Optional[str]) -> bool:
     except Exception:
         return False
 
-# ────────────── Responses kwargs filter (for safety) ──────────────
-_ALLOWED_RESPONSES_KW = {"temperature", "top_p", "max_output_tokens", "stop"}
+# ────────────── Kwarg filters ──────────────
+# For Responses API (o* models)
+_ALLOWED_RESPONSES_KW = {"max_output_tokens", "stop"}
 def _filter_responses_kwargs(kwargs: dict) -> dict:
     if not isinstance(kwargs, dict):
         return {}
-    return {k: v for k, v in kwargs.items() if k in _ALLOWED_RESPONSES_KW}
+    out = {k: v for k, v in kwargs.items() if k in _ALLOWED_RESPONSES_KW}
+    out.pop("temperature", None)
+    out.pop("top_p", None)
+    out.pop("max_tokens", None)
+    out.pop("max_completion_tokens", None)
+    out.pop("messages", None)
+    out.pop("response_format", None)
+    return out
+
+# For Chat Completions API (non-o* OpenAI models)
+_ALLOWED_CHAT_KW = {"max_completion_tokens", "stop"}
+def _filter_chat_kwargs(kwargs: dict) -> dict:
+    if not isinstance(kwargs, dict):
+        return {}
+    out = {k: v for k, v in kwargs.items() if k in _ALLOWED_CHAT_KW}
+    out.pop("temperature", None)
+    out.pop("top_p", None)
+    out.pop("max_tokens", None)
+    out.pop("max_output_tokens", None)
+    out.pop("messages", None)
+    out.pop("response_format", None)
+    return out
 
 # ────────────── Repetition penalty (lexical diversity) ──────────────
 def repetition_penalty(text: str, n: int = 2) -> float:
@@ -222,36 +250,213 @@ def _dbg_write(record: Dict[str, Any]):
     except Exception as e:
         print("[JUDGE-DBG] write failed:", e, file=sys.stderr)
 
-# ────────────── LLM wrapper (judge uses ungated pipe) ──────────────
+# ────────────── LLM wrapper: o* → Responses, non-o* → Chat ──────────────
 _mouth = None
+
+def _oai_version() -> str:
+    try:
+        import openai  # type: ignore
+        return getattr(openai, "__version__", "unknown")
+    except Exception:
+        return "unknown"
+
+class _OAISimpleJSONMouth:
+    """
+    o-family models use Responses API with a single string prompt.
+    non-o OpenAI models use Chat Completions.
+    Never send temperature or top_p here, and never forward arbitrary kwargs.
+    """
+    def __init__(self, model: str):
+        try:
+            from openai import OpenAI  # type: ignore
+        except Exception as e:
+            raise RuntimeError(f"OpenAI SDK import failed: {e}")
+        self.model = model
+        self.client = OpenAI()
+        _dbg_print(f"[OAIMOUTH] Initialized with SDK={_oai_version()} model={model}")
+
+    def _build_responses_prompt(self, prompt_body: str) -> str:
+        sysmsg = (
+            'You are a strict JSON judge. Reply with exactly one JSON object with keys '
+            '"subscores", "score", and "rationale". No extra text, no comments, no code fences.'
+        )
+        return f"{sysmsg}\n\n{prompt_body}"
+
+    def _call_chat(self, prompt_body: str, kwargs: Dict[str, Any]) -> str:
+        msgs = [
+            {"role": "system", "content":
+             'You are a strict JSON judge. Reply with exactly one JSON object with keys "subscores", "score", and "rationale". No extra text, no comments, no code fences.'},
+            {"role": "user", "content": prompt_body},
+        ]
+        k = _filter_chat_kwargs(kwargs)
+        max_completion_tokens = k.get("max_completion_tokens", None)
+        stop = k.get("stop", None)
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            messages=msgs,
+            **({} if max_completion_tokens is None else {"max_completion_tokens": int(max_completion_tokens)}),
+            **({} if stop is None else {"stop": stop}),
+        )
+        text = resp.choices[0].message.content or ""
+        return text if isinstance(text, str) else str(text or "")
+
+    def _call_responses(self, prompt_str: str, kwargs: Dict[str, Any]) -> str:
+        k = _filter_responses_kwargs(kwargs)
+        mo = k.get("max_output_tokens", None)
+        try:
+            mo = int(mo) if mo is not None else None
+        except Exception:
+            mo = None
+        if mo is not None and mo < 16:
+            mo = 16
+        stop = k.get("stop", None)
+
+        payload = {"model": self.model, "input": prompt_str}
+        if mo is not None:
+            payload["max_output_tokens"] = mo
+        if stop is not None:
+            payload["stop"] = stop
+
+        resp = self.client.responses.create(**payload)
+
+        # 1) direct helper when available
+        txt = getattr(resp, "output_text", None)
+        if isinstance(txt, str) and txt.strip():
+            return txt
+
+        # 2) traverse common SDK shapes
+        def _first_text_from(obj):
+            # a) resp.output[0].content[0].text
+            try:
+                out = getattr(obj, "output", None)
+                if isinstance(out, list) and out:
+                    c = getattr(out[0], "content", None)
+                    if isinstance(c, list) and c:
+                        t = getattr(c[0], "text", None)
+                        if isinstance(t, str) and t.strip():
+                            return t
+                        if isinstance(c[0], dict):
+                            maybe = c[0].get("text")
+                            if isinstance(maybe, str) and maybe.strip():
+                                return maybe
+            except Exception:
+                pass
+            # b) resp.outputs
+            try:
+                outs = getattr(obj, "outputs", None)
+                if isinstance(outs, list) and outs:
+                    for item in outs:
+                        content = getattr(item, "content", None)
+                        if isinstance(content, list) and content:
+                            t = getattr(content[0], "text", None)
+                            if isinstance(t, str) and t.strip():
+                                return t
+                            if isinstance(content[0], dict):
+                                maybe = content[0].get("text")
+                                if isinstance(maybe, str) and maybe.strip():
+                                    return maybe
+            except Exception:
+                pass
+            # c) resp.data[0].content[0].text
+            try:
+                data = getattr(obj, "data", None)
+                if isinstance(data, list) and data:
+                    content = getattr(data[0], "content", None)
+                    if isinstance(content, list) and content:
+                        t = getattr(content[0], "text", None)
+                        if isinstance(t, str) and t.strip():
+                            return t
+                        if isinstance(content[0], dict):
+                            maybe = content[0].get("text")
+                            if isinstance(maybe, str) and maybe.strip():
+                                return maybe
+            except Exception:
+                pass
+            return ""
+
+        txt2 = _first_text_from(resp)
+        if isinstance(txt2, str) and txt2.strip():
+            return txt2
+
+        # 3) dict fallback if a raw dict leaks through
+        if isinstance(resp, dict):
+            for path in (
+                ("output_text",),
+                ("output", 0, "content", 0, "text"),
+                ("outputs", 0, "content", 0, "text"),
+                ("data", 0, "content", 0, "text"),
+            ):
+                cur = resp
+                ok = True
+                for p in path:
+                    if isinstance(cur, list) and isinstance(p, int) and p < len(cur):
+                        cur = cur[p]
+                    elif isinstance(cur, dict) and isinstance(p, str) and p in cur:
+                        cur = cur[p]
+                    else:
+                        ok = False
+                        break
+                if ok and isinstance(cur, str) and cur.strip():
+                    return cur
+
+        return ""
+
+    def __call__(self, prompt: str, *, generate_kwargs: Optional[Dict[str, Any]] = None) -> str:
+        kwargs = dict(generate_kwargs or {})
+        kwargs.pop("temperature", None)
+        kwargs.pop("top_p", None)
+
+        if _is_o_family(self.model):
+            text = self._call_responses(self._build_responses_prompt(prompt), kwargs)
+            if not text.strip():
+                # fallback to Chat Completions if Responses returned empty text
+                try:
+                    k = _filter_chat_kwargs(kwargs)
+                    mct = k.get("max_completion_tokens", None)
+                    if mct is None and "max_output_tokens" in kwargs:
+                        try:
+                            mct = int(kwargs["max_output_tokens"])
+                        except Exception:
+                            mct = None
+                    if isinstance(mct, int) and mct < 16:
+                        mct = 16
+                    msgs = [
+                        {"role": "system", "content": 'You are a strict JSON judge. Reply with exactly one JSON object with keys "subscores", "score", and "rationale". No extra text, no comments, no code fences.'},
+                        {"role": "user", "content": prompt},
+                    ]
+                    fallback_model = "gpt-4o-mini" if self.model.startswith("o") else self.model
+                    resp = self.client.chat.completions.create(
+                        model=fallback_model,
+                        messages=msgs,
+                        **({} if mct is None else {"max_completion_tokens": int(mct)}),
+                    )
+                    text = resp.choices[0].message.content or ""
+                except Exception:
+                    text = ""
+            if JUDGE_DEBUG:
+                _dbg_print(f"[RAWHEAD-RESP] {(text or '')[:120].replace(chr(10), '\\n')}")
+            return text or ""
+        else:
+            text = self._call_chat(prompt, kwargs)
+            if JUDGE_DEBUG:
+                _dbg_print(f"[RAWHEAD-CHAT] {(text or '')[:120].replace(chr(10), '\\n')}")
+            return text or ""
+
 def _get_mouth():
     """
     Build an ungated JSON-only pipe for the judge, independent of the speaker gate.
-    If using the OpenAI provider, construct a strict Responses-based pipe with its own system message.
-    Otherwise, fall back to llm_script.llm_fn_from_env().
+    Prefer OpenAI wrapper when provider is OpenAI, otherwise fall back to llm_script.
     """
     global _mouth
     if _mouth is not None:
         return _mouth
 
-    # Prefer OpenAI strict JSON path
     if _using_openai_provider():
-        try:
-            from llm_script import get_openai_client, _OpenAIPipe  # type: ignore
-            sysmsg = (
-                "You are a strict JSON judge. Reply with exactly one JSON object with keys "
-                '"subscores", "score", and "rationale". No extra text, no comments, no code fences.'
-            )
-            client = get_openai_client()
-            _mouth = _OpenAIPipe(model=JUDGE_MODEL_ID, client=client, system_fallback=sysmsg)
-            return _mouth
-        except Exception as e:
-            if JUDGE_DEBUG:
-                print("[JUDGE-DBG] OpenAI judge pipe init failed; falling back:", e, file=sys.stderr)
+        _mouth = _OAISimpleJSONMouth(JUDGE_MODEL_ID)
+        return _mouth
 
-    # Fallback: legacy function (HF or gated env path)
     try:
-        from llm_script import llm_fn_from_env
+        from llm_script import llm_fn_from_env  # type: ignore
         _mouth = llm_fn_from_env()
         return _mouth
     except Exception as e2:
@@ -361,13 +566,8 @@ def _repair_json_mild(s: str) -> str:
     return s
 
 def _safe_parse_json(text: Optional[str]) -> Optional[dict]:
-    """
-    Parse possibly messy model output into JSON.
-    Accepts strings, bytes, lists of strings, or arbitrary objects, and coerces to string first.
-    """
     if not text:
         return None
-    # Coerce non-strings to a usable string before any regex
     if isinstance(text, list):
         flat = [t for t in text if isinstance(t, str) and t.strip()]
         text = flat[-1] if flat else " ".join(map(str, text))
@@ -446,39 +646,32 @@ def _parse_strict_vote_json(text: str, allowed: List[str]) -> Optional[Dict[str,
 
 # ────────────── Public API (rubric scorer) ──────────────
 def _judge_call_kwargs(max_tokens: int) -> Dict[str, Any]:
-    """
-    Build safe kwargs for mouth(), conditional on provider.
-    - For OpenAI: only pass max_output_tokens (no temperature or top_p).
-    - For HF: pass deterministic knobs but keep it minimal.
-    """
+    max_tokens = int(max_tokens)
     if _using_openai_provider():
-        return {"max_output_tokens": int(max_tokens)}
+        return {"max_output_tokens": max(16, max_tokens)}
     return {
-        "max_new_tokens": int(max_tokens),
+        "max_new_tokens": max(1, max_tokens),
         "temperature": 0.0,
         "top_p": 1.0,
     }
 
 def _call_mouth_with_arg_gating(mouth_fn, prompt: str, gen_kwargs: Dict[str, Any]) -> str:
-    """
-    Call mouth(), then on OpenAI-style errors about unsupported temperature,
-    drop 'temperature' and retry once.
-    """
     try:
         return mouth_fn(prompt, generate_kwargs=gen_kwargs)
     except Exception as e:
         msg = getattr(e, "message", str(e))
-        if ("Unsupported parameter" in msg or "invalid_request_error" in msg) and "temperature" in msg:
-            g2 = dict(gen_kwargs)
-            g2.pop("temperature", None)
-            return mouth_fn(prompt, generate_kwargs=g2)
-        raise
+        g2 = dict(gen_kwargs)
+        for k in ("temperature", "top_p", "max_tokens", "max_output_tokens", "max_completion_tokens", "messages", "response_format"):
+            if k in msg or k in g2:
+                g2.pop(k, None)
+        _dbg_print("[OAIMOUTH-RETRY] dropping unsupported kwargs, retrying")
+        return mouth_fn(prompt, generate_kwargs=g2)
 
 def score_batch(
     items: List[Dict[str, str]],
     rubric: JudgeRubric,
     *,
-    persona_hook: Optional["PersonaHook"] = None,  # kept for API compatibility
+    persona_hook: Optional["PersonaHook"] = None,
     run_id: str = "",
     round_num: int = -1,
     phase: str = "",
@@ -497,15 +690,12 @@ def score_batch(
 
     for idx, p in enumerate(prompts):
         gen_kwargs = _judge_call_kwargs(JUDGE_MAX_NEW)
-        if _using_openai_provider():
-            gen_kwargs = _filter_responses_kwargs(gen_kwargs)
 
-        # Prompt sanity preview for debugging
         if JUDGE_DEBUG:
             preview = p[:600].replace("\n", "\\n")
             _dbg_print(f"[PROMPT-{idx}] {preview}")
+            _dbg_print(f"[PROMPT-{idx}-LEN] {len(p)} chars")
 
-        # Hard check for empty prompt
         if not p or len(p.strip()) < 10:
             rec = {
                 "error": "prompt_empty",
@@ -530,19 +720,15 @@ def score_batch(
         def _one_call(prompt_text: str) -> str:
             return _call_mouth_with_arg_gating(mouth, prompt_text, gen_kwargs)
 
-        # First attempt
         try:
             raw = _one_call(p)
         except Exception as e:
-            msg = f"{type(e).__name__}"
-            if "presence_penalty" in str(e).lower():
-                msg = f"{msg}:presence_penalty"
-            error_tag = f"openai:{msg}"
+            error_tag = f"openai:{type(e).__name__}"
+            _dbg_print(f"[JUDGE] call failed: {e}")
 
         if not error_tag:
             parsed = _safe_parse_json(raw)
 
-        # Heuristic salvage, or retry with stricter instruction if needed
         if not error_tag and not isinstance(parsed, dict):
             salvage = _heuristic_extract_scores(raw, rubric)
             if salvage is None:
@@ -562,7 +748,7 @@ def score_batch(
                 rationale = ""
 
         if not error_tag and isinstance(parsed, dict):
-            raw_subs = parsed.get("subscores", {})
+            raw_subs = parsed.get("subscores", {}) if isinstance(parsed.get("subscores", {}), dict) else {}
             if isinstance(raw_subs, dict):
                 subs = {k: _bounded_float(raw_subs.get(k, None))
                         for k in rubric.criteria.keys()
@@ -578,12 +764,10 @@ def score_batch(
 
         cand_text = items[idx].get("candidate", "") or ""
 
-        # Specificity bonus, applied to base score
         spec = _specificity_score(cand_text)
         if score is not None:
             score = max(0.0, min(1.0, float(score) + 0.05 * float(spec)))
 
-        # Repetition attenuation
         rp_val = repetition_penalty(cand_text, n=max(1, int(JUDGE_RP_N)))
         rp_applied = False
         if (score is not None) and JUDGE_RP_WEIGHT > 0.0 and rp_val > 0.0:
@@ -661,7 +845,6 @@ def strict_vote_decision(
     mouth = _get_mouth()
     prompt = _make_strict_vote_prompt(context, role, candidates)
 
-    # Prompt sanity preview for debugging
     if JUDGE_DEBUG:
         preview = prompt[:600].replace("\n", "\\n")
         _dbg_print(f"[STRICT-PROMPT] {preview}")
@@ -673,8 +856,6 @@ def strict_vote_decision(
 
     def _call(prompt_str: str) -> str:
         base = _judge_call_kwargs(max_new if isinstance(max_new, int) else min(128, JUDGE_MAX_NEW))
-        if _using_openai_provider():
-            base = _filter_responses_kwargs(base)
         return _call_mouth_with_arg_gating(mouth, prompt_str, base)
 
     for _try in range(2):
@@ -686,10 +867,7 @@ def strict_vote_decision(
             if parsed is not None:
                 break
         except Exception as e:
-            msg = f"{type(e).__name__}"
-            if "presence_penalty" in str(e).lower():
-                msg = f"{msg}:presence_penalty"
-            error_tag = f"openai:{msg}"
+            error_tag = f"openai:{type(e).__name__}"
             parsed = None
             break
 

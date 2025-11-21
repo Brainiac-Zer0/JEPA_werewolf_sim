@@ -47,6 +47,14 @@ sim:
   vote_mix_alpha: 0.45
   log_dz_talk: false
   log_dz_kill: false
+  voting:
+    mode: random
+    random:
+      enabled: true
+      seed: null
+    heuristic:
+      enabled: false
+      name: suspicion_top1
   ui:
     enabled: true
     screen_w: 1200
@@ -69,6 +77,9 @@ sim:
     SOC_ENABLED: true
     SOC_SCALE: 0.05
     SOC_K: 6
+    VOTE_MODE: ''
+    RANDOM_VOTE: 0
+    HEURISTIC_VOTE: 0
   night_chat:
     enabled: false
     turns: 2
@@ -127,14 +138,16 @@ openai:
   temperature: null
   presence_penalty: null
   frequency_penalty: null
-  system: "You are the mouthpiece for a social-deduction agent. Speak in-character in 1–2 concise sentences, never reveal hidden info, avoid OOC or meta."
+  system: "You are the mouthpiece for a social-deduction agent. Speak in-character\
+    \ in 1\u20132 concise sentences, never reveal hidden info, avoid OOC or meta."
 judge_openai:
   model: o4-mini
   max_tokens: 256
   temperature: null
   presence_penalty: null
   frequency_penalty: null
-  system: You are a strict scoring judge. Return JSON only with subscores and a final score.
+  system: You are a strict scoring judge. Return JSON only with subscores and a final
+    score.
 judge:
   model_id: o4-mini
   device: auto
@@ -193,15 +206,15 @@ llm:
     max_output_tokens: 128
     stop:
     - </s>
-    - "###"
-    - "[OOC]"
-    - "Out of character:"
+    - '###'
+    - '[OOC]'
+    - 'Out of character:'
   bans_meta:
   - Use
   - Do not
   - Don't
-  - "No "
-  - "Keep "
+  - 'No '
+  - 'Keep '
   - Reply
   - Provide
   - Follow
@@ -303,7 +316,7 @@ DEFAULT_LEXICON:
   - who
   - where
   - when
-  - "?"
+  - '?'
   vote:
   - vote
   - eliminate
@@ -348,9 +361,9 @@ TALK_CATEGORIES:
 STRATIFY_PHASE_BATCHES: true
 training:
   mode: factorized
-  n_games: 10
-  outer_cycles: 2
-  games_per_cycle: 10
+  n_games: 3
+  outer_cycles: 1
+  games_per_cycle: 1
   epochs: 2
   batch_size: 64
   lr: 0.001
@@ -370,6 +383,8 @@ ablations:
   social: true
   fep_core: true
   language: true
+  random_vote: false
+  heuristic_vote: false
 determinism:
   enabled: true
   seed: 1337
@@ -387,13 +402,8 @@ telemetry:
   print_summary: true
   flush_every: 1
 logging:
-  dir: logs
-  metrics_csv: logs/metrics.csv
-  lang_metrics_csv: logs/lang_metrics.csv
-  run_config: logs/run_config.yaml
-  run_meta: logs/run_meta.json
   judge_jsonl: logs/judge_calls.jsonl
-  debug: true
+  debug: false
 runtime:
   save_config_snapshot: true
 PHASE_AWARE_JEPA: true
@@ -454,3 +464,4 @@ social_influence:
   enabled: true
   K: 6
   scale: 1.0
+JUDGE_PROVIDER: openai

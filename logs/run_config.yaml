@@ -69,6 +69,7 @@ JUDGE_DEBUG_DIR: logs
 JUDGE_DEVICE: auto
 JUDGE_MAX_NEW: 128
 JUDGE_MODEL_ID: o4-mini
+JUDGE_PROVIDER: openai
 JUDGE_RUBRIC_PATH: judge_rubric.yaml
 LANGUAGE_COUPLING:
   enabled: true
@@ -143,9 +144,11 @@ WORLD_INPUT_MODE: z_plus_action
 ablations:
   bandit: false
   fep_core: true
+  heuristic_vote: false
   judge: true
   language: true
   personas: true
+  random_vote: false
   social: true
 bias_head:
   cat_order:
@@ -293,13 +296,8 @@ llm:
   temperature: 0.8
   top_p: 0.92
 logging:
-  debug: true
-  dir: logs
+  debug: false
   judge_jsonl: logs/judge_calls.jsonl
-  lang_metrics_csv: logs/lang_metrics.csv
-  metrics_csv: logs/metrics.csv
-  run_config: logs/run_config.yaml
-  run_meta: logs/run_meta.json
 model:
   action_dim: 8
   encoders:
@@ -329,8 +327,7 @@ openai:
   model: o4-mini
   presence_penalty: null
   system: "You are the mouthpiece for a social-deduction agent. Speak in-character\
-    \ in 1\xE2\u20AC\u201C2 concise sentences, never reveal hidden info, avoid OOC\
-    \ or meta."
+    \ in 1\u20132 concise sentences, never reveal hidden info, avoid OOC or meta."
   temperature: null
 paths:
   checklists: null
@@ -366,9 +363,12 @@ seeds:
 sim:
   discuss_turns: 2
   env_aliases:
+    HEURISTIC_VOTE: 0
+    RANDOM_VOTE: 0
     SOC_ENABLED: true
     SOC_K: 6
     SOC_SCALE: 0.05
+    VOTE_MODE: ''
   log_dz_kill: false
   log_dz_talk: false
   night_chat:
@@ -406,6 +406,14 @@ sim:
     screen_w: 1200
   use_language: true
   vote_mix_alpha: 0.45
+  voting:
+    heuristic:
+      enabled: false
+      name: suspicion_top1
+    mode: random
+    random:
+      enabled: true
+      seed: null
 social:
   enabled: true
   lambda_reg: 0.001
@@ -447,13 +455,13 @@ training:
   batch_size: 64
   device: auto
   epochs: 2
-  games_per_cycle: 10
+  games_per_cycle: 1
   lambda_bc: 0.5
   lambda_talk: 0.5
   lr: 0.001
   max_grad_norm: 1.0
   mode: factorized
-  n_games: 10
-  outer_cycles: 2
+  n_games: 3
+  outer_cycles: 1
   speaker_enabled: true
   speaker_only: false

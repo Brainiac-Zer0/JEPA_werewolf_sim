@@ -1,1 +1,1 @@
-{"run_id": "run_1762564489_809ef7", "seed": 123, "timestamp": 1762564489, "device": "cuda:0"}
+{"run_id": "S2_alpha0.7_seed2718_game149_32c9adec", "seed": 2111062117, "timestamp": 1763286067, "device": "cuda:0", "policy": "planner"}

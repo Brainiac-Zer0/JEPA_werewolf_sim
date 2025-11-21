@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple, Dict
+from typing import Iterable, List, Optional, Tuple, Dict, Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -35,6 +35,8 @@ def _safe_mean(xs: List[torch.Tensor]) -> Optional[torch.Tensor]:
 
 class SocialInfluence(nn.Module):
     """
+    Latent-only social update.
+
     Computes a social update δ_social given self latent z_self and neighbor latents:
         δ = scale * MLP((μ_neighbors - z_self) ⊕ sim)
     with optional trust/similarity weighting of μ_neighbors.
@@ -44,7 +46,12 @@ class SocialInfluence(nn.Module):
         - "cosine": weights ∝ softmax(cos(z_self, z_n)/τ)
         - "role_affinity": weighted by a 2×2 role-affinity table
 
-    Returns (delta, info) where info holds telemetry for logging.
+    IMPORTANT (compatibility):
+    Some call-sites may pass a pooled message embedding as a 2nd positional arg
+    (e.g., forward(z_self, msg_embed)). This class is *latent-only*—we ignore
+    such text inputs. To keep compatibility and avoid TypeError, we *accept*
+    a tensor in the 2nd positional slot and treat it as a no-op (i.e., no
+    neighbors provided → zero update unless z_neighbors are given separately).
     """
     def __init__(
         self,
@@ -150,30 +157,48 @@ class SocialInfluence(nn.Module):
         return torch.nan_to_num(w, nan=0.0)
 
     # ------------------------------ forward --------------------------------
-
+    # Note: we accept a 2nd positional argument that *might* be a pooled message
+    # embedding. We intentionally ignore such inputs to keep the module latent-only.
     def forward(
         self,
         z_self: torch.Tensor,
-        z_neighbors: Iterable[torch.Tensor],
+        z_neighbors: Optional[Iterable[torch.Tensor]] = None,
         *,
         self_role: Optional[str] = None,
         neighbor_roles: Optional[Iterable[Optional[str]]] = None,
+        **kwargs: Any,  # allows msg_embed/msg_mean or other future no-op kwargs
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Args:
             z_self: [D] or [1,D]
-            z_neighbors: iterable of [D] tensors
+            z_neighbors: iterable of [D] tensors (optional). If None/empty → no-op update.
+            (Ignored kwargs for compatibility: msg_embed/msg_mean/etc.)
         Returns:
             delta: [D] social update (bounded, numerically safe)
             info: telemetry dict with delta_norm, mean_delta_norm, var_before, var_after, and counts
         """
+        # --- Compatibility shim: if callers passed a pooled message embedding
+        #     as the second positional arg (a Tensor), treat as no neighbors.
+        ignored_msg = False
+        if torch.is_tensor(z_neighbors):
+            # A tensor here is *not* a list of neighbor latents; it's most likely a pooled text embedding.
+            # Keep latent-only behavior by ignoring it.
+            ignored_msg = True
+            z_neighbors = None
+
+        # Normalize inputs
         z_self = _as_2d(torch.nan_to_num(z_self, nan=0.0)).to(self.device or z_self.device)  # (B,D)
-        neigh_list = [_as_2d(torch.nan_to_num(z, nan=0.0)).to(z_self.device) for z in z_neighbors]  # list of (B,D)
+        neigh_list: List[torch.Tensor] = []
+        if z_neighbors is not None:
+            # Collect only tensor items safely
+            for z in z_neighbors:
+                if torch.is_tensor(z):
+                    neigh_list.append(_as_2d(torch.nan_to_num(z, nan=0.0)).to(z_self.device))
         n = len(neigh_list)
 
         var_before = _safe_var(z_self).mean().item()
 
-        info = {
+        info: Dict[str, float] = {
             "n_neighbors": float(n),
             "trust_mode": self.trust_mode,
             "scale": float(self.scale),
@@ -182,6 +207,8 @@ class SocialInfluence(nn.Module):
             "var_before": float(var_before),
             "applied_count": 0.0,
         }
+        if ignored_msg:
+            info["ignored_msg_embed"] = 1.0
 
         if n == 0:
             # No neighbors, identity update with robust stats

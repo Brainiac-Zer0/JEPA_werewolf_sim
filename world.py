@@ -143,7 +143,7 @@ def tally_votes_deterministic(vote_dict: Dict[str, str]) -> List[Tuple[str, int]
     """
     Deterministic tally: return list of (target_name, count), sorted by
       1) count descending, then 2) target_name ascending (alpha).
-    This avoids reliance on dict insertion order / Counter internals.
+    This avoids reliance on dict insertion order and Counter internals.
     """
     c = Counter(vote_dict.values())
     return sorted(c.items(), key=lambda kv: (-kv[1], kv[0]))
@@ -209,7 +209,7 @@ def resolve_votes_detailed(
 # Backwards-compatible minimal resolver (kept for existing callers)
 def resolve_votes(vote_dict):
     """
-    Legacy API: return winner name or None on tie / no votes.
+    Legacy API: return winner name or None on tie, or no votes.
     Uses the deterministic resolver above.
     """
     det = resolve_votes_detailed(vote_dict)

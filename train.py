@@ -99,7 +99,7 @@ def _env_str(key: str, default: str) -> str:
 # --------------------------------------------------------------------------
 
 # ── Hyper-parameters (config defaults; CLI can override; ENV can override both)
-N_GAMES: int = _env_int("N_GAMES", int(CFG.get("N_GAMES", 50)))  # per-role
+N_GAMES: int = _env_int("N_GAMES", int(CFG.get("N_GAMES", 5)))  # per-role
 
 # Training mode & knobs (Phase-4)
 TR_CFG = CFG.get("training", {}) if isinstance(CFG.get("training"), dict) else {}
@@ -215,8 +215,8 @@ def _train_speakers_from_agents(agents: List[Any], rubric: JudgeRubric) -> None:
             "lambda_j": float(LAMBDA_J),
             "lambda_c": float(LAMBDA_C),
             "lambda_o": float(LAMBDA_O),
-            "repetition_penalty": float(rp),          # NEW
-            "rp_deduction": float(-0.05 * rp),       # NEW (for audit)
+            "repetition_penalty": float(rp),
+            "rp_deduction": float(-0.05 * rp),
         }
 
     for ag in agents:
@@ -371,7 +371,7 @@ def _split_rollouts_meta(sim_ret: Any) -> Tuple[Any, Dict[str, Any]]:
     rollouts, meta = [], {}
     try:
         if isinstance(sim_ret, tuple):
-            # 2-tuple or 3+-tuple — first is rollouts, second may be meta
+            # 2-tuple or 3+-tuple, first is rollouts, second may be meta
             rollouts = sim_ret[0]
             meta_candidate = sim_ret[1] if len(sim_ret) >= 2 else {}
             meta = meta_candidate if isinstance(meta_candidate, dict) else {}
@@ -389,7 +389,7 @@ def _split_rollouts_meta(sim_ret: Any) -> Tuple[Any, Dict[str, Any]]:
 # ============================ Social stats logging ============================
 
 def _log_social_stats_if_any(meta: Dict[str, Any]) -> None:
-    """Best-effort print + jsonl write for meta['social_stats']."""
+    """Best-effort print, and jsonl write for meta['social_stats'].""" 
     try:
         if not isinstance(meta, dict):
             return
@@ -409,6 +409,31 @@ def _log_social_stats_if_any(meta: Dict[str, Any]) -> None:
     except Exception:
         pass
 
+# ============================ Progress helpers ================================
+
+_SIM_EXPECTED: int = 0
+_SIM_DONE: int = 0
+
+def _compute_expected_sims(outer_cycles: int, games_per_cycle: int, speaker_enabled: bool) -> int:
+    """
+    Per cycle accounting:
+      core collection = 2 * games_per_cycle  (two roles)
+      speaker extras  = 3 per cycle          (per role bias fetch = 2, post-cycle = 1)
+    """
+    per_cycle = (2 * games_per_cycle) + (3 if speaker_enabled else 0)
+    return outer_cycles * per_cycle
+
+def _run_sim_and_count(label: str = "core"):
+    """Wrapper that runs one simulation, increments the global counter, and prints progress."""
+    global _SIM_DONE, _SIM_EXPECTED
+    sim_ret = run_sim_and_collect_rollouts(visual=False)
+    _SIM_DONE += 1
+    try:
+        print(f"[PROGRESS] game {_SIM_DONE}/{_SIM_EXPECTED} ({label})")
+    except Exception:
+        pass
+    return sim_ret
+
 # ============================ Rollout collection ==============================
 
 def collect_rollouts_for_role(
@@ -417,7 +442,7 @@ def collect_rollouts_for_role(
     rubric: JudgeRubric | None = None,
 ) -> List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]]:
     """
-    Run `n_games` simulations and grab only the rollout tuples whose *actor*
+    Run `n_games` simulations and grab only the rollout tuples whose actor
     has `role == role`. If the simulator returns agents in meta, also trains speakers.
 
     Supports both schemas:
@@ -426,9 +451,9 @@ def collect_rollouts_for_role(
     """
     all_rollouts: list = []
     for _ in range(n_games):
-        sim_ret = run_sim_and_collect_rollouts(visual=False)
+        sim_ret = _run_sim_and_count(label=f"core:{role}")
         rollouts, meta = _split_rollouts_meta(sim_ret)
-        # Optional social telemetry print/write
+        # Optional social telemetry print, and write
         _log_social_stats_if_any(meta)
 
         if SPEAKER_ENABLED and rubric is not None:
@@ -523,7 +548,7 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 def main() -> None:
-    # 0) CLI overrides + determinism & run id
+    # 0) CLI overrides, determinism, and run id
     args = parse_args()
     effective_mode_cfg = (args.mode or MODE).lower()
     n_games = int(args.n_games)
@@ -533,7 +558,7 @@ def main() -> None:
     seed = int(args.seed)
 
     set_global_determinism(seed)
-    # PATCH: timezone-aware UTC (addresses DeprecationWarning for utcnow)
+    # PATCH: timezone-aware UTC
     run_id = f"train_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_seed{seed}"
     save_run_config(run_id, CFG)
     # Expose run id to helpers for social telemetry logging
@@ -541,7 +566,7 @@ def main() -> None:
     RUN_ID = run_id
     epoch_logger = TrainingEpochLogger()
 
-    # 1) Judge rubric (for optional speaker learning)
+    # 1) Judge rubric, for optional speaker learning
     rubric = None
     if bool(args.speaker):
         try:
@@ -558,7 +583,6 @@ def main() -> None:
         "games_per_cycle": int(getattr(args, "games_per_cycle", n_games)),
         "speaker": int(getattr(args, "speaker", 1 if SPEAKER_ENABLED else 0)),
         "speaker_only": bool(getattr(args, "speaker_only", False)),
-        # record reward weights for reproducibility
         "lambda_j": float(LAMBDA_J),
         "lambda_c": float(LAMBDA_C),
         "lambda_o": float(LAMBDA_O),
@@ -569,7 +593,14 @@ def main() -> None:
     speaker_enabled = bool(getattr(args, "speaker", 1 if SPEAKER_ENABLED else 0))
     speaker_only = bool(getattr(args, "speaker_only", False))
 
-    # Pre-create/load mouthpieces (if available)
+    # Progress announcement
+    global _SIM_EXPECTED, _SIM_DONE
+    _SIM_DONE = 0
+    _SIM_EXPECTED = _compute_expected_sims(outer_cycles, games_per_cycle, speaker_enabled)
+    print(f"[PLAN] expected total games = {_SIM_EXPECTED} "
+          f"(outer_cycles={outer_cycles}, games_per_cycle={games_per_cycle}, speaker_enabled={int(speaker_enabled)})")
+
+    # Pre-create or load mouthpieces, if available
     for role_name in (WEREWOLF, VILLAGER):
         _ensure_mouthpiece_for_role(role_name)
 
@@ -659,9 +690,9 @@ def main() -> None:
                     )
                     eval_metrics = evaluate_jepa_factorized(role_rollouts, world_model, phase_action_encoder, fplanner)
 
-                    # (Optional) Coalition probe — independent specialists vs shared, Werewolf only.
+                    # Optional coalition probe, Werewolf only
                     if role_name == WEREWOLF and COAL_COMPARE:
-                        print("[COAL] Probe: IndependentKillHeads vs SharedKillHead (see console/CSV for loss trends)")
+                        print("[COAL] Probe: IndependentKillHeads vs SharedKillHead (see console and CSV for loss trends)")
                         from collections import defaultdict
                         groups = defaultdict(list)
                         for r in role_rollouts:
@@ -671,7 +702,7 @@ def main() -> None:
                             print("[COAL] No self_idx in aux; skipping independent probe.")
                         else:
                             for wolf_id, rows in groups.items():
-                                wm_i, pae_i, fplanner_i = load_role_models_factorized(role_name)  # fresh init
+                                wm_i, pae_i, fplanner_i = load_role_models_factorized(role_name)
                                 train_jepa_factorized(
                                     rollout_data_phaseaware=rows,
                                     world_model=wm_i,
@@ -697,12 +728,12 @@ def main() -> None:
             # ===== Mouthpiece (speaker + bias-head) =====
             if speaker_enabled:
                 # 1) REINFORCE already triggered during rollout via _train_speakers_from_agents
-                # 2) (Optional) Supervised bias-head step if present + we have labeled intents
+                # 2) Optional supervised bias-head step if present and we have labeled intents
                 try:
                     agents_for_bias = None
                     try:
                         # Re-run a tiny sim to get meta-agents for labeled intents, if available
-                        sim_ret_extra = run_sim_and_collect_rollouts(visual=False)
+                        sim_ret_extra = _run_sim_and_count(label=f"bias:{role_name}")
                         _rolls_extra, meta_extra = _split_rollouts_meta(sim_ret_extra)
                         _log_social_stats_if_any(meta_extra)
                         agents_for_bias = meta_extra.get("agents", None) if isinstance(meta_extra, dict) else None
@@ -725,7 +756,7 @@ def main() -> None:
                 # Save mouthpiece pieces if any updated
                 _save_mouthpiece_for_role(role_name)
 
-            # record/update summary entry (rolling per cycle; last cycle persists)
+            # record or update summary entry
             role_entry = {"overall": stats}
             if ph_stats:
                 role_entry["per_phase"] = ph_stats
@@ -733,17 +764,17 @@ def main() -> None:
                 role_entry["eval"] = eval_cache[role_name]
             run_summary["roles"][role_name] = role_entry
 
-        # === Post-cycle speaker dataset & trainers (spec requirement) ===========
+        # === Post-cycle speaker dataset and trainers (spec requirement) ===========
         if speaker_enabled:
             try:
-                sim_ret = run_sim_and_collect_rollouts(visual=False)
+                sim_ret = _run_sim_and_count(label="postcycle")
                 _rolls_cycle, meta_cycle = _split_rollouts_meta(sim_ret)
                 _log_social_stats_if_any(meta_cycle)
                 agents_cycle = meta_cycle.get("agents", []) if isinstance(meta_cycle, dict) else []
                 if agents_cycle:
                     ds = collect_utterance_dataset(agents_cycle)
                     if _train_speaker_bandit_api is not None and ds:
-                        # Signature may vary repo-to-repo; call defensively
+                        # Signature may vary repo-to-repo, call defensively
                         try:
                             _train_speaker_bandit_api(ds)
                             print(f"[SPEAKER/BANDIT] post-cycle updated on {len(ds)} samples.")
@@ -766,7 +797,7 @@ def main() -> None:
                 print(f"[SPEAKER] Post-cycle speaker step skipped: {e}")
 
     # 3) Persist integrity summary at end
-    #    Belt-and-suspenders: save mouthpieces once more after all cycles
+    #    Belt and suspenders: save mouthpieces once more after all cycles
     for role_name in (WEREWOLF, VILLAGER):
         try:
             _save_mouthpiece_for_role(role_name)

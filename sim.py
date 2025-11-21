@@ -40,7 +40,13 @@
 #     final fallback uses SAFE_FALLBACK. Collapse is penalized via repetition metrics and judge.
 # - NEW (Phase 7c hotfix): Agent-name hygiene for targetless speech and malformed mentions.
 # - NEW (2.1/2.2/2.3): Allowed-name gating for LLM; deterministic day kill; wolf consensus night kill.
-# - NEW (6: Logging print-site and CSV): Error-aware console prints and CSV 'error' field.
+# - NEW (6: Logging print-site and CSV 'error' field).
+# - NEW (Baseline toggle): Random voting policy via config or env to produce uniform targets.
+# - NEW (Fixes): Judge can be disabled or unavailable; Heuristic policy uses local signals without judge;
+#   vote rows backfill target and target_is_wolf so downstream summaries never NaN.
+# - NEW (JEPA-only + social env override):
+#   * POLICY in {"jepa_only", "jepa_random"} uses a JEPA-only vote branch without judge mixing.
+#   * SOCIAL_ENABLED and SIM_SOCIAL_ENABLED env vars override config for Stage A social coupling.
 # -----------------------------------------------------------------------------
 
 import sys
@@ -49,33 +55,28 @@ import random
 import concurrent.futures as cf
 from collections import deque, Counter
 from typing import Dict, Tuple, List, Optional, Deque
-import re  # NEW: for agent mention sanitation
+import re
 
 import pygame
 import torch, yaml
 import torch.nn.functional as F
 
-# NEW: logging and determinism helpers
 import uuid, time, json, csv, pathlib
 import numpy as np
-from types import SimpleNamespace  # NEW: for hygiene cfg wrapper
+from types import SimpleNamespace
 
 from agent import BaseAgent
 from roles import WEREWOLF, VILLAGER, assign_roles
-# NEW: persona randomization hook
 try:
     from roles import apply_personality
 except Exception:
     apply_personality = None
 
-# WORLD helpers (updated per 2.2/2.3)
 try:
     from world import resolve_votes_detailed, eliminate_player, _alive_name_set, consensus_target
 except Exception:
-    # Back-compat fallbacks if detailed APIs not present
     from world import resolve_votes as _resolve_votes_fallback, eliminate_player  # type: ignore
     def resolve_votes_detailed(votes: Dict[str, str], alive_names: Optional[List[str]] = None):
-        """Compat shim using legacy resolve_votes."""
         try:
             winner = _resolve_votes_fallback(votes)  # type: ignore
         except Exception:
@@ -90,33 +91,22 @@ except Exception:
         return c.most_common(1)[0][0]
 
 from training_utils import load_role_models
-# Keep MessageEncoder import; SocialInfluence no longer used here (agent owns it)
 try:
     from encoders import MessageEncoder
 except Exception:
     raise
 
-# Judge imports
 from judge import JudgeRubric, score_batch
 
-# -----------------------------------------------------------------------------
-# Speaker/LLM coupling imports with transparent guards and SAFE_FALLBACK wiring
-# -----------------------------------------------------------------------------
-
 SAFE_FALLBACK = "I need a moment to think."
-
-# Try to import a canonical fallback string from llm_script if it exists
 try:
     from llm_script import SAFE_FALLBACK as _SAFE_FALLBACK_STR
     if isinstance(_SAFE_FALLBACK_STR, str) and _SAFE_FALLBACK_STR.strip():
         SAFE_FALLBACK = _SAFE_FALLBACK_STR.strip()
 except Exception as _e_sf:
-    # Do not fail, keep local SAFE_FALLBACK and make noise once
     print(f"[IMPORT] llm_script.SAFE_FALLBACK unavailable: {type(_e_sf).__name__}: {_e_sf}")
 
-# Speaker LLM helpers
 try:
-    # Bias head and fusion helpers, prompt builders, and guards
     from speaker_llm import (
         LogitBiasHead,
         FUSION_ALPHA,
@@ -127,8 +117,8 @@ try:
         maybe_second_pass_kwargs,
         with_fused_bias_generate_kwargs,
         repetition_penalty,
-        normalize_utterance,  # <-- NEW: import normalizer for sim-level hygiene
-        _set_allowed_names,   # <-- NEW (2.1): name gating for LLM
+        normalize_utterance,
+        _set_allowed_names,
     )
     print("[IMPORT] speaker_llm import OK")
 except Exception as e:
@@ -138,7 +128,6 @@ except Exception as e:
     CAT_ORDER = ["accuse","defend","hedge","question","vote"]
 
     def guard_and_shape(text_raw, plan, role, phase, cfg):
-        # Pass through, but never return empty
         text = text_raw if (text_raw and text_raw.strip()) else SAFE_FALLBACK
         return text, {"violated": False, "redo": False, "repetition_penalty": None}
 
@@ -158,15 +147,12 @@ except Exception as e:
         toks = [t for t in (text or "").split() if t]
         return 1.0 if len(toks) <= n else 0.0
 
-    # Fallback normalizer: noop but safe
     def normalize_utterance(s: str) -> str:
         return (s or "").strip()
 
-    # Fallback name gate: no-op
     def _set_allowed_names(_names: List[str]):
         return None
 
-# Hist feature helper
 try:
     from speaker import make_hist_feats as _mk_hist_feats  # type: ignore
     from speaker import build_plan_tuple  # type: ignore
@@ -183,16 +169,14 @@ except Exception as e:
             "shape": kwargs.get("shape", ""),
         }
 
-# NEW (P5I/P5C): route and hygiene from speaker
 try:
     from speaker import postprocess_text  # type: ignore
 except Exception as e:
     print(f"[IMPORT] speaker.postprocess_text FAILED: {type(e).__name__}: {e}")
 
-    def postprocess_text(text, role, cfg):  # no-op fallback, never return empty
+    def postprocess_text(text, role, cfg):
         return text if (text and text.strip()) else SAFE_FALLBACK
 
-# LLM entrypoints that return (text, meta)
 try:
     from llm_script import chatgpt_llm_with_bias, tok as _LLM_TOK
     print("[IMPORT] llm_script import OK")
@@ -200,49 +184,37 @@ except Exception as e:
     print(f"[IMPORT] llm_script import FAILED: {type(e).__name__}: {e}")
 
     def chatgpt_llm_with_bias(_z, _agent, *, named_target: Optional[str] = None, **_kwargs):
-        # Replace stub with sentence fallback
         return SAFE_FALLBACK, {"repetition_penalty": None}
 
     _LLM_TOK = None
 
-# NEW (Phase 7): buffered language metrics CSV writer
 try:
     from training_utils import LangMetricsWriter  # type: ignore
 except Exception:
-    LangMetricsWriter = None  # fallback later
+    LangMetricsWriter = None
 
-# -----------------------------------------------------------------------------
-# Load config, derive globals, and light helpers
-# -----------------------------------------------------------------------------
 with open("config.yaml", "r") as f:
     CFG = yaml.safe_load(f)
 
-# Debug mode flag for narrow-try behavior
 DEBUG_MODE = bool(CFG.get("logging", {}).get("debug", False) or CFG.get("DEBUG", False))
 
-# Core sim settings
 NUM_AGENTS = int(CFG.get("NUM_AGENTS", 6))
 NUM_WEREWOLVES = int(CFG.get("NUM_WEREWOLVES", 1))
 
-# Screen/display
 SCREEN_W = int(CFG.get("SCREEN_W", 1200))
 SCREEN_H = int(CFG.get("SCREEN_H", 600))
 FPS = int(CFG.get("FPS", 1))
 AGENT_R = int(CFG.get("AGENT_R", 30))
 
-# Message log
 MSG_LOG_LIMIT = int(CFG.get("MSG_LOG_LIMIT", 12))
 MSG_BOX_W = int(CFG.get("MSG_BOX_W", 360))
 MSG_BOX_X = int(CFG.get("MSG_BOX_X", SCREEN_W - MSG_BOX_W))
 
-# Language toggle
 USE_LANGUAGE = bool(CFG.get("USE_LANGUAGE", True))
 
-# Judge settings
 RUBRIC_PATH = CFG.get("RUBRIC_PATH", "judge_rubric.yaml")
 PLANNER_TOPK = int(CFG.get("PLANNER_TOPK", 3))
 
-# NEW: logging and seeds
 LOG_CFG = CFG.get("logging", {}) if isinstance(CFG.get("logging", {}), dict) else {}
 LOG_DIR       = LOG_CFG.get("dir", "logs")
 METRICS_CSV   = LOG_CFG.get("metrics_csv", f"{LOG_DIR}/metrics.csv")
@@ -253,41 +225,12 @@ SAVE_CFG_SNAPSHOT = bool(CFG.get("runtime", {}).get("save_config_snapshot", True
 SEEDS = CFG.get("seeds", {}) if isinstance(CFG.get("seeds", {}), dict) else {}
 SEED_GLOBAL = int(SEEDS.get("global", 123))
 
-# NEW: sim-level knobs
 SIM_CFG = CFG.get("sim", {}) if isinstance(CFG.get("sim"), dict) else {}
 VOTE_MIX_ALPHA: float = float(SIM_CFG.get("vote_mix_alpha", 0.0))
 LOG_DZ_TALK: bool = bool(SIM_CFG.get("log_dz_talk", False))
 LOG_DZ_KILL: bool = bool(SIM_CFG.get("log_dz_kill", False))
+POLICY: str = str(SIM_CFG.get("policy", "") or "").lower()
 
-def _social_enabled_from_cfg(cfg: dict) -> bool:
-    top  = bool((cfg.get("social", {}) or {}).get("enabled", True))
-    sims = bool(((cfg.get("sim", {}) or {}).get("social", {}) or {}).get("enabled", True))
-    return bool(top and sims)
-SOCIAL_ENABLED_CFG = _social_enabled_from_cfg(CFG)
-
-# Hygiene merge
-def _merged_hygiene(cfg: dict) -> SimpleNamespace:
-    lang = cfg.get("language", {}) or {}
-    llm_hyg = (cfg.get("llm", {}) or {}).get("hygiene", {}) or {}
-    top_hyg = cfg.get("hygiene", {}) or {}
-    min_words = int(lang.get("min_words", llm_hyg.get("min_words", top_hyg.get("min_words", 12))))
-    redo_max = int(lang.get("redo_max", llm_hyg.get("redo_max", top_hyg.get("redo_max", 1))))
-    force_q  = float(lang.get("force_question_prob", llm_hyg.get("force_question_prob", top_hyg.get("force_question_prob", 0.25))))
-    return SimpleNamespace(min_words=min_words, redo_max=redo_max, force_question_prob=force_q)
-
-HYGIENE_NS = _merged_hygiene(CFG)
-HYGIENE_NS_POST = HYGIENE_NS
-
-# LLM speaker route and hygiene config
-LLM_CFG = CFG.get("llm", {}) if isinstance(CFG.get("llm"), dict) else {}
-LLM_SPK_ENABLED: bool = bool(LLM_CFG.get("speaker_enabled", True))
-LLM_ALPHA: float      = float(LLM_CFG.get("alpha", 0.5))
-
-# Fusion config
-FUSION_CFG = CFG.get("fusion", {}) if isinstance(CFG.get("fusion"), dict) else {}
-ALPHA_INTENT_BIAS: float = float(FUSION_CFG.get("alpha_intent_bias", FUSION_ALPHA if 'FUSION_ALPHA' in globals() else 0.5))
-
-# Env overrides
 def _env_bool(name: str, default: bool) -> bool:
     v = os.getenv(name, None)
     if v is None:
@@ -312,16 +255,71 @@ def _env_float(name: str, default: float) -> float:
     except Exception:
         return default
 
+def _env_str(name: str, default: str) -> str:
+    v = os.getenv(name, None)
+    return v if v is not None else default
+
+def _social_enabled_from_cfg(cfg: dict) -> bool:
+    """
+    Combine config-level social flags with env overrides so baselines can
+    cleanly flip Stage A social on or off.
+    """
+    top  = bool((cfg.get("social", {}) or {}).get("enabled", True))
+    sims = bool(((cfg.get("sim", {}) or {}).get("social", {}) or {}).get("enabled", True))
+    default = bool(top and sims)
+    env_soc = _env_bool("SOCIAL_ENABLED", default)
+    env_sim = _env_bool("SIM_SOCIAL_ENABLED", env_soc)
+    return bool(env_soc and env_sim)
+
+SOCIAL_ENABLED_CFG = _social_enabled_from_cfg(CFG)
+
+def _merged_hygiene(cfg: dict) -> SimpleNamespace:
+    lang = cfg.get("language", {}) or {}
+    llm_hyg = (cfg.get("llm", {}) or {}).get("hygiene", {}) or {}
+    top_hyg = cfg.get("hygiene", {}) or {}
+    min_words = int(lang.get("min_words", llm_hyg.get("min_words", top_hyg.get("min_words", 12))))
+    redo_max = int(lang.get("redo_max", llm_hyg.get("redo_max", top_hyg.get("redo_max", 1))))
+    force_q  = float(lang.get("force_question_prob", llm_hyg.get("force_question_prob", top_hyg.get("force_question_prob", 0.25))))
+    return SimpleNamespace(min_words=min_words, redo_max=redo_max, force_question_prob=force_q)
+
+HYGIENE_NS = _merged_hygiene(CFG)
+HYGIENE_NS_POST = HYGIENE_NS
+
+LLM_CFG = CFG.get("llm", {}) if isinstance(CFG.get("llm"), dict) else {}
+LLM_SPK_ENABLED: bool = bool(LLM_CFG.get("speaker_enabled", True))
+LLM_ALPHA: float      = float(LLM_CFG.get("alpha", 0.5))
+
+FUSION_CFG = CFG.get("fusion", {}) if isinstance(CFG.get("fusion"), dict) else {}
+ALPHA_INTENT_BIAS: float = float(FUSION_CFG.get("alpha_intent_bias", FUSION_ALPHA if 'FUSION_ALPHA' in globals() else 0.5))
+
+# Apply env overrides
 USE_LANGUAGE   = _env_bool("USE_LANGUAGE", USE_LANGUAGE)
 PLANNER_TOPK   = _env_int("PLANNER_TOPK", PLANNER_TOPK)
 VOTE_MIX_ALPHA = _env_float("VOTE_MIX_ALPHA", VOTE_MIX_ALPHA)
 LOG_DZ_TALK    = _env_bool("LOG_DZ_TALK", LOG_DZ_TALK)
 LOG_DZ_KILL    = _env_bool("LOG_DZ_KILL", LOG_DZ_KILL)
 ALPHA_INTENT_BIAS = _env_float("ALPHA_INTENT_BIAS", ALPHA_INTENT_BIAS)
+SEED_GLOBAL = _env_int("SEED_GLOBAL", SEED_GLOBAL)
 
-# -----------------------------------------------------------------------------
-# Runtime globals and helpers
-# -----------------------------------------------------------------------------
+# Judge availability toggle and helper
+JUDGE_ENABLED = _env_bool("JUDGE_ENABLED", True)
+def _can_use_judge() -> bool:
+    if not JUDGE_ENABLED:
+        return False
+    key = os.getenv("OPENAI_API_KEY", "").strip()
+    return key != ""
+
+if not USE_LANGUAGE:
+    LLM_SPK_ENABLED = False
+
+AGENTSIM_POLICY = _env_str("AGENTSIM_POLICY", POLICY).lower()
+if _env_bool("RANDOM_VOTE", False) and not AGENTSIM_POLICY:
+    AGENTSIM_POLICY = "random_voting"
+POLICY = AGENTSIM_POLICY or POLICY
+_IS_RANDOM_POLICY = POLICY in {"random_voting", "random_vote", "random"}
+_IS_HEURISTIC_POLICY = POLICY in {"heuristic_voting", "heuristic"}
+_IS_JEPA_ONLY_POLICY = POLICY in {"jepa_only", "jepa_random"}
+
 screen = font = font_s = clock = None
 msg_log: Deque[Tuple[str, str]] = deque(maxlen=200)
 
@@ -337,7 +335,7 @@ def ensure_dir(path: str):
 
 def write_config_snapshot(cfg: dict, path: str):
     ensure_dir(path)
-    with open(path, "w") as f:
+    with open(path, "w",) as f:
         yaml.safe_dump(cfg, f)
 
 def append_csv_rows(path: str, rows: list[dict]):
@@ -369,7 +367,6 @@ def append_csv_rows(path: str, rows: list[dict]):
         for r in rows:
             w.writerow({k: r.get(k, "") for k in header})
 
-# Sanity validators
 def _assert_len(name: str, obj, expected: int, *, ctx: str = ""):
     got = (len(obj) if hasattr(obj, "__len__") else int(getattr(obj, "numel", lambda: -1)()))
     assert got == expected, (
@@ -387,16 +384,15 @@ def _check_mask(mask: torch.Tensor, expected: int, *, kind: str, round_num: int,
     assert isinstance(mask, torch.Tensor) and mask.dim() == 1, \
         f"[SANITY] {kind} mask must be 1-D tensor | r{round_num} {agent}"
     _assert_len(f"{kind} mask", mask, expected, ctx=f"r{round_num} agent={agent}")
-    assert torch.isfinite(mask.float()).all(), f"[SANITY] {kind} mask has non-finite values | r{round_num} {agent}"
+    assert torch.isfinite(mask.float()).all(), f"[SANITY] {kind} mask has non-finite values | r{round_num} agent={agent}"
 
-# Uniform event logger (CSV): now error-aware and NA/blank-friendly
 def emit_event(rows, *, run_id, round_num, phase_code, phase_str, agent, role,
                choice_type, payload_idx, mask_names=None, judge=None,
-               dz=None, speaker_mode="", persona_norm=0.0, error: str = ""):
-    # If an error is present, blank numeric judge fields.
+               dz=None, speaker_mode="", persona_norm=0.0, error: str = "", policy: str = ""):
     j = judge if (judge and not error) else None
     rows.append({
         "run_id": run_id,
+        "seed": SEED_GLOBAL,
         "round": round_num,
         "phase": phase_str,
         "phase_code": phase_code,
@@ -415,21 +411,35 @@ def emit_event(rows, *, run_id, round_num, phase_code, phase_str, agent, role,
         "speaker_mode": speaker_mode,
         "persona_norm": persona_norm,
         "error": error or "",
+        "policy": policy or "",
+        "target": "",
+        "target_is_wolf": "",
     })
 
-# Diagnostic logger for mouthpiece path
+def _annotate_vote(rows: list[dict], *, round_num: int, agent_name: str, target_name: Optional[str], target_role: Optional[str]):
+    try:
+        target_is_wolf = ""
+        if target_role is not None:
+            target_is_wolf = int(target_role == WEREWOLF)
+        for row in reversed(rows):
+            if row.get("round") != round_num:
+                break
+            if row.get("phase") == "DAY_VOTE" and row.get("agent") == agent_name and not row.get("target"):
+                row["target"] = target_name or ""
+                row["target_is_wolf"] = target_is_wolf
+                break
+    except Exception:
+        pass
+
 def _mouth_log(msg: str):
-    # Prefix for grepping in slurm logs
     print(f"[MOUTHPIECE] {msg}", flush=True)
 
-# NEW helpers used by night chat
 def _recent_texts_of(ag, k: int = 3) -> list[str]:
     try:
         return [m for (_n, m) in list(ag.message_memory)[-k:] if m and m.strip()]
     except Exception:
         return []
 
-# Finite guards
 def _finite(t: torch.Tensor) -> torch.Tensor:
     if not torch.is_tensor(t):
         return torch.tensor([], dtype=torch.float32)
@@ -441,7 +451,6 @@ def _finite_mean(xs: List[float]) -> float:
         return float("nan")
     return float(sum(vals) / len(vals))
 
-# Category fusion for intent
 @torch.no_grad()
 def _fused_intent_for_agent(ag: BaseAgent, z_t: torch.Tensor, *, recent_texts: List[str], alpha: Optional[float] = None) -> Dict[str, torch.Tensor]:
     th_logits = None
@@ -456,13 +465,15 @@ def _fused_intent_for_agent(ag: BaseAgent, z_t: torch.Tensor, *, recent_texts: L
 
     bh_logits = None
     try:
-        bh = getattr(ag, "bias_head", None)
-        if isinstance(bh, LogitBiasHead):
+        if isinstance(getattr(ag, "bias_head", None), LogitBiasHead):
             h = _mk_hist_feats(recent_texts).to(z_t.device)
-            if h.dim() == 1: h = h.unsqueeze(0)
-            if z_t.dim() == 1: z_in = z_t.unsqueeze(0)
-            else: z_in = z_t
-            bh_logits = bh(z_in, h).squeeze(0).detach().float()
+            if h.dim() == 1:
+                h = h.unsqueeze(0)
+            if z_t.dim() == 1:
+                z_in = z_t.unsqueeze(0)
+            else:
+                z_in = z_t
+            bh_logits = ag.bias_head(z_in, h).squeeze(0).detach().float()
     except Exception:
         bh_logits = None
 
@@ -499,7 +510,6 @@ def _fused_intent_for_agent(ag: BaseAgent, z_t: torch.Tensor, *, recent_texts: L
         "cat_id": torch.tensor(int(cat_id)),
     }
 
-# Build aux with texts
 def _aux_with_texts(ag: BaseAgent, agents: List[BaseAgent]) -> dict:
     aux = ag.make_aux(agents)
     try:
@@ -510,7 +520,6 @@ def _aux_with_texts(ag: BaseAgent, agents: List[BaseAgent]) -> dict:
         aux["neighbor_texts"] = []
     return aux
 
-# Mix helpers
 def _safe_norm_probs(x: torch.Tensor) -> torch.Tensor:
     s = float(x.sum().item())
     if s <= 0.0 or not torch.isfinite(x).all():
@@ -529,7 +538,6 @@ def _mix_topk_scores(topk_probs_planner: List[float], judged: List[dict], alpha:
     mix = alpha * p_pl + (1.0 - alpha) * p_j
     return int(torch.argmax(mix).item())
 
-# UI helpers
 def _wrap(text: str, fnt: pygame.font.Font, width: int) -> list[str]:
     out, cur = [], ""
     for word in text.split():
@@ -568,7 +576,6 @@ def draw_agents(agents: list[BaseAgent]) -> None:
     _draw_log()
     pygame.display.flip()
 
-# Multi-head helpers
 def _get_heads(ag: BaseAgent):
     if hasattr(ag, "planner_factorized") and ag.planner_factorized is not None:
         return ag.planner_factorized
@@ -642,7 +649,6 @@ def _agent_context_block(ag: BaseAgent, max_lines: int = 6) -> str:
 def _candidate_text(target_name: str) -> str:
     return f"We should vote to eliminate {target_name}."
 
-# TALK→VOTE alignment
 def _talk_vote_alignment(cat_id: int) -> float:
     if cat_id == 4:   return 1.0
     if cat_id == 0:   return 0.9
@@ -657,14 +663,7 @@ def _intent_name_from_id(cid: int) -> str:
     except Exception:
         return "hedge"
 
-# -----------------------------------------------------------------------------
-# NEW: Concrete target resolver → canonical "Agent_N" handle (global index)
-# -----------------------------------------------------------------------------
 def _resolve_target(idx: Optional[int], alive_agents: List[BaseAgent]) -> Optional[str]:
-    """
-    Map a global agent index to canonical 'Agent_N' if valid and alive.
-    Returns None if idx is invalid or refers to a dead/nonexistent agent.
-    """
     try:
         if idx is None or idx < 0 or idx >= NUM_AGENTS:
             return None
@@ -673,26 +672,14 @@ def _resolve_target(idx: Optional[int], alive_agents: List[BaseAgent]) -> Option
     except Exception:
         return None
 
-# -----------------------------------------------------------------------------
-# NEW: robust target picker to eliminate None targets for targetful intents
-# -----------------------------------------------------------------------------
 def _pick_valid_target(ag: BaseAgent,
                        living: List[BaseAgent],
                        prefer: Optional[List[str]] = None) -> Optional[str]:
-    """
-    Always return a live, non-self canonical 'Agent_N' if possible.
-    Preference order:
-      1) first valid name in `prefer`
-      2) last speaker from message_memory
-      3) random alive non-self
-    """
     names_alive = {a.name for a in living if a.alive}
-    # 1) prefer list
     if prefer:
         for nm in prefer:
             if nm and nm in names_alive and nm != ag.name:
                 return nm
-    # 2) last speaker
     try:
         if getattr(ag, "message_memory", None):
             for n, _ in reversed(ag.message_memory):
@@ -700,13 +687,9 @@ def _pick_valid_target(ag: BaseAgent,
                     return n
     except Exception:
         pass
-    # 3) random fallback
     candidates = [a.name for a in living if a.alive and a.name != ag.name]
     return random.choice(candidates) if candidates else None
 
-# -----------------------------------------------------------------------------
-# NEW: single-path stdout/UI logger to keep logs normalized
-# -----------------------------------------------------------------------------
 def _log_utterance(speaker: str, text: str, *, visual: bool):
     try:
         print(f"{speaker}: {text}", flush=True)
@@ -715,23 +698,17 @@ def _log_utterance(speaker: str, text: str, *, visual: bool):
     if visual:
         msg_log.append((speaker, text))
 
-# -----------------------------------------------------------------------------
-# NEW: Agent mention sanitizer (fixes Agent' and strips names when targetless)
-# -----------------------------------------------------------------------------
-# Matches canonical Agent_7, Agent7, Agent'_7, Agent' 7, Agent_7's, etc.
 _AGENT_MENTION_RE = re.compile(
     r"""
     (?:
-        \bAgent      # literal Agent
-        (?:[_\s]*|['’]\s*)   # optional underscore/space or stray apostrophe
-        (\d+)        # capture the digits
-        (?:\b|(?=['’]s))     # word boundary or possessive follows
+        \bAgent
+        (?:[_\s]*|['’]\s*)
+        (\d+)
+        (?:\b|(?=['’]s))
     )
     """,
     re.IGNORECASE | re.VERBOSE,
 )
-
-# Matches malformed "Agent'" with nothing after it
 _AGENT_STRAY_RE = re.compile(r"\bAgent['’]\b", re.IGNORECASE)
 
 def _sanitize_agent_mentions(
@@ -739,57 +716,34 @@ def _sanitize_agent_mentions(
     *,
     allow_specific: bool,
 ) -> str:
-    """Fix malformed 'Agent'' artifacts and, if not allowed, replace any explicit
-    Agent_N references with neutral phrasing ('someone' / 'someone's')."""
-
     if not text:
         return text
-
     s = text
-
-    # 1) Fix stray "Agent'" → "someone"
     s = _AGENT_STRAY_RE.sub("someone", s)
 
-    # 2) Normalize variants like Agent7 → Agent_7 (only if we keep specifics)
     def _norm_or_neutral(m: re.Match) -> str:
         num = m.group(1)
-        # If not allowed to refer to a specific player, neutralize.
         if not allow_specific:
-            # Preserve possessive if present immediately after
             end = m.end()
             possessive = ""
             if end < len(s) and s[end:end+2] in ("'s", "’s"):
                 possessive = "'s"
             return f"someone{possessive}"
-        # Otherwise, return canonical Agent_{num} (preserve possessive externally)
         start, end = m.span()
         possessive = ""
         if end < len(s) and s[end:end+2] in ("'s", "’s"):
             possessive = s[end:end+2]
         return f"Agent_{num}{possessive}"
 
-    # We run the replacement iteratively because we inspect lookahead possessives.
-    # Safer approach: rebuild string by scanning; here we do a two-pass workaround.
-    # First, insert placeholders for possessives to keep them stable.
     s = s.replace("’s", "'s")
     s = _AGENT_MENTION_RE.sub(_norm_or_neutral, s)
-
-    # Light whitespace cleanup
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-# -----------------------------------------------------------------------------
-# NEW: Planner sanity helper — roster-aware get_planner()
-# -----------------------------------------------------------------------------
 def _ensure_planner_heads_match_roster(ag: BaseAgent, num_agents: int) -> None:
-    """
-    Ensure the agent’s planner VoteHead is sized to this game's roster.
-    Uses get_planner(num_agents_override=...) when available; falls back safely.
-    """
     gp = getattr(ag, "get_planner", None)
     if callable(gp):
         try:
-            # Ensure the agent’s heads are sized to this game’s roster before checking
             p = gp(num_agents_override=num_agents)
             v = getattr(p, "vote", None)
             assert v is not None and hasattr(v, "net") and hasattr(v.net[-1], "out_features"), \
@@ -799,15 +753,11 @@ def _ensure_planner_heads_match_roster(ag: BaseAgent, num_agents: int) -> None:
                 f"[SANITY] VoteHead out_features={out_dim} != NUM_AGENTS={num_agents} | agent={ag.name}"
             return
         except TypeError:
-            # Older signature without override; fall through to best-effort check
             pass
         except AssertionError as e:
-            # Re-raise to fail fast
             raise
         except Exception as e:
             print(f"[SANITY] get_planner override check failed for {ag.name}: {type(e).__name__}: {e}")
-
-    # Best-effort legacy check
     try:
         p = gp() if callable(gp) else _get_heads(ag)
         v = getattr(p, "vote", None)
@@ -818,9 +768,6 @@ def _ensure_planner_heads_match_roster(ag: BaseAgent, num_agents: int) -> None:
     except Exception as e:
         print(f"[SANITY] legacy planner check failed for {ag.name}: {type(e).__name__}: {e}")
 
-# -----------------------------------------------------------------------------
-# SpeakerLLM fallback generator built from helpers
-# -----------------------------------------------------------------------------
 def _speaker_llm_fallback_generate(
     ag: BaseAgent,
     z_t: torch.Tensor,
@@ -830,10 +777,6 @@ def _speaker_llm_fallback_generate(
     plan: dict,
     recent_texts: List[str],
 ) -> tuple[str, dict]:
-    """
-    Build a role-phase prompt and logits processors with bias fusion,
-    call the agent's llm_fn, then guard and return. Never emits empty.
-    """
     try:
         tok = getattr(ag, "tokenizer", None) or _LLM_TOK
         prompt, base_kwargs = build_prompt_and_controls(
@@ -846,17 +789,13 @@ def _speaker_llm_fallback_generate(
             dialog_state=getattr(ag, "dialog_state", None),
             self_name=ag.name,
         )
-
-        # NEW: If no concrete target, nudge the model not to name players.
         if not (plan.get("target") or plan.get("target_idx") is not None):
             prompt += (
                 "\n\n[STYLE]\n"
-                "If you don't have a specific player as a target, speak generally.\n"
-                "Do NOT name or refer to any player by 'Agent_#' or by name.\n"
+                "If you do not have a specific player as a target, speak generally.\n"
+                "Do not name or refer to any player by 'Agent_#' or by name.\n"
                 "Prefer neutral phrasing such as 'someone', 'a player', or 'the situation'."
             )
-
-        # fuse bias head if available, using fused intent probs if present on plan
         talkhead_probs = None
         if "fused_probs" in plan and isinstance(plan["fused_probs"], list) and plan["fused_probs"]:
             talkhead_probs = torch.tensor(plan["fused_probs"], dtype=torch.float32)
@@ -875,26 +814,21 @@ def _speaker_llm_fallback_generate(
         else:
             fused_kwargs = {}
 
-        # merge processors
         gen_kwargs = dict(base_kwargs)
         if fused_kwargs:
             lp = list(gen_kwargs.get("logits_processor", []))
             lp.extend(fused_kwargs.get("logits_processor", []))
             gen_kwargs["logits_processor"] = lp
 
-        # invoke llm
         llm = getattr(ag, "llm_fn", None)
         text_out = None
         if callable(llm):
             text_out = llm(prompt, generate_kwargs=gen_kwargs)
             if isinstance(text_out, tuple) and len(text_out) >= 1:
                 text_out = text_out[0]
-        # guard and shape
         text_out = text_out if isinstance(text_out, str) else ""
         text_guarded, meta_guard = guard_and_shape(text_out, plan, role or "Unknown", phase, HYGIENE_NS)
         text_guarded = text_guarded if (text_guarded and text_guarded.strip()) else SAFE_FALLBACK
-
-        # small collapse signal
         rp = repetition_penalty(text_guarded, n=2)
         meta = {"repetition_penalty": rp, **meta_guard}
         return text_guarded, meta
@@ -902,11 +836,43 @@ def _speaker_llm_fallback_generate(
         _mouth_log(f"{ag.name} speaker_llm fallback path failed: {type(e).__name__}: {e}")
         return SAFE_FALLBACK, {"repetition_penalty": None, "violated": False, "redo": False}
 
-# -----------------------------------------------------------------------------
-# MAIN LOOP
-# -----------------------------------------------------------------------------
+# Heuristic vote chooser for heuristic policy
+def _heuristic_vote_choice(ag: BaseAgent, living: list[BaseAgent]) -> Optional[str]:
+    counts = Counter()
+    try:
+        for n, m in list(getattr(ag, "message_memory", []))[-12:]:
+            if not m:
+                continue
+            for other in living:
+                if other.name == ag.name:
+                    continue
+                if other.name in m:
+                    counts[other.name] += 1
+    except Exception:
+        pass
+    if counts:
+        cand, _ = counts.most_common(1)[0]
+        if any(x.name == cand and x.alive for x in living):
+            return cand
+    try:
+        z_t = _finite(ag.encode_current_belief(getattr(ag, "round_num_hint", 0), living).detach())
+    except Exception:
+        z_t = None
+    try:
+        topk = _vote_topk_for_agent(ag, z_t, living, k=PLANNER_TOPK) if z_t is not None else []
+        if topk:
+            return topk[0][0]
+    except Exception:
+        pass
+    choices = [x.name for x in living if x.alive and x.name != ag.name]
+    return random.choice(choices) if choices else None
+
 def simulate_game(visual: bool = True):
-    run_id = f"run_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+    env_run_id = os.getenv("RUN_ID", "").strip()
+    if env_run_id:
+        run_id = env_run_id
+    else:
+        run_id = f"run_{int(time.time())}_{uuid.uuid4().hex[:6]}"
     set_seed(SEED_GLOBAL)
     pathlib.Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
     if SAVE_CFG_SNAPSHOT:
@@ -917,10 +883,10 @@ def simulate_game(visual: bool = True):
             "seed": SEED_GLOBAL,
             "timestamp": int(time.time()),
             "device": str(torch.device("cuda:0" if torch.cuda.is_available() else "cpu")),
+            "policy": POLICY,
         }, f)
 
-    # Phase 7: language metrics writer
-    lang_writer = None
+    lang_writer = None    # type: ignore
     if LangMetricsWriter is not None:
         try:
             lang_writer = LangMetricsWriter(csv_path=LANG_METRICS_CSV, run_id=run_id, seed=SEED_GLOBAL)
@@ -935,44 +901,39 @@ def simulate_game(visual: bool = True):
                 return lang_writer.add(row)
         append_csv_rows(LANG_METRICS_CSV, [row])
 
-    # Pygame
     if visual:
         pygame.init()
         global screen, font, font_s, clock
         screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
-        pygame.display.set_caption("JEPA Werewolf Sim")
+        pygame.display.setCaption("JEPA Werewolf Sim")
         font = pygame.font.SysFont(None, 32)
         font_s = pygame.font.SysFont(None, 24)
         clock = pygame.time.Clock()
 
-    # Agents and roles
     agents = [BaseAgent(f"Agent_{i}") for i in range(NUM_AGENTS)]
     assert len(agents) == NUM_AGENTS, "[SANITY] agent list does not match NUM_AGENTS"
     assign_roles(agents, NUM_WEREWOLVES)
     if apply_personality is not None:
         apply_personality(agents)
     print("▶ Assigned roles:", ", ".join(f"{a.name}:{a.role}" for a in agents))
+    if POLICY:
+        print(f"[POLICY] Using policy='{POLICY}'")
 
     for ag in agents:
         ag.last_delta_social_norm = 0.0
         ag.social_enabled = bool(SOCIAL_ENABLED_CFG)
 
-    # Shared encoder
     shared_msg_encoder = MessageEncoder()
     for ag in agents:
         ag.message_encoder = shared_msg_encoder
 
-    # Attach JEPA sub-modules
     for ag in agents:
         wm, ae, planner = load_role_models(ag.role)
         ag.world_model, ag.action_encoder, ag.planner = wm, ae, planner
 
-    # --- NEW: roster-aware planner sanity (replaces older snippet) -------------
     for ag in agents:
         _ensure_planner_heads_match_roster(ag, NUM_AGENTS)
-    # --------------------------------------------------------------------------
 
-    # LLM hookup
     if not USE_LANGUAGE:
         _mouth_log("USE_LANGUAGE is False, attaching static fallback")
         for ag in agents:
@@ -981,13 +942,12 @@ def simulate_game(visual: bool = True):
         from llm_script import llm_fn_from_env
         mouth_fn = llm_fn_from_env()
         try:
-            from llm_script import tok as _llm_tok  # public alias
+            from llm_script import tok as _llm_tok
         except Exception:
             _llm_tok = None
         for ag in agents:
             ag.attach_llm(mouth_fn, tokenizer=_llm_tok)
 
-    # Judge rubric
     try:
         judge_rubric = JudgeRubric.load(RUBRIC_PATH)
     except Exception as e:
@@ -1002,7 +962,6 @@ def simulate_game(visual: bool = True):
     mask_logs: list[dict] = []
     social_stats_log: list[dict] = []
 
-    # Day and night loop
     while True:
         if visual:
             pygame.event.pump()
@@ -1010,7 +969,6 @@ def simulate_game(visual: bool = True):
         living = [a for a in agents if a.alive]
         print(f"\n=== Day {round_num} ===")
 
-        # (2.1) Allowed names gate before DISCUSS
         try:
             if USE_LANGUAGE:
                 alive_names_gate = [a.name for a in agents if getattr(a, "alive", False)]
@@ -1018,13 +976,11 @@ def simulate_game(visual: bool = True):
         except Exception as e:
             _mouth_log(f"allowed-names gate (DAY) failed: {type(e).__name__}: {e}")
 
-        # optional: cache z pre-talk for Δz(TALK)
         z_pre_talk: Dict[str, torch.Tensor] = {}
         if LOG_DZ_TALK:
             for ag in living:
                 z_pre_talk[ag.name] = _finite(ag.encode_current_belief(round_num, agents).detach())
 
-        # DISCUSS
         for ag in living:
             try:
                 z_t_discuss = _finite(ag.encode_current_belief(round_num, agents).detach())
@@ -1033,7 +989,6 @@ def simulate_game(visual: bool = True):
                 cat_id = int(fused["cat_id"].item())
                 fused_probs = fused["fused_probs"].tolist()
 
-                # target heuristics from vote top-k
                 arg_id: Optional[int] = None
                 named_target: Optional[str] = None
                 topk_for_ref = _vote_topk_for_agent(ag, z_t_discuss, living, k=PLANNER_TOPK)
@@ -1057,10 +1012,8 @@ def simulate_game(visual: bool = True):
                         named_target = None
                         arg_id = None
 
-                # Build plan tuple
                 intent_name = _intent_name_from_id(cat_id)
 
-                # --- NEW: ensure targetful intents always get a valid target ---
                 if intent_name == "defend" and not named_target:
                     named_target = ag.name
                     try:
@@ -1074,7 +1027,6 @@ def simulate_game(visual: bool = True):
                         arg_id = int(named_target.split("_")[1]) if named_target else None
                     except Exception:
                         arg_id = None
-                # ----------------------------------------------------------------
 
                 try:
                     plan = build_plan_tuple(
@@ -1089,7 +1041,6 @@ def simulate_game(visual: bool = True):
                 except Exception:
                     plan = {"intent": intent_name, "target": named_target, "shape": ""}
 
-                # --- NEW: resolve concrete target before speaking and logging ---
                 try:
                     if arg_id is not None and isinstance(plan, dict):
                         plan["target_idx"] = int(arg_id)
@@ -1099,16 +1050,13 @@ def simulate_game(visual: bool = True):
                         named_target = forced
                 except Exception:
                     pass
-                # ---------------------------------------------------------------
 
-                # Honor router flag: if speaker disabled, short-circuit to SAFE_FALLBACK
                 if not LLM_SPK_ENABLED:
                     _mouth_log(f"{ag.name} router disabled by cfg, emitting SAFE_FALLBACK")
                     text = SAFE_FALLBACK
                     gen_meta = {"repetition_penalty": None, "violated": False, "redo": False}
                     ag.speaker_mode = "disabled"
                 else:
-                    # Primary path: bias-fusion mouthpiece
                     use_primary_ok = False
                     text = ""
                     gen_meta = {}
@@ -1130,11 +1078,8 @@ def simulate_game(visual: bool = True):
                         _mouth_log(f"{ag.name} primary mouthpiece failed: {type(e).__name__}: {e}")
                         if DEBUG_MODE:
                             raise
-
-                    # Fallback 1: speaker_llm built prompt path
                     if not use_primary_ok:
                         try:
-                            # enrich plan with fused probs for fallback processors
                             plan_fb = dict(plan)
                             plan_fb["fused_probs"] = fused_probs
                             text_raw, gen_meta_fb = _speaker_llm_fallback_generate(
@@ -1153,13 +1098,11 @@ def simulate_game(visual: bool = True):
                             ag.speaker_mode = "llm"
                             _mouth_log(f"{ag.name} fallback guarded len={len((text or '').split())} violated={gen_meta.get('violated', False)} redo={gen_meta.get('redo', False)}")
                         except Exception as e2:
-                            # Final fallback
                             _mouth_log(f"{ag.name} fallback prompt path failed: {type(e2).__name__}: {e2}")
                             text = SAFE_FALLBACK
                             gen_meta = {"repetition_penalty": None, "violated": False, "redo": False}
                             ag.speaker_mode = "safe"
 
-                # Postprocess hygiene, preserve punctuation, never empty
                 try:
                     text = postprocess_text(text, role=ag.role or "Unknown", cfg=HYGIENE_NS)
                     if (not text) or (not text.strip()):
@@ -1169,9 +1112,6 @@ def simulate_game(visual: bool = True):
                     _mouth_log(f"{ag.name} postprocess failed: {type(e).__name__}: {e}")
                     text = text if (text and text.strip()) else SAFE_FALLBACK
 
-                # --- NEW: Fallback templating bug fix ---------------------------
-                # If the text is exactly the fallback, suppress any downstream
-                # target injection by clearing target info and forcing generic sanitation.
                 is_fallback_text = (text.strip() == SAFE_FALLBACK)
                 if is_fallback_text:
                     named_target = None
@@ -1182,9 +1122,7 @@ def simulate_game(visual: bool = True):
                                 plan["target_idx"] = None
                     except Exception:
                         pass
-                # ----------------------------------------------------------------
 
-                # --- NEW: normalize utterance and sanitize agent mentions (DAY) ---
                 try:
                     text = normalize_utterance(text)
                 except Exception:
@@ -1195,15 +1133,11 @@ def simulate_game(visual: bool = True):
                     text = _sanitize_agent_mentions(text, allow_specific=allow_specific)
                 except Exception:
                     pass
-                # ------------------------------------------------------------------
 
-                # Buffer the public message
                 ag.buffer_message(ag.name, text)
 
-                # annotate buffer
                 retry_count = 1 if gen_meta.get("redo") else 0
                 if getattr(ag, "msg_buffer", None):
-                    # Only record named_target if we did not collapse to fallback
                     if not is_fallback_text:
                         ag.msg_buffer[-1]["named_target"] = plan.get("target") or named_target
                     else:
@@ -1212,12 +1146,10 @@ def simulate_game(visual: bool = True):
                     ag.msg_buffer[-1]["strict_ok"] = int(not gen_meta.get("violated", False))
                     ag.msg_buffer[-1]["retry_count"] = retry_count
 
-                # stdout and UI (single normalized path)
                 _log_utterance(ag.name, text, visual=visual)
                 if not text or not text.strip():
                     _mouth_log(f"{ag.name} final printed text is EMPTY AFTER CLEAN")
 
-                # update last buffer row with rich fields
                 if getattr(ag, "msg_buffer", None):
                     row = ag.msg_buffer[-1]
                     row.update({
@@ -1233,7 +1165,6 @@ def simulate_game(visual: bool = True):
                     })
                 ag.talk_category_last = int(cat_id)
 
-                # dialog_state update
                 try:
                     if hasattr(ag, "dialog_state") and hasattr(ag.dialog_state, "update_from_msg"):
                         ag.dialog_state.update_from_msg(
@@ -1243,7 +1174,6 @@ def simulate_game(visual: bool = True):
                 except Exception:
                     pass
 
-                # language metrics
                 try:
                     _lang_emit({
                         "run_id": run_id,
@@ -1263,32 +1193,31 @@ def simulate_game(visual: bool = True):
                 except Exception:
                     pass
 
-                # Judge utterance and record subscores
                 utter_judge = None
-                try:
-                    ctx_block = _agent_context_block(ag, max_lines=3)
-                    j_items = [{"context": ctx_block, "role": ag.role or "Unknown", "candidate": text}]
-                    j_res = score_batch(j_items, judge_rubric, run_id=run_id, round_num=round_num, phase="DAY_DISCUSS", agent=ag.name)[0]
-                    subs = j_res.get("subscores", {}) or {}
-                    utter_judge = {
-                        "score": float(j_res.get("score", 0.0)),
-                        "coherence": float(subs.get("coherence", 0.0)),
-                        "truthfulness": float(subs.get("truthfulness", 0.0)),
-                        "role_alignment": float(subs.get("role_alignment", 0.0)),
-                        "social_safety": float(subs.get("social_safety", 0.0)),
-                    }
-                    if getattr(ag, "msg_buffer", None):
-                        ag.msg_buffer[-1]["judge_score"] = utter_judge["score"]
-                        ag.msg_buffer[-1]["judge_subscores"] = {
-                            "coherence": utter_judge["coherence"],
-                            "truthfulness": utter_judge["truthfulness"],
-                            "role_alignment": utter_judge["role_alignment"],
-                            "social_safety": utter_judge["social_safety"],
+                if _can_use_judge():
+                    try:
+                        ctx_block = _agent_context_block(ag, max_lines=3)
+                        j_items = [{"context": ctx_block, "role": ag.role or "Unknown", "candidate": text}]
+                        j_res = score_batch(j_items, judge_rubric, run_id=run_id, round_num=round_num, phase="DAY_DISCUSS", agent=ag.name)[0]
+                        subs = j_res.get("subscores", {}) or {}
+                        utter_judge = {
+                            "score": float(j_res.get("score", 0.0)),
+                            "coherence": float(subs.get("coherence", 0.0)),
+                            "truthfulness": float(subs.get("truthfulness", 0.0)),
+                            "role_alignment": float(subs.get("role_alignment", 0.0)),
+                            "social_safety": float(subs.get("social_safety", 0.0)),
                         }
-                except Exception:
-                    utter_judge = None
+                        if getattr(ag, "msg_buffer", None):
+                            ag.msg_buffer[-1]["judge_score"] = utter_judge["score"]
+                            ag.msg_buffer[-1]["judge_subscores"] = {
+                                "coherence": utter_judge["coherence"],
+                                "truthfulness": utter_judge["truthfulness"],
+                                "role_alignment": utter_judge["role_alignment"],
+                                "social_safety": utter_judge["social_safety"],
+                            }
+                    except Exception:
+                        utter_judge = None
 
-                # telemetry row
                 emit_event(
                     metrics_rows,
                     run_id=run_id, round_num=round_num,
@@ -1299,9 +1228,9 @@ def simulate_game(visual: bool = True):
                     judge=utter_judge,
                     speaker_mode=getattr(ag, "speaker_mode", "") or "",
                     persona_norm=getattr(ag, "persona_norm", 0.0),
+                    policy=POLICY,
                 )
 
-                # optional Δz(TALK)
                 if LOG_DZ_TALK and ag.name in z_pre_talk:
                     try:
                         z_post = _finite(ag.encode_current_belief(round_num, agents).detach())
@@ -1319,7 +1248,6 @@ def simulate_game(visual: bool = True):
                     except Exception:
                         pass
 
-                # TALK rollout tuple
                 try:
                     z_talk_pre = z_pre_talk.get(ag.name, z_t_discuss)
                     z_talk_post = _finite(ag.encode_current_belief(round_num, agents).detach())
@@ -1352,7 +1280,6 @@ def simulate_game(visual: bool = True):
                 except Exception:
                     pass
 
-        # Social coupling
         living = [a for a in agents if a.alive]
 
         z_pre_map: Dict[str, torch.Tensor] = {}
@@ -1474,25 +1401,12 @@ def simulate_game(visual: bool = True):
             ag: z_post_map.get(ag.name, z_pre_map[ag.name]) for ag in living
         }
 
-        # PRE-ACT: judge vote etc.
         pending: Dict[str, Tuple[torch.Tensor, int, torch.Tensor, str, str, dict]] = {}
         vote_map: Dict[BaseAgent, BaseAgent] = {}
 
         for ag in living:
             z_t = _finite(z_map[ag])
-            topk = _vote_topk_for_agent(ag, z_t, living, PLANNER_TOPK)
-            if not topk:
-                continue
-
             alive_names = [x.name for x in living if x.name != ag.name]
-            assert all(n.startswith("Agent_") for n in alive_names), \
-                f"[SANITY] vote mask has bad names: {alive_names} | r{round_num} {ag.name}"
-            assert len(set(alive_names)) == len(alive_names), \
-                f"[SANITY] vote mask has duplicates: {alive_names} | r{round_num} {ag.name}"
-
-            mask_logs.append({"round": round_num, "phase": "DAY_VOTE", "actor": ag.name, "mask": alive_names})
-            phase_log.append({"round": round_num, "phase": "DAY_VOTE"})
-
             if not alive_names:
                 emit_event(
                     metrics_rows, run_id=run_id, round_num=round_num,
@@ -1501,7 +1415,210 @@ def simulate_game(visual: bool = True):
                     payload_idx=-1, mask_names=[],
                     speaker_mode=getattr(ag, "speaker_mode", "") or "",
                     persona_norm=getattr(ag, "persona_norm", 0.0),
+                    policy=POLICY,
                 )
+                continue
+
+            # Random voting policy
+            if _IS_RANDOM_POLICY:
+                target_name = random.choice(alive_names)
+                target = next((x for x in living if x.name == target_name), None)
+                vote_map[ag] = target
+                tgt_idx = int(target_name.split('_')[1])
+                aux_snap = _aux_with_texts(ag, agents)
+                _check_aux(aux_snap, round_num=round_num, agent=ag.name)
+                pending[ag.name] = (
+                    z_t.detach(),
+                    1,
+                    torch.tensor(int(tgt_idx)),
+                    ag.role or "Unknown",
+                    "VOTE_TARGET",
+                    aux_snap,
+                )
+                print(f"Random→ {ag.name} votes {target_name}")
+                # approximate talk→vote alignment based on last talk category
+                align_tv = _talk_vote_alignment(int(getattr(ag, "talk_category_last", -1)))
+                emit_event(
+                    metrics_rows,
+                    run_id=run_id, round_num=round_num,
+                    phase_code=1, phase_str="DAY_VOTE",
+                    agent=ag.name, role=ag.role,
+                    choice_type="VOTE_TARGET",
+                    payload_idx=tgt_idx,
+                    mask_names=alive_names,
+                    judge=None,
+                    speaker_mode=getattr(ag, "speaker_mode", "") or "",
+                    persona_norm=getattr(ag, "persona_norm", 0.0),
+                    policy=POLICY,
+                )
+                try:
+                    _lang_emit({
+                        "run_id": run_id,
+                        "seed": SEED_GLOBAL,
+                        "phase": "DAY_VOTE",
+                        "round": round_num,
+                        "agent": ag.name,
+                        "align_tv": float(align_tv),
+                    })
+                except Exception:
+                    pass
+                _annotate_vote(metrics_rows, round_num=round_num, agent_name=ag.name, target_name=target_name, target_role=getattr(target, "role", None))
+                continue
+
+            # Heuristic voting policy
+            if _IS_HEURISTIC_POLICY:
+                target_name = _heuristic_vote_choice(ag, living)
+                if not target_name:
+                    continue
+                target = next((x for x in living if x.name == target_name), None)
+                vote_map[ag] = target
+                tgt_idx = int(target_name.split("_")[1])
+                aux_snap = _aux_with_texts(ag, agents)
+                _check_aux(aux_snap, round_num=round_num, agent=ag.name)
+                pending[ag.name] = (
+                    z_t.detach(),
+                    1,
+                    torch.tensor(int(tgt_idx)),
+                    ag.role or "Unknown",
+                    "VOTE_TARGET",
+                    aux_snap,
+                )
+                print(f"Heuristic→ {ag.name} votes {target_name}")
+                align_tv = _talk_vote_alignment(int(getattr(ag, "talk_category_last", -1)))
+                emit_event(
+                    metrics_rows,
+                    run_id=run_id, round_num=round_num,
+                    phase_code=1, phase_str="DAY_VOTE",
+                    agent=ag.name, role=ag.role,
+                    choice_type="VOTE_TARGET",
+                    payload_idx=tgt_idx,
+                    mask_names=alive_names,
+                    judge=None,
+                    speaker_mode=getattr(ag, "speaker_mode", "") or "",
+                    persona_norm=getattr(ag, "persona_norm", 0.0),
+                    policy=POLICY,
+                )
+                try:
+                    _lang_emit({
+                        "run_id": run_id,
+                        "seed": SEED_GLOBAL,
+                        "phase": "DAY_VOTE",
+                        "round": round_num,
+                        "agent": ag.name,
+                        "align_tv": float(align_tv),
+                    })
+                except Exception:
+                    pass
+                _annotate_vote(metrics_rows, round_num=round_num, agent_name=ag.name, target_name=target_name, target_role=getattr(target, "role", None))
+                continue
+
+            # JEPA-only branch: top-1 from JEPA/plan head, no judge mixing
+            if _IS_JEPA_ONLY_POLICY:
+                topk = _vote_topk_for_agent(ag, z_t, living, k=PLANNER_TOPK)
+                if not topk:
+                    continue
+                best_name = topk[0][0]
+                target = next((x for x in living if x.name == best_name), None)
+                if target is None:
+                    target = next((x for x in living if x.name != ag.name), living[0])
+                vote_map[ag] = target
+                tgt_idx = int(target.name.split("_")[1])
+                aux_snap = _aux_with_texts(ag, agents)
+                _check_aux(aux_snap, round_num=round_num, agent=ag.name)
+                pending[ag.name] = (
+                    z_t.detach(),
+                    1,
+                    torch.tensor(int(tgt_idx)),
+                    ag.role or "Unknown",
+                    "VOTE_TARGET",
+                    aux_snap,
+                )
+                print(f"JepaOnly→ {ag.name} votes {target.name}")
+                align_tv = _talk_vote_alignment(int(getattr(ag, "talk_category_last", -1)))
+                emit_event(
+                    metrics_rows,
+                    run_id=run_id, round_num=round_num,
+                    phase_code=1, phase_str="DAY_VOTE",
+                    agent=ag.name, role=ag.role,
+                    choice_type="VOTE_TARGET",
+                    payload_idx=tgt_idx,
+                    mask_names=alive_names,
+                    judge=None,
+                    speaker_mode=getattr(ag, "speaker_mode", "") or "",
+                    persona_norm=getattr(ag, "persona_norm", 0.0),
+                    policy=POLICY,
+                )
+                try:
+                    _lang_emit({
+                        "run_id": run_id,
+                        "seed": SEED_GLOBAL,
+                        "phase": "DAY_VOTE",
+                        "round": round_num,
+                        "agent": ag.name,
+                        "align_tv": float(align_tv),
+                    })
+                except Exception:
+                    pass
+                _annotate_vote(metrics_rows, round_num=round_num, agent_name=ag.name, target_name=target.name if target else "", target_role=getattr(target, "role", None))
+                continue
+
+            # Planner top-k
+            topk = _vote_topk_for_agent(ag, z_t, living, PLANNER_TOPK)
+            if not topk:
+                continue
+
+            assert all(n.startswith("Agent_") for n in alive_names), \
+                f"[SANITY] vote mask has bad names: {alive_names} | r{round_num} {ag.name}"
+            assert len(set(alive_names)) == len(alive_names), \
+                f"[SANITY] vote mask has duplicates: {alive_names} | r{round_num} {ag.name}"
+
+            mask_logs.append({"round": round_num, "phase": "DAY_VOTE", "actor": ag.name, "mask": alive_names})
+            phase_log.append({"round": round_num, "phase": "DAY_VOTE"})
+
+            # If judge is unavailable, pick planner top1 and log error
+            if not _can_use_judge():
+                best_name = topk[0][0]
+                target = next((x for x in living if x.name == best_name), None)
+                vote_map[ag] = target
+                tgt_idx = int(best_name.split('_')[1])
+                aux_snap = _aux_with_texts(ag, agents)
+                _check_aux(aux_snap, round_num=round_num, agent=ag.name)
+                pending[ag.name] = (
+                    z_t.detach(),
+                    1,
+                    torch.tensor(int(tgt_idx)),
+                    ag.role or "Unknown",
+                    "VOTE_TARGET",
+                    aux_snap,
+                )
+                print(f"PlannerNoJudge→ {ag.name} votes {best_name}")
+                align_tv = _talk_vote_alignment(int(getattr(ag, "talk_category_last", -1)))
+                emit_event(
+                    metrics_rows,
+                    run_id=run_id, round_num=round_num,
+                    phase_code=1, phase_str="DAY_VOTE",
+                    agent=ag.name, role=ag.role,
+                    choice_type="VOTE_TARGET",
+                    payload_idx=tgt_idx,
+                    mask_names=alive_names,
+                    judge=None,
+                    speaker_mode=getattr(ag, "speaker_mode", "") or "",
+                    persona_norm=getattr(ag, "persona_norm", 0.0),
+                    error="judge_disabled",
+                    policy=POLICY,
+                )
+                try:
+                    _lang_emit({
+                        "run_id": run_id,
+                        "seed": SEED_GLOBAL,
+                        "phase": "DAY_VOTE",
+                        "round": round_num,
+                        "agent": ag.name,
+                        "align_tv": float(align_tv),
+                    })
+                except Exception:
+                    pass
+                _annotate_vote(metrics_rows, round_num=round_num, agent_name=ag.name, target_name=best_name, target_role=getattr(target, "role", None))
                 continue
 
             context_block = _agent_context_block(ag, max_lines=3)
@@ -1513,6 +1630,18 @@ def simulate_game(visual: bool = True):
 
             align_tv = _talk_vote_alignment(int(getattr(ag, "talk_category_last", -1)))
             align_vec = [align_tv for _ in range(len(judge_items))]
+
+            try:
+                _lang_emit({
+                    "run_id": run_id,
+                    "seed": SEED_GLOBAL,
+                    "phase": "DAY_VOTE",
+                    "round": round_num,
+                    "agent": ag.name,
+                    "align_tv": float(align_tv),
+                })
+            except Exception:
+                pass
 
             judged = score_batch(
                 judge_items, judge_rubric,
@@ -1545,7 +1674,6 @@ def simulate_game(visual: bool = True):
             if getattr(ag, "msg_buffer", None):
                 ag.msg_buffer[-1]["alignment_vote"] = float(align_tv)
 
-            # ----- NEW (6): Conditional console print and error tagging -----
             subs = {}
             s_val = None
             error_tag = ""
@@ -1567,7 +1695,6 @@ def simulate_game(visual: bool = True):
                 print(log_line)
                 if visual:
                     msg_log.append(("Judge", log_line))
-                # CSV row with blanks and error column populated
                 emit_event(
                     metrics_rows,
                     run_id=run_id, round_num=round_num,
@@ -1576,10 +1703,11 @@ def simulate_game(visual: bool = True):
                     choice_type="VOTE_TARGET",
                     payload_idx=int(target.name.split("_")[1]) if target else -1,
                     mask_names=alive_names,
-                    judge=None,  # force blank subscores
+                    judge=None,
                     speaker_mode=getattr(ag, "speaker_mode", "") or "",
                     persona_norm=getattr(ag, "persona_norm", 0.0),
                     error=error_tag or "judge_error",
+                    policy=POLICY,
                 )
             else:
                 s = float(s_val)
@@ -1608,8 +1736,8 @@ def simulate_game(visual: bool = True):
                     },
                     speaker_mode=getattr(ag, "speaker_mode", "") or "",
                     persona_norm=getattr(ag, "persona_norm", 0.0),
+                    policy=POLICY,
                 )
-            # --------------------------------------------------------------
 
             for row in reversed(metrics_rows):
                 if row["round"] != round_num:
@@ -1618,12 +1746,13 @@ def simulate_game(visual: bool = True):
                     row["align_tv"] = f"{align_tv:.3f}"
                     break
 
+            _annotate_vote(metrics_rows, round_num=round_num, agent_name=ag.name, target_name=target.name if target else "", target_role=getattr(target, "role", None))
+
         if vote_map:
-            print("✉ Votes (judge-selected):", ", ".join(f"{k.name}->{v.name}" for k, v in vote_map.items()))
+            print("✉ Votes:", ", ".join(f"{k.name}->{v.name}" for k, v in vote_map.items()))
         else:
             print("✉ Votes: (none)")
 
-        # (2.2) Deterministic day-vote elimination (ties → no kill)
         try:
             alive_now = _alive_name_set(agents)
         except Exception:
@@ -1643,7 +1772,6 @@ def simulate_game(visual: bool = True):
             if visual:
                 msg_log.append(("System", "No elimination (tie or no votes)."))
 
-        # Persist TALK outcome
         try:
             for ag in agents:
                 if getattr(ag, "msg_buffer", None) and ag.msg_buffer:
@@ -1652,7 +1780,6 @@ def simulate_game(visual: bool = True):
         except Exception:
             pass
 
-        # Night discussion among wolves
         NCFG = (CFG.get("sim", {}).get("night_chat", {}) if isinstance(CFG.get("sim", {}).get("night_chat", {}), dict) else {})
         NCHAT_ON   = bool(NCFG.get("enabled", False))
         NCHAT_TURNS= int(NCFG.get("turns", 2))
@@ -1665,7 +1792,6 @@ def simulate_game(visual: bool = True):
         wolves = [a for a in agents if a.alive and a.role == WEREWOLF]
         consensus_tally: Counter[str] = Counter()
 
-        # (2.1) Allowed names gate before NIGHT_DISCUSS (wolves chat still respects alive list)
         try:
             if USE_LANGUAGE:
                 alive_names_gate = [a.name for a in agents if getattr(a, "alive", False)]
@@ -1708,13 +1834,10 @@ def simulate_game(visual: bool = True):
                         _mouth_log(f"{wolf.name} night primary failed: {type(e).__name__}: {e}")
                         text, meta = SAFE_FALLBACK, {"repetition_penalty": None}
 
-                    # --- NEW: Fallback templating bug fix for night chat ----------
                     is_fallback_text_n = (text.strip() == SAFE_FALLBACK)
                     if is_fallback_text_n:
                         named_target = None
-                    # --------------------------------------------------------------
 
-                    # --- NEW: normalize and sanitize night chat utterance ----------
                     try:
                         text = normalize_utterance(text)
                     except Exception:
@@ -1724,7 +1847,6 @@ def simulate_game(visual: bool = True):
                         text = _sanitize_agent_mentions(text, allow_specific=allow_specific)
                     except Exception:
                         pass
-                    # -----------------------------------------------------
 
                     for w2 in wolves:
                         w2.buffer_message(wolf.name, text)
@@ -1765,7 +1887,7 @@ def simulate_game(visual: bool = True):
                         consensus_tally[named_target] += 1
 
                     utter_judge = None
-                    if NCHAT_JUDGE:
+                    if NCHAT_JUDGE and _can_use_judge():
                         try:
                             wolf_only = [(n, m) for (n, m) in list(wolf.message_memory)[-6:] if any(w.name == n for w in wolves)]
                             ctx_block = "\n".join(f"- {n}: {m.strip()}" for (n, m) in wolf_only[-3:]) or "- (no wolf chat yet)"
@@ -1792,10 +1914,11 @@ def simulate_game(visual: bool = True):
                         judge=utter_judge,
                         speaker_mode=getattr(wolf, "speaker_mode", "") or "",
                         persona_norm=getattr(wolf, "persona_norm", 0.0),
+                        policy=POLICY,
                     )
 
             total_mentions = sum(consensus_tally.values())
-            chat_consensus_target = None  # renamed to avoid clobbering imported function
+            chat_consensus_target = None
             consensus_frac = 0.0
             if total_mentions > 0:
                 chat_consensus_target, cnt = consensus_tally.most_common(1)[0]
@@ -1808,9 +1931,6 @@ def simulate_game(visual: bool = True):
             chat_consensus_target = None
             consensus_frac = 0.0
 
-        # ---------------------------
-        # NIGHT VOTE (wolves only)
-        # ---------------------------
         wolves = [a for a in agents if a.alive and a.role == WEREWOLF]
         villagers_alive = [a for a in agents if a.alive and a.role != WEREWOLF]
         if wolves and villagers_alive:
@@ -1819,62 +1939,56 @@ def simulate_game(visual: bool = True):
                 f"[SANITY] kill mask has bad names: {legal_targets} | r{round_num}"
             assert len(set(legal_targets)) == len(legal_targets), \
                 f"[SANITY] kill mask has duplicates: {legal_targets} | r{round_num}"
-            # record kill mask for each wolf
             for wolf in wolves:
                 mask_logs.append({"round": round_num, "phase": "NIGHT_VOTE", "actor": wolf.name, "mask": legal_targets})
 
-            # Each wolf picks a target (KillHead if available; else planner top-k over villagers)
             wolf_choices: Dict[str, str] = {}
             for wolf in wolves:
                 target_name = None
-                fp_w = _get_heads(wolf)
-                try:
-                    z_t_w = z_map.get(wolf, wolf.encode_current_belief(round_num, agents))
-                except Exception:
-                    z_t_w = wolf.encode_current_belief(round_num, agents)
-
-                # Prefer KillHead with proper mask
-                if hasattr(fp_w, "kill"):
+                if _IS_RANDOM_POLICY:
+                    target_name = random.choice(legal_targets)
+                else:
+                    fp_w = _get_heads(wolf)
                     try:
-                        with torch.no_grad():
-                            try:
-                                nA = int(fp_w.kill.net[-1].out_features)  # type: ignore[attr-defined]
-                            except Exception:
-                                nA = NUM_AGENTS
-                            kmask = _kill_mask_for(wolf, agents, nA).unsqueeze(0)
-                            _check_mask(kmask.squeeze(0), nA, kind="kill", round_num=round_num, agent=wolf.name)
-                            k_logits = fp_w.kill(z_t_w.unsqueeze(0), mask=kmask).squeeze(0)
-                            tgt_idx = int(torch.argmax(k_logits).item())
-                            candidate = f"Agent_{tgt_idx}"
-                            if candidate in legal_targets:
-                                target_name = candidate
+                        z_t_w = z_map.get(wolf, wolf.encode_current_belief(round_num, agents))
                     except Exception:
-                        target_name = None
-
-                # Fallback: planner vote over villagers
-                if target_name is None:
-                    try:
-                        topk_vill = _vote_topk_for_agent(wolf, _finite(z_t_w), villagers_alive, k=PLANNER_TOPK)
-                        if topk_vill:
-                            target_name = topk_vill[0][0]
-                    except Exception:
-                        target_name = None
-
-                # Consensus from night chat, then random villager
-                if target_name is None:
-                    if chat_consensus_target in legal_targets:
-                        target_name = chat_consensus_target
-                    else:
-                        target_name = random.choice(legal_targets)
+                        z_t_w = wolf.encode_current_belief(round_num, agents)
+                    if hasattr(fp_w, "kill") and not _IS_RANDOM_POLICY:
+                        try:
+                            with torch.no_grad():
+                                try:
+                                    nA = int(fp_w.kill.net[-1].out_features)  # type: ignore[attr-defined]
+                                except Exception:
+                                    nA = NUM_AGENTS
+                                kmask = _kill_mask_for(wolf, agents, nA).unsqueeze(0)
+                                _check_mask(kmask.squeeze(0), nA, kind="kill", round_num=round_num, agent=wolf.name)
+                                k_logits = fp_w.kill(z_t_w.unsqueeze(0), mask=kmask).squeeze(0)
+                                tgt_idx = int(torch.argmax(k_logits).item())
+                                candidate = f"Agent_{tgt_idx}"
+                                if candidate in legal_targets:
+                                    target_name = candidate
+                        except Exception:
+                            target_name = None
+                    if target_name is None and not _IS_RANDOM_POLICY:
+                        try:
+                            topk_vill = _vote_topk_for_agent(wolf, _finite(z_t_w), villagers_alive, k=PLANNER_TOPK)
+                            if topk_vill:
+                                target_name = topk_vill[0][0]
+                        except Exception:
+                            target_name = None
+                    if target_name is None:
+                        if chat_consensus_target in legal_targets:
+                            target_name = chat_consensus_target
+                        else:
+                            target_name = random.choice(legal_targets)
 
                 wolf_choices[wolf.name] = target_name
 
-                # Per-wolf pending rollout (their chosen kill target)
                 tgt_idx = int(target_name.split("_")[1])
                 aux_snap = _aux_with_texts(wolf, agents)
                 _check_aux(aux_snap, round_num=round_num, agent=wolf.name)
                 pending[wolf.name] = (
-                    _finite(z_t_w).detach(),
+                    _finite(z_map.get(wolf, wolf.encode_current_belief(round_num, agents))).detach(),
                     2,
                     torch.tensor(int(tgt_idx)),
                     wolf.role or "Unknown",
@@ -1882,10 +1996,11 @@ def simulate_game(visual: bool = True):
                     aux_snap,
                 )
 
-                # Optional logging of wolf votes (no judge here)
-                print(f"WolfVote→ {wolf.name} votes {target_name}")
+                if _IS_RANDOM_POLICY:
+                    print(f"RandomKill→ {wolf.name} votes {target_name}")
+                else:
+                    print(f"WolfVote→ {wolf.name} votes {target_name}")
 
-            # (2.3) Werewolf consensus kill using consensus_target helper
             tally_list = list(wolf_choices.values())
             night_choice = consensus_target(tally_list, temperature=0.7)
             if night_choice and (night_choice in legal_targets):
@@ -1908,6 +2023,7 @@ def simulate_game(visual: bool = True):
                     mask_names=legal_targets,
                     speaker_mode=getattr(wolves[0], "speaker_mode", "") or "",
                     persona_norm=getattr(wolves[0], "persona_norm", 0.0),
+                    policy=POLICY,
                 )
                 phase_log.append({
                     "round": round_num,
@@ -1920,7 +2036,6 @@ def simulate_game(visual: bool = True):
                 if visual:
                     msg_log.append(("Night", "No kill (no consensus)."))
 
-        # POST-ACT: z_{t+1}, rollouts, Δz
         z_deltas = []
         cos_deltas = []
         dz_by_agent: Dict[str, float] = {}
@@ -1972,15 +2087,33 @@ def simulate_game(visual: bool = True):
                             row["dz_l2"] = f"{dz_by_agent.get(ag_name, 0.0):.6f}"
                             row["dz_1mcos"] = f"{cos_by_agent.get(ag_name, 0.0):.6f}"
 
-        # win check
         wolves_alive = [a for a in agents if a.alive and a.role == WEREWOLF]
         vill_alive = [a for a in agents if a.alive and a.role != WEREWOLF]
         if not wolves_alive or len(wolves_alive) >= len(vill_alive):
             break
 
+    # Compute game outcome after the loop
+    wolves_alive = [a for a in agents if a.alive and a.role == WEREWOLF]
+    vill_alive = [a for a in agents if a.alive and a.role != WEREWOLF]
+    villager_win = (len(wolves_alive) == 0)
+    if villager_win:
+        game_outcome = 1.0
+    else:
+        game_outcome = -1.0
+
+    # Attach game_outcome to every rollout row
+    new_rollout = []
+    for (z_t, ph_code, payload_idx, z_next, role, choice_type, aux) in rollout:
+        try:
+            aux["game_outcome"] = game_outcome
+        except Exception:
+            aux = dict(aux)
+            aux["game_outcome"] = game_outcome
+        new_rollout.append((z_t, ph_code, payload_idx, z_next, role, choice_type, aux))
+    rollout = new_rollout
+
     print("\n== Game over ==")
 
-    # Flush language writer
     try:
         if lang_writer is not None:
             if hasattr(lang_writer, "flush"):
@@ -1994,7 +2127,7 @@ def simulate_game(visual: bool = True):
     by_phase: Dict[str, int] = {}
     for r in metrics_rows:
         by_phase[r["phase"]] = by_phase.get(r["phase"], 0) + 1
-    print("[SUMMARY] rows:", len(metrics_rows), "by_phase:", by_phase)
+    print("[SUMMARY] rows:", len(metrics_rows), "by_phase:", by_phase, f"policy={POLICY or '(default)'}")
 
     executor.shutdown(wait=True)
 
@@ -2015,17 +2148,16 @@ def simulate_game(visual: bool = True):
         "phases": phase_log,
         "mask_logs": mask_logs,
         "social_stats": _social_stats,
+        "policy": POLICY,
     }
     return rollout, meta_out
 
-
-# Safe wrapper
 def safe_simulate_game(visual: bool = True):
     try:
         result = simulate_game(visual=visual)
     except Exception as e:
         print(f"[SAFE_SIM] simulate_game crashed: {type(e).__name__}: {e}")
-        return [], {"agents": [], "social_stats": []}
+        return [], {"agents": [], "social_stats": [], "policy": POLICY}
 
     if isinstance(result, tuple) and len(result) == 2:
         rollouts, meta = result
@@ -2033,12 +2165,11 @@ def safe_simulate_game(visual: bool = True):
         rollouts, meta = [], result
 
     if not isinstance(meta, dict):
-        meta = {"agents": meta if isinstance(meta, list) else [], "social_stats": []}
+        meta = {"agents": meta if isinstance(meta, list) else [], "social_stats": [], "policy": POLICY}
     meta.setdefault("agents", [])
     meta.setdefault("social_stats", [])
+    meta.setdefault("policy", POLICY)
     return rollouts, meta
 
-
-# CLI
 if __name__ == "__main__":
     simulate_game(visual=True)

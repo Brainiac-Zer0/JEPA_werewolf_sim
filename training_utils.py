@@ -25,7 +25,7 @@ from encoders import PhaseActionEncoder  # learnable, persisted
 try:
     from encoders import FactorizedPlanner, TalkHead, VoteHead, KillHead  # optional convenience
 except Exception:
-    # Fallback shim if FactorizedPlanner isn't exported; assumes Talk/Vote/Kill are available
+    # Fallback shim if FactorizedPlanner is not exported; assumes Talk/Vote/Kill are available
     class FactorizedPlanner(nn.Module):
         def __init__(self, latent_dim: int, num_agents: int, num_talk_cats: int):
             super().__init__()
@@ -47,7 +47,7 @@ except Exception:
                 "kill": self.kill(z, kill_mask),
             }
 
-# ── Optional mouthpiece controllers (if present)
+# Optional mouthpiece controllers (if present)
 try:
     # SpeakerBandit: produces logits over templates given latent/role/history features
     # LogitBiasHead: produces token-level biases or category biases; API varies by repo
@@ -77,7 +77,7 @@ os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 os.makedirs(LOGS_DIR, exist_ok=True)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ── Load config
+# Load config
 with open("config.yaml", "r") as f:
     CFG = yaml.safe_load(f) or {}
 
@@ -100,7 +100,7 @@ SAVE_OPTIM: bool = bool(CFG.get("SAVE_OPTIM", False))
 DEBUG_MASKS: bool = bool(CFG.get("DEBUG_MASKS", False))
 STRATIFY_PHASE_BATCHES: bool = bool(CFG.get("STRATIFY_PHASE_BATCHES", True))
 
-# ── Phase-5: mouthpiece & rewards config (defaults are conservative)
+# Phase-5: mouthpiece and rewards config (defaults are conservative)
 RW = CFG.get("MOUTHPIECE_REWARD_WEIGHTS", {}) or {}
 R_COHE   = float(RW.get("coherence", 0.40))
 R_ROLE   = float(RW.get("role_alignment", 0.30))
@@ -109,10 +109,10 @@ R_TRUTH  = float(RW.get("truthfulness_villager", 0.15))
 R_DECEP  = float(RW.get("deception_wolf", 0.30))  # applied to (1 - truthfulness)
 R_ALIGN  = float(RW.get("talk_vote_alignment", 0.10))  # extra bonus
 
-# ── Phase-5: reward/rubric alignment guard (default False to match rubric)
+# Phase-5: reward or rubric alignment guard (default False to match rubric)
 REWARD_USE_ROLE_ALIGNMENT: bool = bool(CFG.get("REWARD_USE_ROLE_ALIGNMENT", False))
 
-# ── Lambda-weighted speaker reward config (and optional night convergence bonus)
+# Lambda-weighted speaker reward config (and optional night convergence bonus)
 SPK = CFG.get("speaker", {}) if isinstance(CFG.get("speaker", {}), dict) else {}
 LJ = float(SPK.get("lambda_j", 1.0))
 LC = float(SPK.get("lambda_c", 0.25))
@@ -123,7 +123,7 @@ SB_LR       = float(MB.get("speaker_bandit_lr", 5e-4))
 SB_EPOCHS   = int(MB.get("speaker_bandit_epochs", 1))
 SB_ENTROPY  = float(MB.get("speaker_bandit_entropy_coef", 0.01))
 SB_BASE_EMA = float(MB.get("speaker_bandit_baseline_ema", 0.9))
-# NEW (Phase-5): small KL to TalkHead prior and arg-aux weight
+# Small KL to TalkHead prior and arg-aux weight
 SB_KL_TO_INTENT = float(MB.get("speaker_bandit_kl_to_intent", 0.01))
 SB_ARG_AUX_WEIGHT = float(MB.get("speaker_bandit_arg_aux_weight", 0.25))
 
@@ -131,7 +131,7 @@ BH_LR      = float(MB.get("bias_head_lr", 5e-4))
 BH_EPOCHS  = int(MB.get("bias_head_epochs", 1))
 BH_ENT_REG = float(MB.get("bias_head_entropy_reg", 0.005))
 BH_KL_REG  = float(MB.get("bias_head_kl_reg", 0.0))
-# NEW (Phase-5): align bias categories to TalkHead prior (KL)
+# Align bias categories to TalkHead prior (KL)
 BH_KL_TO_INTENT = float(MB.get("bias_head_kl_to_intent", 0.01))
 
 LANG_COUP = CFG.get("LANGUAGE_COUPLING", {}) or {}
@@ -139,7 +139,7 @@ LC_ENABLED  = bool(LANG_COUP.get("enabled", False))
 LC_WEIGHT   = float(LANG_COUP.get("loss_weight", 0.05))
 
 # =============================================================================
-# Determinism & run metadata
+# Determinism and run metadata
 # =============================================================================
 
 def set_global_determinism(seed: int = 1337) -> None:
@@ -196,19 +196,16 @@ class TrainingEpochLogger:
             w.writerow(row)
 
 # =============================================================================
-# NEW: Lightweight language metrics CSV (buffered)
+# Language metrics CSV (buffered)
 # =============================================================================
 
 class _LangMetricsWriter:
     """
     Buffered writer for per-utterance language metrics.
 
-    • File: logs/lang_metrics.csv
-    • Always includes run_id and seed
-    • Call lang_metrics_write_utterances(...) anywhere (agent/sim/speaker/judge/llm_script)
-    • Call lang_metrics_flush() at *episode end* (or any time you want a disk flush)
-
-    Columns (schema-stable & compact):
+    File: logs/lang_metrics.csv
+    Always includes run_id and seed
+    Columns:
         run_id, seed, round, phase, agent, role, speaker_mode, choice_type,
         template_id, talk_cat, arg_id,
         judge_score, coherence, truthfulness, role_alignment, social_safety,
@@ -231,7 +228,6 @@ class _LangMetricsWriter:
                 csv.DictWriter(f, fieldnames=self._header).writeheader()
 
     def write(self, row: Dict[str, Any]):
-        # Minimal sanitation and field projection
         clean = {k: row.get(k, "") for k in self._header}
         self._buffer.append(clean)
 
@@ -247,7 +243,6 @@ class _LangMetricsWriter:
             w.writerows(self._buffer)
         self._buffer.clear()
 
-# Module-level singleton & helpers
 _LANG_WRITER: Optional[_LangMetricsWriter] = _LangMetricsWriter()
 
 def lang_metrics_write_utterances(
@@ -259,10 +254,7 @@ def lang_metrics_write_utterances(
     agent_name: str,
     utterances: List["UtteranceSample"],
 ) -> None:
-    """
-    Convenience adapter to log a batch of UtteranceSample rows
-    from anywhere (sim/agent/speaker_llm/judge/llm_script).
-    """
+    """Log a batch of UtteranceSample rows."""
     if not utterances or _LANG_WRITER is None:
         return
     rows = []
@@ -275,7 +267,7 @@ def lang_metrics_write_utterances(
             "agent": str(agent_name),
             "role": str(getattr(s, "role", "")),
             "speaker_mode": str(speaker_mode),
-            "choice_type": "TALK_INTENT",  # UtteranceSample is for talk rows
+            "choice_type": "TALK_INTENT",
             "template_id": int(s.template_id) if s.template_id is not None else "",
             "talk_cat": int(s.talk_cat) if s.talk_cat is not None else "",
             "arg_id": int(s.arg_id) if s.arg_id is not None else "",
@@ -310,10 +302,7 @@ def lang_metrics_write_generic(
     align_tv: Optional[float] = None,
     rep_penalty: Optional[float] = None,
 ) -> None:
-    """
-    Generic rows (e.g., vote/kill language explanations or judge_eval/judge traces).
-    Keeps the same CSV schema.
-    """
+    """Generic rows, keeping the same CSV schema."""
     if _LANG_WRITER is None:
         return
     _LANG_WRITER.write({
@@ -338,15 +327,14 @@ def lang_metrics_write_generic(
     })
 
 def lang_metrics_flush() -> None:
-    """Manually flush buffered rows to disk (call this at EPISODE END)."""
+    """Flush buffered rows to disk."""
     if _LANG_WRITER is not None:
         _LANG_WRITER.flush()
 
-# Always flush at process exit as a safety net
 atexit.register(lang_metrics_flush)
 
 # =============================================================================
-# Metrics helpers (acc & illegal mass)
+# Metrics helpers
 # =============================================================================
 
 @torch.no_grad()
@@ -355,7 +343,6 @@ def top1_acc(logits: torch.Tensor, targets: torch.Tensor, mask: Optional[torch.T
     Compute top-1 accuracy with an optional boolean mask applied to logits.
     """
     if mask is not None:
-        # Ensure broadcast safety
         if logits.dim() == 2 and mask.dim() == 1:
             mask = mask.unsqueeze(0).expand_as(logits)
         masked_logits = logits.masked_fill(~mask, float("-inf"))
@@ -368,7 +355,7 @@ def top1_acc(logits: torch.Tensor, targets: torch.Tensor, mask: Optional[torch.T
 @torch.no_grad()
 def illegal_mass(logits: torch.Tensor, mask: Optional[torch.Tensor]) -> float:
     """
-    Softmax probability mass on illegal indices (diagnostic; lower is better).
+    Softmax probability mass on illegal indices.
     """
     if mask is None:
         return 0.0
@@ -378,7 +365,7 @@ def illegal_mass(logits: torch.Tensor, mask: Optional[torch.Tensor]) -> float:
     return float(probs.masked_fill(mask, 0.0).sum().item())
 
 # =============================================================================
-# Rollout normalization (legacy & phase-aware)
+# Rollout normalization
 # =============================================================================
 
 @dataclass
@@ -387,18 +374,18 @@ class RolloutSample:
     a_idx: Optional[torch.Tensor]
     z_next: torch.Tensor
     role: str
-    # Phase-aware (optional)
-    phase: Optional[int] = None              # 0..PHASE_COUNT-1
-    payload_idx: Optional[int] = None        # talk_cat or target idx
-    choice_type: Optional[str] = None        # "TALK_INTENT"|"VOTE_TARGET"|"KILL_TARGET"
-    # Optional per-row meta for masks (alive flags, wolf team, self idx, etc.)
+    # Phase-aware
+    phase: Optional[int] = None
+    payload_idx: Optional[int] = None
+    choice_type: Optional[str] = None
+    # Optional per-row meta
     aux: Optional[Dict[str, Any]] = None
 
 def normalize_rollouts(raw: List[Tuple]) -> List[RolloutSample]:
     """
     Accepts:
-      - legacy: (z_t, a_idx, z_next, role)
-      - phase-aware: (z_t, phase_code, action_payload, z_{t+1}, role[, choice_type[, aux_meta_dict]])
+      legacy: (z_t, a_idx, z_next, role)
+      phase-aware: (z_t, phase_code, action_payload, z_next, role[, choice_type[, aux_meta_dict]])
     """
     out: List[RolloutSample] = []
     for tup in raw:
@@ -406,7 +393,6 @@ def normalize_rollouts(raw: List[Tuple]) -> List[RolloutSample]:
             z_t, a_idx, z_next, role = tup
             out.append(RolloutSample(z_t=z_t, a_idx=a_idx, z_next=z_next, role=role))
         else:
-            # phase-aware path
             z_t, phase, payload, z_next, role = tup[:5]
             ct = tup[5] if len(tup) >= 6 else None
             aux = tup[6] if len(tup) >= 7 and isinstance(tup[6], dict) else None
@@ -417,7 +403,7 @@ def normalize_rollouts(raw: List[Tuple]) -> List[RolloutSample]:
     return out
 
 # =============================================================================
-# Optimizer & scheduler factory
+# Optimizer and scheduler factory
 # =============================================================================
 
 def make_optimizer_and_scheduler(
@@ -439,7 +425,7 @@ def make_optimizer_and_scheduler(
     return opt, sched
 
 # =============================================================================
-# Phase-stratified batching (optional)
+# Phase-stratified batching
 # =============================================================================
 
 def _roundrobin_pop(queues: Dict[int, List[RolloutSample]], batch_size: int) -> List[RolloutSample]:
@@ -458,14 +444,11 @@ def make_batches(
 ) -> List[List[RolloutSample]]:
     if not STRATIFY_PHASE_BATCHES:
         return [rows[i:i+batch_size] for i in range(0, len(rows), batch_size)]
-    # Group by phase (default bucket for None)
     buckets: DefaultDict[int, List[RolloutSample]] = defaultdict(list)
     for r in rows:
         buckets[int(0 if r.phase is None else r.phase)].append(r)
-    # Shuffle within buckets for randomness
     for b in buckets.values():
         random.shuffle(b)
-    # Build batches round-robin
     batches: List[List[RolloutSample]] = []
     remaining = sum(len(v) for v in buckets.values())
     while remaining > 0:
@@ -477,7 +460,7 @@ def make_batches(
     return batches
 
 # =============================================================================
-# Legacy trainer (baseline) + optional CSV logging
+# Legacy trainer
 # =============================================================================
 
 def train_jepa(
@@ -501,7 +484,6 @@ def train_jepa(
     action_encoder.to(DEVICE)
     planner.to(DEVICE)
 
-    # Simple chunk count for scheduler; recomputed each epoch
     steps_per_epoch = max(1, math.ceil(len(rollout_data)/batch_size))
     optimizer, scheduler = make_optimizer_and_scheduler(
         list(world_model.parameters()) + list(action_encoder.parameters()) + list(planner.parameters()),
@@ -526,18 +508,17 @@ def train_jepa(
 
         for batch in batches:
             z_t, a_idx, z_next = zip(*[(r[0], r[1], r[2]) for r in batch])
-            z_t_tensor     = torch.stack(z_t).to(DEVICE)                     # [B, latent]
-            a_idx_tensor   = torch.stack(a_idx).long().squeeze().to(DEVICE)  # [B]
-            z_next_tensor  = torch.stack(z_next).to(DEVICE)                   # [B, latent]
+            z_t_tensor     = torch.stack(z_t).to(DEVICE)
+            a_idx_tensor   = torch.stack(a_idx).long().squeeze().to(DEVICE)
+            z_next_tensor  = torch.stack(z_next).to(DEVICE)
 
             with torch_amp.autocast(enabled=USE_AMP):
-                a_embed = action_encoder(a_idx_tensor)                        # [B, a_dim]
-                z_pred  = world_model(z_t_tensor, a_embed)                    # [B, latent]
-                logits  = planner(z_t_tensor)                                 # [B, num_agents]
+                a_embed = action_encoder(a_idx_tensor)
+                z_pred  = world_model(z_t_tensor, a_embed)
+                logits  = planner(z_t_tensor)
                 L_mse = mse_loss(z_pred, z_next_tensor)
                 L_bc  = ce_loss(logits, a_idx_tensor)
 
-                # Optional language coupling (legacy has no texts; stays zero unless you extend rollouts)
                 L_lc = torch.tensor(0.0, device=DEVICE)
 
                 loss  = L_mse + LAMBDA_BC * L_bc + L_lc
@@ -545,11 +526,10 @@ def train_jepa(
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
 
-            # NaN guard + grad clipping
             params = list(world_model.parameters()) + list(action_encoder.parameters()) + list(planner.parameters())
             for p in params:
                 if p.grad is not None and torch.isnan(p.grad).any():
-                    raise RuntimeError("NaN in gradients!")
+                    raise RuntimeError("NaN in gradients")
             gnorm = torch.nn.utils.clip_grad_norm_(params, MAX_NORM)
 
             scaler.step(optimizer)
@@ -581,7 +561,6 @@ def train_jepa(
                 "n_batches": len(batches),
             })
 
-    # save
     save_path = os.path.join(CHECKPOINT_DIR, f"{role_name.lower()}_jepa.pt")
     state = {
         "world_model": world_model.state_dict(),
@@ -596,13 +575,13 @@ def train_jepa(
     print(f"[SAVE] {role_name} models saved → {save_path}")
 
 # =============================================================================
-# Phase-aware trainer (bridge → learnable PAE)
+# Phase-aware trainer
 # =============================================================================
 
 def train_jepa_phaseaware(
-    rollout_data_phaseaware: List[Tuple],  # (z_t, phase_code, action_payload, z_next, role[, choice_type])
+    rollout_data_phaseaware: List[Tuple],
     world_model: WorldModelMLP,
-    planner: PlannerHead,                  # legacy head; optional BC on vote/kill
+    planner: PlannerHead,
     *,
     role_name: str = "agent",
     epochs: int = 5,
@@ -641,37 +620,19 @@ def train_jepa_phaseaware(
 
     world_model.train(), planner.train(), pae.train()
 
-    # ---- Language coupling singletons (lazy) ---------------------------------
-    _LC_MSG = None  # type: Optional[Any]
     _LC_SOC = None  # type: Optional[nn.Module]
 
-    def _ensure_lang_coupling_modules() -> Tuple[Optional[Any], Optional[nn.Module]]:
-        nonlocal _LC_MSG, _LC_SOC
-        if not LC_ENABLED or MessageEncoder is None or SocialInfluence is None:
-            return None, None
-        if _LC_MSG is None:
-            msg_model = (CFG.get("model", {})
-                           .get("encoders", {})
-                           .get("message_model", "sentence-transformers/all-MiniLM-L6-v2"))
-            _LC_MSG = MessageEncoder(model_name=msg_model)
+    def _ensure_lang_coupling_modules() -> Optional[nn.Module]:
+        nonlocal _LC_SOC
+        if not LC_ENABLED or SocialInfluence is None:
+            return None
         if _LC_SOC is None:
             soc_cfg = (CFG.get("sim", {}).get("social", {}) or {})
             hidden = int(soc_cfg.get("hidden", 64))
             scale  = float(soc_cfg.get("scale", 0.2))
-            _LC_SOC = SocialInfluence(text_dim=_LC_MSG.output_dim, latent_dim=LATENT_DIM, hidden=hidden, scale=scale)
+            _LC_SOC = SocialInfluence(latent_dim=LATENT_DIM, hidden=hidden, scale=scale)
             _LC_SOC.to(DEVICE)
-        return _LC_MSG, _LC_SOC
-
-    def _collect_texts_from_batch(batch: List[RolloutSample]) -> list:
-        texts: list = []
-        for r in batch:
-            aux = r.aux or {}
-            if isinstance(aux, dict):
-                if "recent_texts" in aux and isinstance(aux["recent_texts"], list):
-                    texts.extend([t for t in aux["recent_texts"] if isinstance(t, str)])
-                elif "neighbor_texts" in aux and isinstance(aux["neighbor_texts"], list):
-                    texts.extend([t for t in aux["neighbor_texts"] if isinstance(t, str)])
-        return texts
+        return _LC_SOC
 
     for ep in range(1, epochs + 1):
         random.shuffle(rows)
@@ -689,7 +650,6 @@ def train_jepa_phaseaware(
             payload = torch.tensor([r.payload_idx if r.payload_idx is not None else 0 for r in batch], device=DEVICE, dtype=torch.long)
             choice_types = [r.choice_type for r in batch]
 
-            # Build learned phase-aware action embedding
             is_talk_mask = torch.tensor([ct == "TALK_INTENT" for ct in choice_types], device=DEVICE, dtype=torch.bool)
             a_embed = torch.zeros(z_t_tensor.size(0), ACTION_EMBED_DIM, device=DEVICE)
             if is_talk_mask.any():
@@ -709,7 +669,6 @@ def train_jepa_phaseaware(
                 z_pred = world_model(z_t_tensor, a_embed)
                 L_mse = mse_loss(z_pred, z_next_tensor)
 
-                # Optional planner BC against vote/kill payloads (skip talk)
                 mask_idx = [i for i, ct in enumerate(choice_types) if ct in (None, "VOTE_TARGET", "KILL_TARGET")]
                 if mask_idx:
                     idx_tensor = torch.tensor(mask_idx, device=DEVICE, dtype=torch.long)
@@ -719,20 +678,17 @@ def train_jepa_phaseaware(
                 else:
                     L_bc = torch.tensor(0.0, device=DEVICE)
 
-                # ---- Optional language coupling --------------------------------
                 L_lc = torch.tensor(0.0, device=DEVICE)
                 if LC_ENABLED:
-                    msg_enc, soc = _ensure_lang_coupling_modules()
-                    if msg_enc is not None and soc is not None:
-                        texts = _collect_texts_from_batch(batch)
-                        if texts:
-                            L_lc = language_coupling_loss(
-                                z_next=z_next_tensor,
-                                texts=texts,
-                                msg_encoder=msg_enc, social=soc, weight=LC_WEIGHT
-                            )
+                    _ = _ensure_lang_coupling_modules()
+                    L_lc = language_coupling_loss(
+                        z_next=z_next_tensor,
+                        texts=[],
+                        msg_encoder=None,
+                        social=None,
+                        weight=LC_WEIGHT
+                    )
 
-                # ---- Optional Stage-A social JEPA regularizer -----------------
                 L_soc = torch.tensor(0.0, device=DEVICE)
                 try:
                     lambda_reg = float(CFG.get("social", {}).get("lambda_reg", 0.0))
@@ -757,7 +713,7 @@ def train_jepa_phaseaware(
             params = list(world_model.parameters()) + list(planner.parameters()) + list(pae.parameters())
             for p in params:
                 if p.grad is not None and torch.isnan(p.grad).any():
-                    raise RuntimeError("NaN in gradients!")
+                    raise RuntimeError("NaN in gradients")
             gnorm = torch.nn.utils.clip_grad_norm_(params, MAX_NORM)
 
             scaler.step(optimizer)
@@ -803,7 +759,7 @@ def train_jepa_phaseaware(
     print(f"[SAVE] {role_name} (phase-aware) models saved → {save_path}")
 
 # =============================================================================
-# Factorized/Masked heads trainer (TalkHead, VoteHead, KillHead)
+# Factorized or masked heads trainer
 # =============================================================================
 
 def _mask_all_true(shape: Tuple[int, int]) -> torch.Tensor:
@@ -838,20 +794,19 @@ def build_kill_mask_from_aux(batch: List[RolloutSample], num_agents: int) -> tor
     Build per-row kill mask using optional aux:
       aux.alive: list[bool]
       aux.self_idx: int
-      aux.wolves: list[bool]  (team membership)
+      aux.wolves: list[bool]
     Behavior:
-      - wolf actor: can kill alive non-wolves (and not self, though self is filtered by non-wolf rule anyway)
-      - non-wolf actor: mask all False (no-ops); if aux missing, we conservatively allow all.
+      wolf actor: can kill alive non-wolves
+      non-wolf actor: mask all False
     """
     B = len(batch)
-    mask = _mask_all_true((B, num_agents))  # default permissive if aux missing
+    mask = _mask_all_true((B, num_agents))
     for i, r in enumerate(batch):
         aux = r.aux or {}
         alive = aux.get("alive", None)
         wolves = aux.get("wolves", None)
         self_idx = aux.get("self_idx", None)
 
-        # If we don't have meta, leave permissive mask (training won't explode).
         if not (isinstance(alive, list) and len(alive) == num_agents):
             continue
 
@@ -861,13 +816,10 @@ def build_kill_mask_from_aux(batch: List[RolloutSample], num_agents: int) -> tor
             wolves_t = torch.tensor(wolves, dtype=torch.bool, device=DEVICE)
             is_wolf_actor = bool(wolves[self_idx])
             if is_wolf_actor:
-                # wolves can only kill alive non-wolves
                 mask[i] &= alive_t & (~wolves_t)
             else:
-                # non-wolves do not issue kill; mask all false
                 mask[i, :] = False
         else:
-            # Missing team info; at least don't kill dead
             mask[i] &= alive_t
     return mask
 
@@ -885,9 +837,9 @@ def train_jepa_factorized(
     epoch_logger: Optional[TrainingEpochLogger] = None,
 ) -> None:
     """
-    Full phase-aware + factorized-head trainer.
-    Expects per-row choice_type ∈ {"TALK_INTENT","VOTE_TARGET","KILL_TARGET"} (or None).
-    Optionally consumes per-row aux dicts to build action masks.
+    Full phase-aware and factorized-head trainer.
+    Expects per-row choice_type in {"TALK_INTENT","VOTE_TARGET","KILL_TARGET"} (or None).
+    Consumes per-row aux dicts to build action masks when provided.
     """
     rows = normalize_rollouts(rollout_data_phaseaware)
     if not rows:
@@ -904,9 +856,19 @@ def train_jepa_factorized(
     planner_factorized.to(DEVICE)
     pae.to(DEVICE)
 
+    # Role probe for latent role identifiability (binary villager vs wolf)
+    role_probe = SimpleRoleProbe(latent_dim=LATENT_DIM, num_classes=2)
+    role_probe.to(DEVICE)
+
     batches_dummy = max(1, math.ceil(len(rows)/batch_size))
+    params = (
+        list(world_model.parameters())
+        + list(planner_factorized.parameters())
+        + list(pae.parameters())
+        + list(role_probe.parameters())
+    )
     optimizer, scheduler = make_optimizer_and_scheduler(
-        list(world_model.parameters()) + list(planner_factorized.parameters()) + list(pae.parameters()),
+        params,
         learning_rate,
         steps_per_epoch=batches_dummy,
         epochs=epochs,
@@ -919,38 +881,24 @@ def train_jepa_factorized(
     world_model.train()
     planner_factorized.train()
     pae.train()
+    role_probe.train()
 
-    # ---- Language coupling singletons (lazy) ---------------------------------
-    _LC_MSG = None  # type: Optional[Any]
+    alpha_outcome = 0.5
+    lambda_role = 0.5
+
     _LC_SOC = None  # type: Optional[nn.Module]
 
-    def _ensure_lang_coupling_modules() -> Tuple[Optional[Any], Optional[nn.Module]]:
-        nonlocal _LC_MSG, _LC_SOC
-        if not LC_ENABLED or MessageEncoder is None or SocialInfluence is None:
-            return None, None
-        if _LC_MSG is None:
-            msg_model = (CFG.get("model", {})
-                           .get("encoders", {})
-                           .get("message_model", "sentence-transformers/all-MiniLM-L6-v2"))
-            _LC_MSG = MessageEncoder(model_name=msg_model)
+    def _ensure_lang_coupling_modules() -> Optional[nn.Module]:
+        nonlocal _LC_SOC
+        if not LC_ENABLED or SocialInfluence is None:
+            return None
         if _LC_SOC is None:
             soc_cfg = (CFG.get("sim", {}).get("social", {}) or {})
             hidden = int(soc_cfg.get("hidden", 64))
             scale  = float(soc_cfg.get("scale", 0.2))
-            _LC_SOC = SocialInfluence(text_dim=_LC_MSG.output_dim, latent_dim=LATENT_DIM, hidden=hidden, scale=scale)
+            _LC_SOC = SocialInfluence(latent_dim=LATENT_DIM, hidden=hidden, scale=scale)
             _LC_SOC.to(DEVICE)
-        return _LC_MSG, _LC_SOC
-
-    def _collect_texts_from_batch(batch: List[RolloutSample]) -> list:
-        texts: list = []
-        for r in batch:
-            aux = r.aux or {}
-            if isinstance(aux, dict):
-                if "recent_texts" in aux and isinstance(aux["recent_texts"], list):
-                    texts.extend([t for t in aux["recent_texts"] if isinstance(t, str)])
-                elif "neighbor_texts" in aux and isinstance(aux["neighbor_texts"], list):
-                    texts.extend([t for t in aux["neighbor_texts"] if isinstance(t, str)])
-        return texts
+        return _LC_SOC
 
     for ep in range(1, epochs + 1):
         random.shuffle(rows)
@@ -970,7 +918,29 @@ def train_jepa_factorized(
             payload = torch.tensor([r.payload_idx if r.payload_idx is not None else 0 for r in batch], device=DEVICE, dtype=torch.long)
             choice_types = [r.choice_type for r in batch]
 
-            # === Action embeddings (learned)
+            roles = [r.role for r in batch]
+            role_labels_list: List[int] = []
+            for rolename in roles:
+                rn = (rolename or "").lower().strip()
+                if rn in ("werewolf", "wolf"):
+                    role_labels_list.append(1)
+                else:
+                    role_labels_list.append(0)
+            role_labels = torch.tensor(role_labels_list, device=DEVICE, dtype=torch.long)
+
+            outcomes_list: List[float] = []
+            for r in batch:
+                aux = r.aux or {}
+                val = 0.0
+                if "game_outcome" in aux:
+                    try:
+                        val = float(aux["game_outcome"])
+                    except Exception:
+                        val = 0.0
+                outcomes_list.append(val)
+            outcomes = torch.tensor(outcomes_list, device=DEVICE, dtype=torch.float32)
+            w = 1.0 + alpha_outcome * outcomes
+
             is_talk_mask = torch.tensor([ct == "TALK_INTENT" for ct in choice_types], device=DEVICE, dtype=torch.bool)
             a_embed = torch.zeros(B, ACTION_EMBED_DIM, device=DEVICE)
             if is_talk_mask.any():
@@ -978,17 +948,17 @@ def train_jepa_factorized(
             if (~is_talk_mask).any():
                 a_embed[~is_talk_mask] = pae(phase_code=phase[~is_talk_mask], payload_idx=payload[~is_talk_mask], is_talk=False)
 
-            # === Build masks for the factorized heads
             talk_mask = build_talk_mask(B, NUM_TALK_CATS)
             vote_mask = build_vote_mask_from_aux(batch, NUM_AGENTS_CFG)
             kill_mask = build_kill_mask_from_aux(batch, NUM_AGENTS_CFG)
 
             with torch_amp.autocast(enabled=USE_AMP):
-                # === World model (JEPA)
                 z_pred = world_model(z_t_tensor, a_embed)
                 L_mse = mse_loss(z_pred, z_next_tensor)
 
-                # === Factorized planner forward
+                role_logits = role_probe(z_t_tensor)
+                L_role = ce_loss(role_logits, role_labels)
+
                 logits = planner_factorized(
                     z_t_tensor,
                     talk_mask=talk_mask,
@@ -996,12 +966,10 @@ def train_jepa_factorized(
                     kill_mask=kill_mask
                 )
 
-                # === Per-head CE losses (only where that head applies)
                 is_vote_mask = torch.tensor([ct == "VOTE_TARGET" for ct in choice_types], device=DEVICE, dtype=torch.bool)
                 is_kill_mask = torch.tensor([ct == "KILL_TARGET" for ct in choice_types], device=DEVICE, dtype=torch.bool)
 
                 if DEBUG_MASKS:
-                    # Assert targets are legal where supervised
                     if is_vote_mask.any():
                         illegal = ~vote_mask[is_vote_mask, payload[is_vote_mask]]
                         assert not illegal.any().item(), "Vote target illegal under vote_mask"
@@ -1016,24 +984,31 @@ def train_jepa_factorized(
                 if is_talk_mask.any():
                     L_talk = ce_loss(logits["talk"][is_talk_mask], payload[is_talk_mask])
                 if is_vote_mask.any():
-                    L_vote = ce_loss(logits["vote"][is_vote_mask], payload[is_vote_mask])
+                    raw_vote = F.cross_entropy(
+                        logits["vote"][is_vote_mask],
+                        payload[is_vote_mask],
+                        reduction="none",
+                    )
+                    L_vote = (raw_vote * w[is_vote_mask]).mean()
                 if is_kill_mask.any():
-                    L_kill = ce_loss(logits["kill"][is_kill_mask], payload[is_kill_mask])
+                    raw_kill = F.cross_entropy(
+                        logits["kill"][is_kill_mask],
+                        payload[is_kill_mask],
+                        reduction="none",
+                    )
+                    L_kill = (raw_kill * w[is_kill_mask]).mean()
 
-                # ---- Optional language coupling --------------------------------
                 L_lc = torch.tensor(0.0, device=DEVICE)
                 if LC_ENABLED:
-                    msg_enc, soc = _ensure_lang_coupling_modules()
-                    if msg_enc is not None and soc is not None:
-                        texts = _collect_texts_from_batch(batch)
-                        if texts:
-                            L_lc = language_coupling_loss(
-                                z_next=z_next_tensor,
-                                texts=texts,
-                                msg_encoder=msg_enc, social=soc, weight=LC_WEIGHT
-                            )
+                    _ = _ensure_lang_coupling_modules()
+                    L_lc = language_coupling_loss(
+                        z_next=z_next_tensor,
+                        texts=[],
+                        msg_encoder=None,
+                        social=None,
+                        weight=LC_WEIGHT
+                    )
 
-                # ---- Optional Stage-A social JEPA regularizer -----------------
                 L_soc = torch.tensor(0.0, device=DEVICE)
                 try:
                     lambda_reg = float(CFG.get("social", {}).get("lambda_reg", 0.0))
@@ -1050,16 +1025,21 @@ def train_jepa_factorized(
                     if vals:
                         L_soc = torch.tensor(sum(vals)/len(vals), device=DEVICE)
 
-                loss = L_mse + (LAMBDA_TALK * L_talk) + (LAMBDA_BC * (L_vote + L_kill)) + L_lc + (lambda_reg * L_soc)
+                loss = (
+                    L_mse
+                    + (LAMBDA_TALK * L_talk)
+                    + (LAMBDA_BC * (L_vote + L_kill))
+                    + (lambda_role * L_role)
+                    + L_lc
+                    + (lambda_reg * L_soc)
+                )
 
-            # Backprop
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
 
-            params = list(world_model.parameters()) + list(planner_factorized.parameters()) + list(pae.parameters())
             for p in params:
                 if p.grad is not None and torch.isnan(p.grad).any():
-                    raise RuntimeError("NaN in gradients!")
+                    raise RuntimeError("NaN in gradients")
             gnorm = torch.nn.utils.clip_grad_norm_(params, MAX_NORM)
 
             scaler.step(optimizer)
@@ -1088,7 +1068,6 @@ def train_jepa_factorized(
         )
 
         if epoch_logger is not None:
-            # Keep CSV compact: push (vote+kill+talk) under L_bc for compatibility
             epoch_logger.log({
                 "run_id": run_id,
                 "role": f"{role_name}-factorized",
@@ -1105,6 +1084,7 @@ def train_jepa_factorized(
         "world_model": world_model.state_dict(),
         "phase_action_encoder": pae.state_dict(),
         "factorized_planner": planner_factorized.state_dict(),
+        "role_probe": role_probe.state_dict(),
     }
     if SAVE_OPTIM:
         state["optim"] = optimizer.state_dict()
@@ -1114,7 +1094,7 @@ def train_jepa_factorized(
     print(f"[SAVE] {role_name} (factorized) models saved → {save_path}")
 
 # =============================================================================
-# Evaluation helpers (no optimizer)
+# Evaluation helpers
 # =============================================================================
 
 @torch.no_grad()
@@ -1181,7 +1161,6 @@ def evaluate_jepa_phase(
         z_pred = world_model(z_t_tensor, a_embed)
         tot_mse += float(mse_loss(z_pred, z_next_tensor).item())
 
-        # optional BC on vote/kill
         mask_idx = [i for i, ct in enumerate(choice_types) if ct in (None, "VOTE_TARGET", "KILL_TARGET")]
         if mask_idx:
             idx_tensor = torch.tensor(mask_idx, device=DEVICE, dtype=torch.long)
@@ -1190,8 +1169,6 @@ def evaluate_jepa_phase(
             tot_ce += float(ce_loss(logits, targets).item())
             tot_acc += float((logits.argmax(-1) == targets).float().sum().item())
             n += float(idx_tensor.numel())
-        # count n for mse separately
-        # If no BC rows, n for CE/acc remains as previous.
     m = sum(len(b) for b in batches)
     return {
         "mse": tot_mse / max(1.0, float(m)),
@@ -1233,7 +1210,6 @@ def evaluate_jepa_factorized(
         payload = torch.tensor([r.payload_idx or 0 for r in batch], device=DEVICE)
         choice_types = [r.choice_type for r in batch]
 
-        # action embed
         is_talk_mask = torch.tensor([ct == "TALK_INTENT" for ct in choice_types], device=DEVICE)
         a_embed = torch.zeros(B, ACTION_EMBED_DIM, device=DEVICE)
         if is_talk_mask.any():
@@ -1245,7 +1221,6 @@ def evaluate_jepa_factorized(
         tot["mse"] += float(mse_loss(z_pred, z_next_tensor).item())
         tot["n"] += float(B)
 
-        # masks + logits
         talk_mask = build_talk_mask(B, NUM_TALK_CATS)
         vote_mask = build_vote_mask_from_aux(batch, NUM_AGENTS_CFG)
         kill_mask = build_kill_mask_from_aux(batch, NUM_AGENTS_CFG)
@@ -1289,7 +1264,7 @@ def evaluate_jepa_factorized(
     }
 
 # =============================================================================
-# Phase-5: Utterance dataset collation + mouthpiece trainers
+# Utterance dataset collation and RoleProbe trainer
 # =============================================================================
 
 @dataclass
@@ -1300,18 +1275,17 @@ class UtteranceSample:
     round_num: int
     template_id: Optional[int]
     talk_cat: Optional[int]
-    hist_feats: Optional[torch.Tensor]   # any small embedding/feature vec (or None)
-    # NEW (Phase-5): fused TalkHead prior (intent probs) and argument id
-    p_intent: Optional[List[float]] = None   # e.g., fused intent distribution over categories
-    arg_id: Optional[int] = None             # optional argument/target chosen by the bandit
+    hist_feats: Optional[torch.Tensor]
+    # fused TalkHead prior and argument id
+    p_intent: Optional[List[float]] = None
+    arg_id: Optional[int] = None
     # scored targets
     judge_score: float = 0.0
     coherence: float = 0.0
     truthfulness: float = 0.0
     role_alignment: float = 0.0
     social_safety: float = 0.0
-    align_tv: Optional[float] = None         # talk→vote alignment [0..1]
-    # optional lexical diversity penalty captured from runtime (if provided)
+    align_tv: Optional[float] = None
     rep_penalty: Optional[float] = None
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
@@ -1325,17 +1299,7 @@ def _role_is_wolf(role: str) -> bool:
 
 def collect_utterance_dataset(agents: List[Any]) -> List[UtteranceSample]:
     """
-    Pull per-utterance training rows from agents' msg_buffer (populated in sim.py Phase-5).
-    Each msg_buffer entry is expected to contain:
-      - 'z' (latent at speak time) or we fallback to agent.encode_current_belief(...)
-      - 'template_id' (int) if the speaker used a template-scaffold
-      - 'judge_score' and 'judge_subscores' with keys: coherence, truthfulness, role_alignment, social_safety
-      - 'alignment_vote' (float) for talk→vote alignment
-      - 'talk_category' or agent.talk_category_last for intent supervision
-      - optional 'p_intent' (List[float]) fused TalkHead prior for α-fusion logging/training
-      - optional 'arg_id' (int) chosen by two-stage bandit (argument/target)
-      - optional 'hist_feats' tensor-like
-      - optional 'repetition_penalty' float in [0,1]
+    Pull per-utterance training rows from agents' msg_buffer.
     """
     out: List[UtteranceSample] = []
     for ag in agents or []:
@@ -1346,7 +1310,6 @@ def collect_utterance_dataset(agents: List[Any]) -> List[UtteranceSample]:
         for row in buf:
             z = row.get("z", None)
             if z is None:
-                # best-effort fallback (rare; we prefer the exact z_t captured when talking)
                 try:
                     z = ag.encode_current_belief(int(row.get("round", 0)), agents).detach()
                 except Exception:
@@ -1357,7 +1320,6 @@ def collect_utterance_dataset(agents: List[Any]) -> List[UtteranceSample]:
                 except Exception:
                     continue
             j = row.get("judge_subscores", {}) or {}
-            # Capture p_intent (list of floats) if present and sane
             p_intent = row.get("p_intent", None)
             if isinstance(p_intent, (list, tuple)) and len(p_intent) > 0:
                 try:
@@ -1370,7 +1332,6 @@ def collect_utterance_dataset(agents: List[Any]) -> List[UtteranceSample]:
                     p_intent = None
             else:
                 p_intent = None
-            # argument id (for two-stage bandit)
             arg_id = row.get("arg_id", None)
             try:
                 arg_id = int(arg_id) if arg_id is not None else None
@@ -1396,18 +1357,281 @@ def collect_utterance_dataset(agents: List[Any]) -> List[UtteranceSample]:
             ))
     return out
 
+# RoleProbe helpers
+class SimpleRoleProbe(nn.Module):
+    """
+    Minimal classifier used as a default RoleProbe.
+
+    It predicts up to num_classes roles from latent z.
+    """
+    def __init__(self, latent_dim: int = LATENT_DIM, num_classes: int = 16):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.ReLU(),
+            nn.Linear(latent_dim, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() > 2:
+            x = x.view(x.size(0), -1)
+        return self.net(x)
+
+class _RoleProbeLogger:
+    def __init__(self, csv_path: str = os.path.join(LOGS_DIR, "metrics_roleprobe.csv")):
+        self.path = csv_path
+        if not os.path.exists(self.path):
+            with open(self.path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(
+                    f,
+                    fieldnames=["run_id", "epoch", "loss", "acc", "n", "num_classes"]
+                )
+                w.writeheader()
+
+    def log(self, run_id: str, epoch: int, loss: float, acc: float, n: int, num_classes: int) -> None:
+        with open(self.path, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(
+                f,
+                fieldnames=["run_id", "epoch", "loss", "acc", "n", "num_classes"]
+            )
+            w.writerow({
+                "run_id": run_id,
+                "epoch": epoch,
+                "loss": round(loss, 6),
+                "acc": round(acc, 6),
+                "n": int(n),
+                "num_classes": int(num_classes),
+            })
+
+def _build_role_probe_tensors_from_utterances(
+    dataset: List[UtteranceSample],
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, int]]:
+    """
+    Turn UtteranceSample list into tensors (X, y) for role probing.
+    X: [N, D_latent], y: [N], role2idx: role string to class index.
+    """
+    xs: List[torch.Tensor] = []
+    ys: List[int] = []
+    role2idx: Dict[str, int] = {}
+
+    for s in dataset:
+        role_str = (s.role or "").strip()
+        if not role_str:
+            continue
+        if not torch.is_tensor(s.z_t):
+            try:
+                z = torch.tensor(s.z_t).float()
+            except Exception:
+                continue
+        else:
+            z = s.z_t
+        if z.dim() > 1:
+            z = z.view(-1)
+        if z.numel() == 0:
+            continue
+        if role_str not in role2idx:
+            role2idx[role_str] = len(role2idx)
+        xs.append(z.detach())
+        ys.append(role2idx[role_str])
+
+    if not xs:
+        return None, None, role2idx
+
+    try:
+        X = torch.stack(xs, dim=0)
+    except Exception:
+        D = xs[0].numel()
+        xs_f = [v for v in xs if v.numel() == D]
+        ys_f = [y for v, y in zip(xs, ys) if v.numel() == D]
+        if not xs_f:
+            return None, None, role2idx
+        X = torch.stack(xs_f, dim=0)
+        ys = ys_f
+
+    y = torch.tensor(ys, dtype=torch.long)
+    return X, y, role2idx
+
+def save_role_probe(
+    probe: nn.Module,
+    role2idx: Dict[str, int],
+    *,
+    run_id: str = "roleprobe",
+) -> str:
+    """
+    Save RoleProbe weights and its role vocabulary mapping.
+    """
+    out = os.path.join(CHECKPOINT_DIR, f"roleprobe_{run_id}.pt")
+    state = {
+        "probe": probe.state_dict(),
+        "role2idx": role2idx,
+    }
+    torch.save(state, out)
+    print(f"[SAVE] RoleProbe saved → {out}")
+    return out
+
+def load_role_probe(
+    probe: Optional[nn.Module] = None,
+    *,
+    run_id: str = "roleprobe",
+    map_location: str | torch.device | None = "cpu",
+    device: Optional[torch.device] = None,
+) -> Tuple[nn.Module, Dict[str, int]]:
+    """
+    Load RoleProbe weights and vocabulary mapping.
+
+    Prefer new-style checkpoints:
+        checkpoints/roleprobe_{run_id}.pt
+
+    Backwards compatible with legacy filename:
+        checkpoints/role_probe.pt
+
+    If probe is None, a SimpleRoleProbe is instantiated.
+    Returns (probe, role2idx).
+    """
+    path = os.path.join(CHECKPOINT_DIR, f"roleprobe_{run_id}.pt")
+    legacy_path = os.path.join(CHECKPOINT_DIR, "role_probe.pt")
+    role2idx: Dict[str, int] = {}
+
+    if not os.path.exists(path):
+        if os.path.exists(legacy_path):
+            print(f"[LOAD] RoleProbe legacy checkpoint ← {legacy_path}")
+            path = legacy_path
+        else:
+            print(f"[INIT] No RoleProbe checkpoint for run_id={run_id}.")
+            if probe is None:
+                probe = SimpleRoleProbe(latent_dim=LATENT_DIM)
+            if device is not None:
+                probe.to(device)
+            return probe, role2idx
+
+    if device is not None:
+        effective_map_location: str | torch.device = device
+    else:
+        effective_map_location = "cpu" if map_location is None else map_location
+
+    state = torch.load(path, map_location=effective_map_location)
+    role2idx = state.get("role2idx", {}) or {}
+
+    if probe is None:
+        num_classes = len(role2idx)
+        if num_classes <= 0:
+            try:
+                w = state["probe"]["net.2.weight"]
+                num_classes = int(w.size(0))
+            except Exception:
+                num_classes = 16
+        probe = SimpleRoleProbe(latent_dim=LATENT_DIM, num_classes=num_classes)
+
+    probe.load_state_dict(state.get("probe", {}))
+
+    if device is not None:
+        probe.to(device)
+
+    print(f"[LOAD] RoleProbe ← {path} (classes={len(role2idx)})")
+
+    if os.path.basename(path) == "role_probe.pt":
+        try:
+            save_role_probe(probe, role2idx, run_id=run_id)
+        except Exception as e:
+            print(f"[WARN] Failed to resave RoleProbe under new name: {e}")
+
+    return probe, role2idx
+
+def train_role_probe(
+    dataset: List[UtteranceSample],
+    probe: Optional[nn.Module],
+    *,
+    epochs: int = 5,
+    batch_size: int = 64,
+    lr: float = 1e-3,
+    run_id: str = "roleprobe",
+    save: bool = True,
+) -> Dict[str, Any]:
+    """
+    Train a RoleProbe classifier on latent states to predict agent role.
+
+    Assumes probe(z_batch) returns logits [B, num_roles].
+    Uses UtteranceSample.z_t and UtteranceSample.role as supervision.
+    """
+    if probe is None:
+        print("[RoleProbe] Probe instance is None; skipping probe training.")
+        return {"acc": 0.0, "loss": 0.0, "n": 0, "num_classes": 0, "role2idx": {}}
+
+    X, y, role2idx = _build_role_probe_tensors_from_utterances(dataset)
+    if X is None or y is None or y.numel() == 0 or len(role2idx) <= 1:
+        print("[RoleProbe] Insufficient data or only one role present; skipping probe training.")
+        return {"acc": 0.0, "loss": 0.0, "n": 0, "num_classes": len(role2idx), "role2idx": role2idx}
+
+    N = int(y.size(0))
+    num_classes = len(role2idx)
+    logger = _RoleProbeLogger()
+
+    probe.to(DEVICE)
+    probe.train()
+    opt = optim.Adam(probe.parameters(), lr=lr)
+    ce = nn.CrossEntropyLoss()
+
+    for ep in range(1, max(1, epochs) + 1):
+        perm = torch.randperm(N)
+        X_ep = X[perm]
+        y_ep = y[perm]
+
+        epoch_loss = 0.0
+        epoch_correct = 0.0
+        epoch_n = 0
+
+        for i in range(0, N, batch_size):
+            xb = X_ep[i:i+batch_size].to(DEVICE)
+            yb = y_ep[i:i+batch_size].to(DEVICE)
+            if xb.size(0) == 0:
+                continue
+
+            logits = probe(xb)
+            if logits.dim() == 1:
+                logits = logits.unsqueeze(0)
+            loss = ce(logits, yb)
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(probe.parameters(), MAX_NORM)
+            opt.step()
+
+            with torch.no_grad():
+                preds = logits.argmax(dim=-1)
+                correct = (preds == yb).float().sum().item()
+                epoch_loss += float(loss.item()) * xb.size(0)
+                epoch_correct += correct
+                epoch_n += xb.size(0)
+
+        mean_loss = epoch_loss / max(1, epoch_n)
+        acc = epoch_correct / max(1, epoch_n)
+        logger.log(run_id, ep, mean_loss, acc, epoch_n, num_classes)
+        print(f"[RoleProbe] epoch={ep} loss={mean_loss:.4f} acc={acc:.4f} N={epoch_n} classes={num_classes}")
+
+    if save:
+        save_role_probe(probe, role2idx, run_id=run_id)
+
+    return {
+        "acc": float(epoch_correct / max(1, epoch_n)),
+        "loss": float(mean_loss),
+        "n": int(epoch_n),
+        "num_classes": int(num_classes),
+        "role2idx": role2idx,
+    }
+
+# =============================================================================
+# Reward assembly
+# =============================================================================
+
 def _compute_reward(sample: UtteranceSample) -> float:
     """
     Role-aware scalar reward combining judge subscores and alignment.
-    NOTE: role_alignment is included only if REWARD_USE_ROLE_ALIGNMENT=True
-    to keep consistency with rubric (truthfulness, coherence, social_safety).
     """
     base = (R_COHE * sample.coherence) + (R_SAFE * sample.social_safety)
 
     if REWARD_USE_ROLE_ALIGNMENT:
         base += (R_ROLE * sample.role_alignment)
 
-    # Truthfulness handling differs by role (wolves rewarded for deception)
     if _role_is_wolf(sample.role):
         base += (R_DECEP * max(0.0, 1.0 - sample.truthfulness))
     else:
@@ -1416,13 +1640,11 @@ def _compute_reward(sample: UtteranceSample) -> float:
     if sample.align_tv is not None:
         base += (R_ALIGN * sample.align_tv)
 
-    # clamp to sane range
     return float(max(-1.0, min(2.0, base)))
 
-# --- Phase-5: Lambda-weighted reward assembly (+ optional night convergence) ---
 def assemble_total_reward(sample: Dict[str, Any]) -> float:
     """
-    Compute λ-weighted total reward for a rollout/utterance sample:
+    Compute weighted total reward for a rollout or utterance sample:
       R_total = LJ * r_judge + LC * r_consistency + LO * r_outcome
     Optionally adds a tiny bonus for werewolves who converge during night chat.
     """
@@ -1432,17 +1654,16 @@ def assemble_total_reward(sample: Dict[str, Any]) -> float:
 
     R_total = (LJ * r_judge) + (LC * r_consistency) + (LO * r_outcome)
 
-    # Optional night convergence reward (wolves only)
     if sample.get("phase") == "NIGHT_DISCUSS" and sample.get("role") == "Werewolf":
-        r_night_consensus = float(sample.get("night_consensus", 0.0))  # 0..1 external calc if logged
+        r_night_consensus = float(sample.get("night_consensus", 0.0))
         R_total += 0.05 * r_night_consensus
 
     sample["reward_total"] = float(R_total)
     return float(R_total)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SpeakerBandit trainer (policy gradient with EMA baseline + entropy bonus)
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# SpeakerBandit trainer
+# =============================================================================
 
 class _BanditLogger:
     def __init__(self, csv_path: str = os.path.join(LOGS_DIR, "metrics_speaker.csv")):
@@ -1459,7 +1680,7 @@ class _BanditLogger:
 def _kl_categorical(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
     """
     KL(p||q) for categorical distributions with small epsilon for numerical stability.
-    p,q are probability vectors [B,C] or [C].
+    p, q are probability vectors [B,C] or [C].
     """
     if p.dim() == 1:
         p = p.unsqueeze(0)
@@ -1482,7 +1703,6 @@ def train_speaker_bandit(
     if speaker is None or SpeakerBandit is None:
         print("[MOUTHPIECE] SpeakerBandit not available; skipping bandit training.")
         return
-    # Filter rows that have a template_id (required for supervised action id)
     rows = [s for s in dataset if s.template_id is not None]
     if not rows:
         print("[MOUTHPIECE] No template_id in dataset; skipping bandit training.")
@@ -1492,9 +1712,7 @@ def train_speaker_bandit(
     speaker.train()
     opt = optim.Adam(speaker.parameters(), lr=lr)
 
-    # moving baseline for variance reduction
     baseline = 0.0
-
     logger = _BanditLogger()
 
     for ep in range(1, max(1, epochs) + 1):
@@ -1504,25 +1722,23 @@ def train_speaker_bandit(
         rewards_all: List[float] = []
 
         for s in rows:
-            # Prepare inputs: latent + optional hist feats + role bit
             z = s.z_t.to(DEVICE)
             if z.dim() == 1:
                 z = z.unsqueeze(0)
             role_bit = torch.tensor([[1.0 if _role_is_wolf(s.role) else 0.0]], device=DEVICE)
             if s.hist_feats is None:
-                hist = torch.zeros((1, 8), device=DEVICE)  # small default
+                hist = torch.zeros((1, 8), device=DEVICE)
             else:
                 h = s.hist_feats
                 if not torch.is_tensor(h):
                     h = torch.tensor(h).float()
                 hist = h.to(DEVICE).view(1, -1)
 
-            # Forward: support two-stage dict outputs with backward compatibility
             out = speaker(z, role_bit=role_bit, hist_feats=hist)
             if isinstance(out, dict):
                 cat_logits = out.get("cat_logits", None)
                 arg_logits = out.get("arg_logits", None)
-                if cat_logits is None:  # degenerate safety
+                if cat_logits is None:
                     cat_logits = out[list(out.keys())[0]]
             else:
                 cat_logits, arg_logits = out, None
@@ -1530,36 +1746,30 @@ def train_speaker_bandit(
             cat_probs = torch.softmax(cat_logits, dim=-1)
             cat_logprobs = torch.log_softmax(cat_logits, dim=-1)
 
-            # pick the actually-used template_id as the "action"
             t_id = int(s.template_id)
             if t_id < 0 or t_id >= cat_probs.size(-1):
-                # Skip if speaker head doesn't match dataset template space
                 continue
 
             lp_cat = cat_logprobs[0, t_id]
             ent_cat = -(cat_probs * cat_logprobs).sum()
 
-            # reward
             R = _compute_reward(s)
             rewards_all.append(R)
             adv = R - baseline
 
-            # Base REINFORCE term on categories
             loss = -(adv * lp_cat) - (entropy_coef * ent_cat)
 
-            # Optional auxiliary REINFORCE on argument/target choice if present
             if (arg_logits is not None) and (s.arg_id is not None):
                 a_logits = arg_logits
                 a_logprobs = torch.log_softmax(a_logits, dim=-1)
                 a_id = int(s.arg_id)
                 if 0 <= a_id < a_logits.size(-1):
                     lp_arg = a_logprobs[0, a_id]
-                    loss = loss - (SB_ARG_AUX_WEIGHT * adv * lp_arg)  # small aux
+                    loss = loss - (SB_ARG_AUX_WEIGHT * adv * lp_arg)
 
-            # Small KL(π_cat || p_intent) regularizer when p_intent present
             if s.p_intent is not None and len(s.p_intent) == cat_probs.size(-1):
                 q = torch.tensor(s.p_intent, dtype=torch.float32, device=DEVICE).unsqueeze(0)
-                kl = _kl_categorical(cat_probs.detach(), q)  # use current probs; don't backprop through q
+                kl = _kl_categorical(cat_probs.detach(), q)
                 loss = loss + SB_KL_TO_INTENT * kl
 
             opt.zero_grad(set_to_none=True)
@@ -1567,7 +1777,6 @@ def train_speaker_bandit(
             torch.nn.utils.clip_grad_norm_(speaker.parameters(), MAX_NORM)
             opt.step()
 
-            # EMA baseline update
             baseline = baseline_ema * baseline + (1.0 - baseline_ema) * R
 
             total_loss += float(loss.item())
@@ -1577,9 +1786,9 @@ def train_speaker_bandit(
         logger.log(ep, total_loss / n, float(np.mean(rewards_all)) if rewards_all else 0.0, float(np.std(rewards_all)) if rewards_all else 0.0, ent_acc / n)
         print(f"[SpeakerBandit] epoch={ep} loss={total_loss/n:.4f} Rμ={np.mean(rewards_all) if rewards_all else 0.0:.3f} H={ent_acc/n:.3f}")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LogitBiasHead trainer (intent CE + reward-weighted soft targets)
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# LogitBiasHead trainer
+# =============================================================================
 
 class _BiasLogger:
     def __init__(self, csv_path: str = os.path.join(LOGS_DIR, "metrics_bias_head.csv")):
@@ -1599,7 +1808,6 @@ def _entropy_categorical(logits: torch.Tensor) -> torch.Tensor:
     return -(p * lp).sum(dim=-1).mean()
 
 def _kl_to_uniform(logits: torch.Tensor) -> torch.Tensor:
-    # KL(p || U) = sum p log(p / U); U=1/K => -H(p) + log K
     k = logits.size(-1)
     H = _entropy_categorical(logits)
     return (math.log(k) - H).clamp(min=0.0)
@@ -1615,15 +1823,12 @@ def train_bias_head_on_intents(
     num_categories: int = NUM_TALK_CATS,
 ) -> None:
     """
-    We interpret LogitBiasHead as a module that can output *category* logits given latent features.
-    If your implementation exposes a different API, adapt this call-site accordingly.
-    Fallback: skip with a clear message.
+    Interpret LogitBiasHead as a module that can output category logits given latent features.
     """
     if bias_head is None or LogitBiasHead is None:
         print("[MOUTHPIECE] LogitBiasHead not available; skipping bias training.")
         return
 
-    # Build supervision: only rows with a talk category label
     rows = [s for s in dataset if s.talk_cat is not None and s.talk_cat >= 0 and s.talk_cat < num_categories]
     if not rows:
         print("[MOUTHPIECE] No talk category labels; skipping bias training.")
@@ -1646,21 +1851,17 @@ def train_bias_head_on_intents(
             if z.dim() == 1:
                 z = z.unsqueeze(0)
             role_bit = torch.tensor([[1.0 if _role_is_wolf(s.role) else 0.0]], device=DEVICE)
-            # Try to call a generic `category_logits` API; fallback to `forward` if available
             if hasattr(bias_head, "category_logits"):
-                logits = bias_head.category_logits(z, role_bit=role_bit)  # [1, C]
+                logits = bias_head.category_logits(z, role_bit=role_bit)
             else:
-                logits = bias_head(z)  # best effort
+                logits = bias_head(z)
 
             target = torch.tensor([int(s.talk_cat)], device=DEVICE, dtype=torch.long)
 
-            # Plain CE to observed intent
             L_ce = ce(logits, target)
 
-            # Reward-weighted soft target (encourage high-judge-score categories)
             with torch.no_grad():
                 R = max(0.0, _compute_reward(s))
-                # start near-uniform, then bump observed category proportional to reward
                 soft = torch.full_like(logits, 1.0 / logits.size(-1))
                 soft[0, target.item()] = min(1.0, 0.5 + 0.5 * R)
                 soft = (soft / soft.sum(dim=-1, keepdim=True)).detach()
@@ -1668,11 +1869,9 @@ def train_bias_head_on_intents(
             logp = torch.log_softmax(logits, dim=-1)
             L_rce = -(soft * logp).sum(dim=-1).mean()
 
-            # regularizers
             H = _entropy_categorical(logits)
             KL_u = _kl_to_uniform(logits)
 
-            # KL(p_bias || p_intent) when p_intent provided
             KL_intent = torch.tensor(0.0, device=DEVICE)
             if s.p_intent is not None and len(s.p_intent) == logits.size(-1):
                 p_bias = torch.softmax(logits, dim=-1)
@@ -1739,7 +1938,7 @@ def load_mouthpiece(role: str, *, speaker: Optional[nn.Module] = None, bias_head
     return speaker, bias_head
 
 # =============================================================================
-# (Optional) Language coupling helper (not wired by default to JEPA loops)
+# Language coupling helper
 # =============================================================================
 
 def language_coupling_loss(
@@ -1751,15 +1950,14 @@ def language_coupling_loss(
     weight: float = LC_WEIGHT,
 ) -> torch.Tensor:
     """
-    Small auxiliary that pulls z_next toward a SocialInfluence projection of the
-    mean text embedding (encourages language↔state consistency).
-    Not used by default; can be called from custom training scripts.
+    Auxiliary that would pull z_next toward a SocialInfluence projection of mean text embedding.
+    With latent-only SocialInfluence or empty texts, returns zero.
     """
     if not texts or msg_encoder is None or social is None or weight <= 0.0:
         return torch.tensor(0.0, device=z_next.device if torch.is_tensor(z_next) else DEVICE)
     try:
         with torch.no_grad():
-            t_emb = msg_encoder(texts).mean(dim=0)  # [D_text]
+            t_emb = msg_encoder(texts).mean(dim=0)
         delta = social(t_emb.to(DEVICE))
         if z_next.dim() == 1:
             z_next = z_next.unsqueeze(0)
@@ -1769,7 +1967,7 @@ def language_coupling_loss(
         return torch.tensor(0.0, device=DEVICE)
 
 # =============================================================================
-# I/O for checkpoints (uses CFG dims if present)
+# I/O for role models
 # =============================================================================
 
 def load_role_models(role: str) -> Tuple[WorldModelMLP, ActionEncoder, PlannerHead]:
@@ -1846,7 +2044,7 @@ def load_role_models_factorized(role: str) -> Tuple[WorldModelMLP, PhaseActionEn
     return wm, pae, fplanner
 
 # =============================================================================
-# Sim runner shim (unchanged)
+# Sim runner shim
 # =============================================================================
 
 def run_sim_and_collect_rollouts(visual: bool = False):

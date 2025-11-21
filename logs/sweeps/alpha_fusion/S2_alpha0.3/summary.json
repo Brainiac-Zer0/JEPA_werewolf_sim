@@ -1,0 +1,20 @@
+{
+  "condition": "S2_alpha0.3",
+  "games_counted": 300,
+  "wins_counted": 300,
+  "villager_win_rate_mean": 0.13,
+  "villager_win_rate_lo": 0.0919436838356627,
+  "villager_win_rate_hi": 0.1680563161643373,
+  "vote_accuracy_mean": 0.3067569226650036,
+  "vote_accuracy_lo": 0.29128695776034536,
+  "vote_accuracy_hi": 0.32222688756966184,
+  "judge_accept_mean": NaN,
+  "judge_accept_lo": NaN,
+  "judge_accept_hi": NaN,
+  "talk_vote_align_mean": 0.6178522842837406,
+  "talk_vote_align_lo": 0.6114587634733025,
+  "talk_vote_align_hi": 0.6242458050941787,
+  "dz_mse_mean": 0.020629368294515317,
+  "dz_mse_lo": 0.02042849290104453,
+  "dz_mse_hi": 0.020830243687986104
+}
