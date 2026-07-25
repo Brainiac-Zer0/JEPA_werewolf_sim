@@ -19,7 +19,7 @@ import torch.nn.functional as F
 # AMP (config-toggled)
 from torch.cuda import amp as torch_amp
 
-from encoders import ActionEncoder, PlannerHead, WorldModelMLP
+from encoders import ActionEncoder, PlannerHead, WorldModelMLP, MLPBeliefEncoder, INPUT_DIM as INPUT_DIM_CFG
 # Phase-aware + factorized planner path
 from encoders import PhaseActionEncoder  # learnable, persisted
 try:
@@ -835,6 +835,7 @@ def train_jepa_factorized(
     learning_rate: float = 1e-3,
     run_id: str = "run",
     epoch_logger: Optional[TrainingEpochLogger] = None,
+    belief_encoder: Optional[MLPBeliefEncoder] = None,
 ) -> None:
     """
     Full phase-aware and factorized-head trainer.
@@ -860,6 +861,15 @@ def train_jepa_factorized(
     role_probe = SimpleRoleProbe(latent_dim=LATENT_DIM, num_classes=2)
     role_probe.to(DEVICE)
 
+    # JEPA belief encoder: when supplied, we re-encode the raw observations stored
+    # in each rollout's aux so gradients flow into the encoder (the central JEPA
+    # claim). The next-state latent is a stop-grad target to prevent representation
+    # collapse. When absent (or a row lacks raw obs) we fall back to the stored
+    # (detached) latents, in which case the encoder is simply not updated.
+    if belief_encoder is not None:
+        belief_encoder.to(DEVICE)
+        belief_encoder.train()
+
     batches_dummy = max(1, math.ceil(len(rows)/batch_size))
     params = (
         list(world_model.parameters())
@@ -867,6 +877,8 @@ def train_jepa_factorized(
         + list(pae.parameters())
         + list(role_probe.parameters())
     )
+    if belief_encoder is not None:
+        params = list(belief_encoder.parameters()) + params
     optimizer, scheduler = make_optimizer_and_scheduler(
         params,
         learning_rate,
@@ -912,8 +924,37 @@ def train_jepa_factorized(
 
         for batch in batches:
             B = len(batch)
-            z_t_tensor    = torch.stack([r.z_t for r in batch]).to(DEVICE)
-            z_next_tensor = torch.stack([r.z_next for r in batch]).to(DEVICE)
+            # Build z_t (with grad through the encoder) and z_next (stop-grad target)
+            # by re-encoding raw observations when available; otherwise fall back to
+            # the stored detached latents.
+            def _obs(aux, key):
+                v = (aux or {}).get(key) if isinstance(aux, dict) else None
+                if isinstance(v, torch.Tensor):
+                    return v.reshape(-1).float()
+                return None
+            xt_list, xn_list, idx_with_x = [], [], []
+            if belief_encoder is not None:
+                for i, r in enumerate(batch):
+                    xt = _obs(r.aux, "x_t")
+                    xn = _obs(r.aux, "x_next")
+                    if xt is not None and xn is not None:
+                        idx_with_x.append(i)
+                        xt_list.append(xt)
+                        xn_list.append(xn)
+            z_t_list: List[Optional[torch.Tensor]] = [None] * B
+            z_next_list: List[Optional[torch.Tensor]] = [None] * B
+            if idx_with_x:
+                zt_enc = belief_encoder(torch.stack(xt_list).to(DEVICE))            # grad → encoder
+                zn_enc = belief_encoder(torch.stack(xn_list).to(DEVICE)).detach()   # stop-grad target
+                for j, i in enumerate(idx_with_x):
+                    z_t_list[i] = zt_enc[j]
+                    z_next_list[i] = zn_enc[j]
+            for i, r in enumerate(batch):
+                if z_t_list[i] is None:
+                    z_t_list[i] = r.z_t.to(DEVICE)
+                    z_next_list[i] = r.z_next.to(DEVICE)
+            z_t_tensor    = torch.stack(z_t_list)
+            z_next_tensor = torch.stack(z_next_list)
             phase = torch.tensor([r.phase if r.phase is not None else 0 for r in batch], device=DEVICE, dtype=torch.long)
             payload = torch.tensor([r.payload_idx if r.payload_idx is not None else 0 for r in batch], device=DEVICE, dtype=torch.long)
             choice_types = [r.choice_type for r in batch]
@@ -981,22 +1022,34 @@ def train_jepa_factorized(
                 L_vote = torch.tensor(0.0, device=DEVICE)
                 L_kill = torch.tensor(0.0, device=DEVICE)
 
+                def _finite_target_rows(head_logits, sel, tgt):
+                    """Keep only rows whose target logit is finite. A masked (‑inf)
+                    target would make cross-entropy inf/NaN; this happens when the
+                    reconstructed legality mask excludes the recorded target."""
+                    if not sel.any():
+                        return None
+                    hl = head_logits[sel]
+                    tg = tgt[sel]
+                    picked = hl.gather(1, tg.unsqueeze(1)).squeeze(1)
+                    ok = torch.isfinite(picked)
+                    if not ok.any():
+                        return None
+                    return hl[ok], tg[ok], ok
+
                 if is_talk_mask.any():
                     L_talk = ce_loss(logits["talk"][is_talk_mask], payload[is_talk_mask])
                 if is_vote_mask.any():
-                    raw_vote = F.cross_entropy(
-                        logits["vote"][is_vote_mask],
-                        payload[is_vote_mask],
-                        reduction="none",
-                    )
-                    L_vote = (raw_vote * w[is_vote_mask]).mean()
+                    _v = _finite_target_rows(logits["vote"], is_vote_mask, payload)
+                    if _v is not None:
+                        vl, vt, vok = _v
+                        raw_vote = F.cross_entropy(vl, vt, reduction="none")
+                        L_vote = (raw_vote * w[is_vote_mask][vok]).mean()
                 if is_kill_mask.any():
-                    raw_kill = F.cross_entropy(
-                        logits["kill"][is_kill_mask],
-                        payload[is_kill_mask],
-                        reduction="none",
-                    )
-                    L_kill = (raw_kill * w[is_kill_mask]).mean()
+                    _k = _finite_target_rows(logits["kill"], is_kill_mask, payload)
+                    if _k is not None:
+                        kl, kt, kok = _k
+                        raw_kill = F.cross_entropy(kl, kt, reduction="none")
+                        L_kill = (raw_kill * w[is_kill_mask][kok]).mean()
 
                 L_lc = torch.tensor(0.0, device=DEVICE)
                 if LC_ENABLED:
@@ -1086,11 +1139,20 @@ def train_jepa_factorized(
         "factorized_planner": planner_factorized.state_dict(),
         "role_probe": role_probe.state_dict(),
     }
+    # Embed the (shared) belief encoder so the checkpoint is self-contained and the
+    # simulator can restore the trained encoder used to produce z_t.
+    if belief_encoder is not None:
+        state["belief_encoder"] = belief_encoder.state_dict()
     if SAVE_OPTIM:
         state["optim"] = optimizer.state_dict()
         if scheduler is not None:
             state["sched"] = scheduler.state_dict()
     torch.save(state, save_path)
+    # Also write a canonical shared-encoder checkpoint (single representational space).
+    if belief_encoder is not None:
+        enc_path = os.path.join(CHECKPOINT_DIR, "belief_encoder.pt")
+        torch.save({"belief_encoder": belief_encoder.state_dict(),
+                    "input_dim": INPUT_DIM_CFG, "latent_dim": LATENT_DIM}, enc_path)
     print(f"[SAVE] {role_name} (factorized) models saved → {save_path}")
 
 # =============================================================================
@@ -1183,6 +1245,7 @@ def evaluate_jepa_factorized(
     phase_action_encoder: PhaseActionEncoder,
     planner_factorized: FactorizedPlanner,
     batch_size: int = 32,
+    belief_encoder: Optional[MLPBeliefEncoder] = None,
 ) -> Dict[str, float]:
     rows = normalize_rollouts(rollout_data_phaseaware)
     if not rows:
@@ -1190,6 +1253,8 @@ def evaluate_jepa_factorized(
                 "talk_acc": 0.0, "vote_acc": 0.0, "kill_acc": 0.0,
                 "vote_illegal": 0.0, "kill_illegal": 0.0}
     world_model.eval(); planner_factorized.eval(); phase_action_encoder.eval()
+    if belief_encoder is not None:
+        belief_encoder.eval()
 
     mse_loss = nn.MSELoss(reduction="sum")
     ce_loss  = nn.CrossEntropyLoss(reduction="sum")
@@ -1204,8 +1269,28 @@ def evaluate_jepa_factorized(
     batches = make_batches(rows, batch_size)
     for batch in batches:
         B = len(batch)
-        z_t_tensor    = torch.stack([r.z_t for r in batch]).to(DEVICE)
-        z_next_tensor = torch.stack([r.z_next for r in batch]).to(DEVICE)
+        # Re-encode from raw observations when the trained encoder is provided so the
+        # evaluation reflects the encoder actually used at inference; otherwise fall
+        # back to the stored latents.
+        if belief_encoder is not None:
+            def _obs(aux, key):
+                v = (aux or {}).get(key) if isinstance(aux, dict) else None
+                return v.reshape(-1).float() if isinstance(v, torch.Tensor) else None
+            with torch.no_grad():
+                z_t_l, z_n_l = [], []
+                for r in batch:
+                    xt = _obs(r.aux, "x_t"); xn = _obs(r.aux, "x_next")
+                    if xt is not None and xn is not None:
+                        z_t_l.append(belief_encoder(xt.to(DEVICE)))
+                        z_n_l.append(belief_encoder(xn.to(DEVICE)))
+                    else:
+                        z_t_l.append(r.z_t.to(DEVICE))
+                        z_n_l.append(r.z_next.to(DEVICE))
+            z_t_tensor    = torch.stack(z_t_l)
+            z_next_tensor = torch.stack(z_n_l)
+        else:
+            z_t_tensor    = torch.stack([r.z_t for r in batch]).to(DEVICE)
+            z_next_tensor = torch.stack([r.z_next for r in batch]).to(DEVICE)
         phase   = torch.tensor([r.phase or 0 for r in batch], device=DEVICE)
         payload = torch.tensor([r.payload_idx or 0 for r in batch], device=DEVICE)
         choice_types = [r.choice_type for r in batch]
@@ -1990,6 +2075,26 @@ def load_role_models(role: str) -> Tuple[WorldModelMLP, ActionEncoder, PlannerHe
 
     return wm, ae, planner
 
+def load_shared_belief_encoder() -> MLPBeliefEncoder:
+    """
+    Load the shared JEPA belief encoder from checkpoints/belief_encoder.pt if present,
+    else return a freshly-initialized encoder. This is the single, shared context
+    encoder the thesis describes (one consistent representational space for all
+    agents). Used by both the training loop and the simulator.
+    """
+    enc = MLPBeliefEncoder(input_dim=INPUT_DIM_CFG, latent_dim=LATENT_DIM)
+    ckpt_path = os.path.join(CHECKPOINT_DIR, "belief_encoder.pt")
+    if os.path.exists(ckpt_path):
+        try:
+            state = torch.load(ckpt_path, map_location="cpu")
+            enc.load_state_dict(state["belief_encoder"])
+            print(f"[LOAD] shared belief encoder ← {ckpt_path}")
+        except Exception as e:
+            print(f"[WARN] failed to load shared belief encoder ({e}); starting fresh.")
+    else:
+        print("[INIT] No shared belief encoder checkpoint; starting fresh.")
+    return enc
+
 def load_role_models_phase(role: str) -> Tuple[WorldModelMLP, PhaseActionEncoder, PlannerHead]:
     """
     Phase-aware loader: returns (WM, PhaseActionEncoder, PlannerHead) and loads {role}_jepa_phase.pt if present.
@@ -2047,10 +2152,10 @@ def load_role_models_factorized(role: str) -> Tuple[WorldModelMLP, PhaseActionEn
 # Sim runner shim
 # =============================================================================
 
-def run_sim_and_collect_rollouts(visual: bool = False):
-    """Normalize sim output to (rollouts, meta) so train.py can use meta['agents'].""" 
+def run_sim_and_collect_rollouts(visual: bool = False, seed: int | None = None):
+    """Normalize sim output to (rollouts, meta) so train.py can use meta['agents']."""
     from sim import simulate_game
-    ret = simulate_game(visual=visual)
+    ret = simulate_game(visual=visual, seed=seed)
     if isinstance(ret, tuple) and len(ret) == 2:
         return ret
     return ret, {}

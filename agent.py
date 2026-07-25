@@ -802,6 +802,10 @@ class BaseAgent:
             x = x.to(device)
         x = self._fit_input_dim(x, device)
 
+        # Stash the exact (post-fit) observation fed to the encoder so the trainer
+        # can re-encode it and let JEPA gradients flow into the belief encoder.
+        self._last_obs_x = x.detach()
+
         z = self.encoder(x)
 
         if torch.isnan(z).any() or torch.isinf(z).any():

@@ -90,7 +90,7 @@ except Exception:
         c = Counter(tally_list)
         return c.most_common(1)[0][0]
 
-from training_utils import load_role_models
+from training_utils import load_role_models, load_role_models_factorized, load_shared_belief_encoder
 try:
     from encoders import MessageEncoder
 except Exception:
@@ -230,6 +230,9 @@ VOTE_MIX_ALPHA: float = float(SIM_CFG.get("vote_mix_alpha", 0.0))
 LOG_DZ_TALK: bool = bool(SIM_CFG.get("log_dz_talk", False))
 LOG_DZ_KILL: bool = bool(SIM_CFG.get("log_dz_kill", False))
 POLICY: str = str(SIM_CFG.get("policy", "") or "").lower()
+# Number of discussion turns per day (each alive player speaks once per turn).
+# Previously this config value was ignored and everyone spoke exactly once.
+DISCUSS_TURNS: int = int(SIM_CFG.get("discuss_turns", CFG.get("TURNS_DAY_DISCUSS", 1)) or 1)
 
 def _env_bool(name: str, default: bool) -> bool:
     v = os.getenv(name, None)
@@ -300,6 +303,7 @@ LOG_DZ_TALK    = _env_bool("LOG_DZ_TALK", LOG_DZ_TALK)
 LOG_DZ_KILL    = _env_bool("LOG_DZ_KILL", LOG_DZ_KILL)
 ALPHA_INTENT_BIAS = _env_float("ALPHA_INTENT_BIAS", ALPHA_INTENT_BIAS)
 SEED_GLOBAL = _env_int("SEED_GLOBAL", SEED_GLOBAL)
+DISCUSS_TURNS = max(1, _env_int("DISCUSS_TURNS", DISCUSS_TURNS))
 
 # Judge availability toggle and helper
 JUDGE_ENABLED = _env_bool("JUDGE_ENABLED", True)
@@ -322,6 +326,11 @@ _IS_JEPA_ONLY_POLICY = POLICY in {"jepa_only", "jepa_random"}
 
 screen = font = font_s = clock = None
 msg_log: Deque[Tuple[str, str]] = deque(maxlen=200)
+
+# Seed of the game currently being simulated; set at the top of simulate_game so
+# that all per-row telemetry logs the actual per-game seed rather than the
+# constant module default.
+_CURRENT_GAME_SEED: int = SEED_GLOBAL
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -392,7 +401,7 @@ def emit_event(rows, *, run_id, round_num, phase_code, phase_str, agent, role,
     j = judge if (judge and not error) else None
     rows.append({
         "run_id": run_id,
-        "seed": SEED_GLOBAL,
+        "seed": _CURRENT_GAME_SEED,
         "round": round_num,
         "phase": phase_str,
         "phase_code": phase_code,
@@ -650,12 +659,30 @@ def _candidate_text(target_name: str) -> str:
     return f"We should vote to eliminate {target_name}."
 
 def _talk_vote_alignment(cat_id: int) -> float:
+    """DEPRECATED constant lookup (kept for back-compat). Prefer _talk_vote_align_real."""
     if cat_id == 4:   return 1.0
     if cat_id == 0:   return 0.9
     if cat_id == 3:   return 0.6
     if cat_id == 2:   return 0.4
     if cat_id == 1:   return 0.2
     return 0.5
+
+def _talk_vote_align_real(ag: "BaseAgent", voted_idx: int) -> float:
+    """
+    Real talk→vote alignment: for a directed utterance (accuse/vote), 1.0 if the
+    agent voted for the same target it accused/proposed, else 0.0. Undirected
+    utterances (hedge/defend/question or no target) return NaN so they are excluded
+    from the mean rather than counted as a fixed constant.
+    """
+    cat = int(getattr(ag, "talk_category_last", -1))
+    tgt = int(getattr(ag, "talk_target_last_idx", -1))
+    # Only accuse (0) and explicit vote (4) are directed vote-relevant intents.
+    if cat not in (0, 4) or tgt < 0:
+        return float("nan")
+    try:
+        return 1.0 if int(voted_idx) == tgt else 0.0
+    except Exception:
+        return float("nan")
 
 def _intent_name_from_id(cid: int) -> str:
     try:
@@ -867,20 +894,29 @@ def _heuristic_vote_choice(ag: BaseAgent, living: list[BaseAgent]) -> Optional[s
     choices = [x.name for x in living if x.alive and x.name != ag.name]
     return random.choice(choices) if choices else None
 
-def simulate_game(visual: bool = True):
+def simulate_game(visual: bool = True, seed: int | None = None):
+    # Resolve the per-game seed. Priority: explicit arg > GAME_SEED env > SEED_GLOBAL.
+    # Threading a distinct seed per game is what makes repeated games in a run
+    # independent instead of identical (previously every game reset to SEED_GLOBAL).
+    if seed is None:
+        game_seed = _env_int("GAME_SEED", SEED_GLOBAL)
+    else:
+        game_seed = int(seed)
+    global _CURRENT_GAME_SEED
+    _CURRENT_GAME_SEED = game_seed
     env_run_id = os.getenv("RUN_ID", "").strip()
     if env_run_id:
         run_id = env_run_id
     else:
         run_id = f"run_{int(time.time())}_{uuid.uuid4().hex[:6]}"
-    set_seed(SEED_GLOBAL)
+    set_seed(game_seed)
     pathlib.Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
     if SAVE_CFG_SNAPSHOT:
         write_config_snapshot(CFG, RUN_CFG_PATH)
     with open(RUN_META_PATH, "w") as f:
         json.dump({
             "run_id": run_id,
-            "seed": SEED_GLOBAL,
+            "seed": game_seed,
             "timestamp": int(time.time()),
             "device": str(torch.device("cuda:0" if torch.cuda.is_available() else "cpu")),
             "policy": POLICY,
@@ -889,7 +925,7 @@ def simulate_game(visual: bool = True):
     lang_writer = None    # type: ignore
     if LangMetricsWriter is not None:
         try:
-            lang_writer = LangMetricsWriter(csv_path=LANG_METRICS_CSV, run_id=run_id, seed=SEED_GLOBAL)
+            lang_writer = LangMetricsWriter(csv_path=LANG_METRICS_CSV, run_id=run_id, seed=game_seed)
         except Exception:
             lang_writer = None
 
@@ -912,7 +948,7 @@ def simulate_game(visual: bool = True):
 
     agents = [BaseAgent(f"Agent_{i}") for i in range(NUM_AGENTS)]
     assert len(agents) == NUM_AGENTS, "[SANITY] agent list does not match NUM_AGENTS"
-    assign_roles(agents, NUM_WEREWOLVES)
+    assign_roles(agents, NUM_WEREWOLVES, seed=game_seed)
     if apply_personality is not None:
         apply_personality(agents)
     print("▶ Assigned roles:", ", ".join(f"{a.name}:{a.role}" for a in agents))
@@ -927,9 +963,24 @@ def simulate_game(visual: bool = True):
     for ag in agents:
         ag.message_encoder = shared_msg_encoder
 
+    # Load the shared, trained JEPA belief encoder once and give every agent the
+    # SAME instance (single consistent representational space, per the thesis).
+    shared_belief_encoder = load_shared_belief_encoder()
+    shared_belief_encoder.eval()
     for ag in agents:
-        wm, ae, planner = load_role_models(ag.role)
-        ag.world_model, ag.action_encoder, ag.planner = wm, ae, planner
+        ag.encoder = shared_belief_encoder
+
+    # Load the trained factorized world model + phase-action encoder + factorized
+    # planner per role, so decisions run on trained networks (previously the sim
+    # loaded a legacy '{role}_jepa.pt' that training never produced → untrained).
+    _factorized_cache: Dict[str, tuple] = {}
+    for ag in agents:
+        if ag.role not in _factorized_cache:
+            _factorized_cache[ag.role] = load_role_models_factorized(ag.role)
+        wm, pae, fplanner = _factorized_cache[ag.role]
+        ag.world_model = wm
+        ag.phase_action_encoder = pae
+        ag.planner_factorized = fplanner
 
     for ag in agents:
         _ensure_planner_heads_match_roster(ag, NUM_AGENTS)
@@ -981,9 +1032,13 @@ def simulate_game(visual: bool = True):
             for ag in living:
                 z_pre_talk[ag.name] = _finite(ag.encode_current_belief(round_num, agents).detach())
 
-        for ag in living:
+        # Each alive player speaks once per discussion turn, for DISCUSS_TURNS turns per
+        # day. Repeating `living` yields full speaking passes (previously the
+        # discuss_turns config was ignored and everyone spoke exactly once).
+        for ag in (living * DISCUSS_TURNS):
             try:
                 z_t_discuss = _finite(ag.encode_current_belief(round_num, agents).detach())
+                x_t_discuss_cur = getattr(ag, "_last_obs_x", None)  # raw obs behind z_t_discuss (for encoder training)
                 recent_texts = [m for (_n, m) in list(ag.message_memory)[-3:]] if getattr(ag, "message_memory", None) else []
                 fused = _fused_intent_for_agent(ag, z_t_discuss, recent_texts=recent_texts, alpha=ALPHA_INTENT_BIAS)
                 cat_id = int(fused["cat_id"].item())
@@ -1164,6 +1219,9 @@ def simulate_game(visual: bool = True):
                         "router_dbg": None,
                     })
                 ag.talk_category_last = int(cat_id)
+                # Track the directed target of this utterance (accuse/vote/defend/question)
+                # so talk→vote alignment can measure real consistency, not a constant lookup.
+                ag.talk_target_last_idx = arg_id if arg_id is not None else -1
 
                 try:
                     if hasattr(ag, "dialog_state") and hasattr(ag.dialog_state, "update_from_msg"):
@@ -1177,7 +1235,7 @@ def simulate_game(visual: bool = True):
                 try:
                     _lang_emit({
                         "run_id": run_id,
-                        "seed": SEED_GLOBAL,
+                        "seed": _CURRENT_GAME_SEED,
                         "phase": "DAY_DISCUSS",
                         "round": round_num,
                         "agent": ag.name,
@@ -1251,9 +1309,13 @@ def simulate_game(visual: bool = True):
                 try:
                     z_talk_pre = z_pre_talk.get(ag.name, z_t_discuss)
                     z_talk_post = _finite(ag.encode_current_belief(round_num, agents).detach())
+                    x_next_talk_cur = getattr(ag, "_last_obs_x", None)  # raw obs behind z_talk_post
                     talk_payload_t = torch.tensor(int(cat_id))
                     talk_aux = _aux_with_texts(ag, agents)
                     _check_aux(talk_aux, round_num=round_num, agent=ag.name)
+                    # Raw observations for JEPA encoder training (re-encoded at train time)
+                    talk_aux["x_t"] = x_t_discuss_cur
+                    talk_aux["x_next"] = x_next_talk_cur
                     rollout.append((
                         z_talk_pre,
                         torch.tensor(0),
@@ -1283,8 +1345,12 @@ def simulate_game(visual: bool = True):
         living = [a for a in agents if a.alive]
 
         z_pre_map: Dict[str, torch.Tensor] = {}
+        x_pre_map: Dict[str, torch.Tensor] = {}  # raw obs behind each z_pre (for encoder training)
         for ag in living:
             z_pre_map[ag.name] = _finite(ag.encode_current_belief(round_num, agents).detach())
+            _xp = getattr(ag, "_last_obs_x", None)
+            if _xp is not None:
+                x_pre_map[ag.name] = _xp
 
         per_agent_deltas: List[float] = []
         per_agent_stats: List[dict] = []
@@ -1436,8 +1502,7 @@ def simulate_game(visual: bool = True):
                     aux_snap,
                 )
                 print(f"Random→ {ag.name} votes {target_name}")
-                # approximate talk→vote alignment based on last talk category
-                align_tv = _talk_vote_alignment(int(getattr(ag, "talk_category_last", -1)))
+                align_tv = _talk_vote_align_real(ag, tgt_idx)
                 emit_event(
                     metrics_rows,
                     run_id=run_id, round_num=round_num,
@@ -1454,7 +1519,7 @@ def simulate_game(visual: bool = True):
                 try:
                     _lang_emit({
                         "run_id": run_id,
-                        "seed": SEED_GLOBAL,
+                        "seed": _CURRENT_GAME_SEED,
                         "phase": "DAY_VOTE",
                         "round": round_num,
                         "agent": ag.name,
@@ -1484,7 +1549,7 @@ def simulate_game(visual: bool = True):
                     aux_snap,
                 )
                 print(f"Heuristic→ {ag.name} votes {target_name}")
-                align_tv = _talk_vote_alignment(int(getattr(ag, "talk_category_last", -1)))
+                align_tv = _talk_vote_align_real(ag, tgt_idx)
                 emit_event(
                     metrics_rows,
                     run_id=run_id, round_num=round_num,
@@ -1501,7 +1566,7 @@ def simulate_game(visual: bool = True):
                 try:
                     _lang_emit({
                         "run_id": run_id,
-                        "seed": SEED_GLOBAL,
+                        "seed": _CURRENT_GAME_SEED,
                         "phase": "DAY_VOTE",
                         "round": round_num,
                         "agent": ag.name,
@@ -1534,7 +1599,7 @@ def simulate_game(visual: bool = True):
                     aux_snap,
                 )
                 print(f"JepaOnly→ {ag.name} votes {target.name}")
-                align_tv = _talk_vote_alignment(int(getattr(ag, "talk_category_last", -1)))
+                align_tv = _talk_vote_align_real(ag, tgt_idx)
                 emit_event(
                     metrics_rows,
                     run_id=run_id, round_num=round_num,
@@ -1551,7 +1616,7 @@ def simulate_game(visual: bool = True):
                 try:
                     _lang_emit({
                         "run_id": run_id,
-                        "seed": SEED_GLOBAL,
+                        "seed": _CURRENT_GAME_SEED,
                         "phase": "DAY_VOTE",
                         "round": round_num,
                         "agent": ag.name,
@@ -1592,7 +1657,7 @@ def simulate_game(visual: bool = True):
                     aux_snap,
                 )
                 print(f"PlannerNoJudge→ {ag.name} votes {best_name}")
-                align_tv = _talk_vote_alignment(int(getattr(ag, "talk_category_last", -1)))
+                align_tv = _talk_vote_align_real(ag, tgt_idx)
                 emit_event(
                     metrics_rows,
                     run_id=run_id, round_num=round_num,
@@ -1610,7 +1675,7 @@ def simulate_game(visual: bool = True):
                 try:
                     _lang_emit({
                         "run_id": run_id,
-                        "seed": SEED_GLOBAL,
+                        "seed": _CURRENT_GAME_SEED,
                         "phase": "DAY_VOTE",
                         "round": round_num,
                         "agent": ag.name,
@@ -1628,20 +1693,18 @@ def simulate_game(visual: bool = True):
                 "candidate": _candidate_text(name),
             } for (name, _p) in topk]
 
-            align_tv = _talk_vote_alignment(int(getattr(ag, "talk_category_last", -1)))
-            align_vec = [align_tv for _ in range(len(judge_items))]
-
-            try:
-                _lang_emit({
-                    "run_id": run_id,
-                    "seed": SEED_GLOBAL,
-                    "phase": "DAY_VOTE",
-                    "round": round_num,
-                    "agent": ag.name,
-                    "align_tv": float(align_tv),
-                })
-            except Exception:
-                pass
+            # Per-candidate talk→vote alignment for the judge: 1.0 if the candidate is
+            # the target the agent accused/proposed this round, else 0.0.
+            _tt = int(getattr(ag, "talk_target_last_idx", -1))
+            _tcat = int(getattr(ag, "talk_category_last", -1))
+            def _cand_align(nm: str) -> float:
+                if _tcat not in (0, 4) or _tt < 0:
+                    return 0.0
+                try:
+                    return 1.0 if int(nm.split("_")[1]) == _tt else 0.0
+                except Exception:
+                    return 0.0
+            align_vec = [_cand_align(nm) for (nm, _p) in topk]
 
             judged = score_batch(
                 judge_items, judge_rubric,
@@ -1659,6 +1722,19 @@ def simulate_game(visual: bool = True):
 
             vote_map[ag] = target
             tgt_idx = int(target.name.split('_')[1])
+            # Real talk→vote alignment: did the agent vote for whom it accused/proposed?
+            align_tv = _talk_vote_align_real(ag, tgt_idx)
+            try:
+                _lang_emit({
+                    "run_id": run_id,
+                    "seed": _CURRENT_GAME_SEED,
+                    "phase": "DAY_VOTE",
+                    "round": round_num,
+                    "agent": ag.name,
+                    "align_tv": float(align_tv),
+                })
+            except Exception:
+                pass
             a_idx = torch.tensor(int(tgt_idx))
             aux_snap = _aux_with_texts(ag, agents)
             _check_aux(aux_snap, round_num=round_num, agent=ag.name)
@@ -1867,7 +1943,7 @@ def simulate_game(visual: bool = True):
                     try:
                         _lang_emit({
                             "run_id": run_id,
-                            "seed": SEED_GLOBAL,
+                            "seed": _CURRENT_GAME_SEED,
                             "phase": "NIGHT_DISCUSS",
                             "round": round_num,
                             "agent": wolf.name,
@@ -2002,7 +2078,9 @@ def simulate_game(visual: bool = True):
                     print(f"WolfVote→ {wolf.name} votes {target_name}")
 
             tally_list = list(wolf_choices.values())
-            night_choice = consensus_target(tally_list, temperature=0.7)
+            # Thesis night-kill rule: p_i ∝ exp(c_i / max_c). temperature=1.0 and
+            # sampling via the seeded global RNG (no majority short-circuit).
+            night_choice = consensus_target(tally_list, temperature=1.0)
             if night_choice and (night_choice in legal_targets):
                 victim = next((a for a in agents if a.name == night_choice and a.alive), None)
             else:
@@ -2044,8 +2122,13 @@ def simulate_game(visual: bool = True):
         for ag in agents:
             if ag.name in pending:
                 z_next = _finite(ag.encode_current_belief(round_num + 1, agents).detach())
+                x_next_cur = getattr(ag, "_last_obs_x", None)  # raw obs behind z_next
                 z_t, ph_code, payload_idx, role, choice_type, aux = pending[ag.name]
                 _check_aux(aux, round_num=round_num, agent=ag.name)
+                # Raw observations for JEPA encoder training (re-encoded at train time)
+                if isinstance(aux, dict):
+                    aux.setdefault("x_t", x_pre_map.get(ag.name))
+                    aux["x_next"] = x_next_cur
                 rollout.append((
                     z_t,
                     torch.tensor(int(ph_code)),

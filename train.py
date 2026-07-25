@@ -36,6 +36,7 @@ from training_utils import (         # noqa: E402
     load_role_models,
     load_role_models_phase,
     load_role_models_factorized,
+    load_shared_belief_encoder,
     run_sim_and_collect_rollouts,
     train_jepa,
     train_jepa_phaseaware,
@@ -225,7 +226,9 @@ def _train_speakers_from_agents(agents: List[Any], rubric: JudgeRubric) -> None:
         batch = [m for m in ag.msg_buffer if m.get("reward") is not None]
         if not batch:
             continue
-        stats = ag.speaker.learn_step(batch, ag.speaker_opt, entropy_bonus=0.01, baseline=0.0)
+        # Use the bandit's EMA reward baseline (baseline=None activates it) for
+        # REINFORCE variance reduction, per the thesis, instead of a fixed 0.0.
+        stats = ag.speaker.learn_step(batch, ag.speaker_opt, entropy_bonus=0.01, baseline=None)
 
         # Optional: compact component stats to sanity-check variation
         try:
@@ -413,6 +416,14 @@ def _log_social_stats_if_any(meta: Dict[str, Any]) -> None:
 
 _SIM_EXPECTED: int = 0
 _SIM_DONE: int = 0
+# Base seed for the run; each collected game derives a distinct seed from this so
+# that repeated games are independent draws (fixes the identical-games bug where
+# every game reset to the same constant seed).
+RUN_BASE_SEED: int = 1337
+
+def _game_seed_for(index: int) -> int:
+    """Deterministic-but-distinct per-game seed derived from the run base seed."""
+    return (int(RUN_BASE_SEED) * 1_000_003 + int(index) * 9973 + 1) % (2**31 - 1)
 
 def _compute_expected_sims(outer_cycles: int, games_per_cycle: int, speaker_enabled: bool) -> int:
     """
@@ -426,7 +437,8 @@ def _compute_expected_sims(outer_cycles: int, games_per_cycle: int, speaker_enab
 def _run_sim_and_count(label: str = "core"):
     """Wrapper that runs one simulation, increments the global counter, and prints progress."""
     global _SIM_DONE, _SIM_EXPECTED
-    sim_ret = run_sim_and_collect_rollouts(visual=False)
+    game_seed = _game_seed_for(_SIM_DONE)
+    sim_ret = run_sim_and_collect_rollouts(visual=False, seed=game_seed)
     _SIM_DONE += 1
     try:
         print(f"[PROGRESS] game {_SIM_DONE}/{_SIM_EXPECTED} ({label})")
@@ -558,6 +570,8 @@ def main() -> None:
     seed = int(args.seed)
 
     set_global_determinism(seed)
+    global RUN_BASE_SEED
+    RUN_BASE_SEED = int(seed)
     # PATCH: timezone-aware UTC
     run_id = f"train_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_seed{seed}"
     save_run_config(run_id, CFG)
@@ -603,6 +617,11 @@ def main() -> None:
     # Pre-create or load mouthpieces, if available
     for role_name in (WEREWOLF, VILLAGER):
         _ensure_mouthpiece_for_role(role_name)
+
+    # Shared JEPA belief encoder (single representational space across roles/agents).
+    # Trained in-place across both roles each cycle so gradients reach the encoder,
+    # then persisted to checkpoints/belief_encoder.pt for the simulator to load.
+    shared_belief_encoder = load_shared_belief_encoder()
 
     # For JEPA eval aggregation across cycles
     eval_cache: Dict[str, Dict[str, float]] = {}
@@ -687,8 +706,9 @@ def main() -> None:
                         run_id=run_id,
                         epoch_logger=epoch_logger,
                         epochs=epochs, batch_size=batch_size, learning_rate=lr,
+                        belief_encoder=shared_belief_encoder,
                     )
-                    eval_metrics = evaluate_jepa_factorized(role_rollouts, world_model, phase_action_encoder, fplanner)
+                    eval_metrics = evaluate_jepa_factorized(role_rollouts, world_model, phase_action_encoder, fplanner, belief_encoder=shared_belief_encoder)
 
                     # Optional coalition probe, Werewolf only
                     if role_name == WEREWOLF and COAL_COMPARE:

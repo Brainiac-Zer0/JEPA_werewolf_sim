@@ -369,6 +369,10 @@ class SpeakerBandit(nn.Module):
         self._latent_dim = latent_dim
         self._hidden = hidden
         self._mlp: Optional[nn.Sequential] = None  # lazy init to match feat size at runtime
+        # REINFORCE variance-reduction baseline (EMA of observed rewards).
+        self.reward_baseline: float = 0.0
+        self.baseline_ema: float = 0.9
+        self._baseline_initialized: bool = False
 
     def _build(self, in_features: int):
         self._mlp = nn.Sequential(
@@ -502,8 +506,21 @@ class SpeakerBandit(nn.Module):
         logps = torch.log_softmax(logits, dim=-1)
         sel_logp = logps.gather(1, tids.unsqueeze(1)).squeeze(1)
 
-        if baseline is not None:
-            rewards = rewards - baseline
+        # Variance-reduction baseline. When an explicit baseline is passed we use it;
+        # otherwise we use (and update) an EMA of observed rewards, per the thesis's
+        # REINFORCE formulation L = -(R - b) * log pi(template | z, intent).
+        batch_R_mean = float(rewards.mean().item())
+        if baseline is None:
+            b = float(self.reward_baseline) if self._baseline_initialized else batch_R_mean
+        else:
+            b = float(baseline)
+        rewards = rewards - b
+        # Update EMA baseline from the raw batch mean for next step.
+        if not self._baseline_initialized:
+            self.reward_baseline = batch_R_mean
+            self._baseline_initialized = True
+        else:
+            self.reward_baseline = self.baseline_ema * self.reward_baseline + (1.0 - self.baseline_ema) * batch_R_mean
 
         ent = -(logps.exp() * logps).sum(dim=-1).mean()
         loss = -(rewards * sel_logp).mean() - entropy_bonus * ent

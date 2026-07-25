@@ -177,24 +177,46 @@ def _derive_effects(p: Dict[str, float]) -> Dict[str, float]:
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-def assign_roles(agent_list: List[Any], num_werewolves: int) -> None:
+def assign_roles(agent_list: List[Any], num_werewolves: int, seed: Optional[int] = None) -> None:
     """
-    Deterministic role assignment using config seeds (if provided).
+    Deterministic role assignment.
+
+    If ``seed`` is provided (per-game seed threaded from the training/eval loop),
+    role shuffling and persona sampling are derived from it so that each game is a
+    distinct-but-reproducible draw. If ``seed`` is None, we fall back to the
+    config-level seeds (legacy single-game behavior).
+
     Mutates agents in-place; does NOT return.
     """
     n = len(agent_list)
     if num_werewolves < 0 or num_werewolves > n:
         raise ValueError(f"num_werewolves={num_werewolves} out of range for n_agents={n}")
 
-    # Separate RNGs so shuffling and persona sampling are reproducible
-    rng_roles   = _rng(_resolve_run_seed())
-    rng_persona = _rng(_resolve_persona_seed())
+    # Separate RNGs so shuffling and persona sampling are reproducible.
+    # When a per-game seed is supplied, derive both streams from it so that
+    # repeated games in a run are independent rather than identical.
+    if seed is not None:
+        base_seed = int(seed)
+        rng_roles = _rng(base_seed)
+        # Only override the persona stream from the game seed when no explicit
+        # persona seed was configured; otherwise honor the configured persona seed.
+        if PERSONA_SEED_CFG is None and PERSONA_SEED_LEG is None:
+            rng_persona = _rng(base_seed + 101)
+        else:
+            rng_persona = _rng(_resolve_persona_seed())
+    else:
+        rng_roles   = _rng(_resolve_run_seed())
+        rng_persona = _rng(_resolve_persona_seed())
 
     roles = [WEREWOLF] * num_werewolves + [VILLAGER] * (n - num_werewolves)
     rng_roles.shuffle(roles)
 
     for agent, role in zip(agent_list, roles):
         agent.role = role
+        # Ground-truth wolf flag (used by make_aux to build kill/vote legality masks
+        # for training). This is training metadata, not an agent observation, so it
+        # does not leak wolf identity into villager belief inputs.
+        agent.is_wolf = (role == WEREWOLF)
 
         # Persona: either assign a role-biased random vector, or a neutral one
         if PERSONA_ENABLED:

@@ -713,11 +713,11 @@ class IntentFusionProcessor(nn.Module):
             return F.log_softmax(bias_logits, dim=-1)
         if bias_logits is None:
             return F.log_softmax(intent_logits, dim=-1)
-        p_int  = F.softmax(intent_logits, dim=-1)
-        p_bias = F.softmax(bias_logits,   dim=-1)
-        p = (self._alpha * p_int) + ((1.0 - self._alpha) * p_bias)
-        p = (p + 1e-8) / (p.sum(dim=-1, keepdim=True) + 1e-8)
-        return torch.log(p)
+        # Thesis fusion (Sec. 3.6): combine the two logit-bias contributions in
+        # logit space, b = α·b_planner + (1-α)·b_bias, then sample from softmax(b).
+        # (Previously this mixed softmax probabilities, which is not softmax(logits+b).)
+        fused_logits = (self._alpha * intent_logits) + ((1.0 - self._alpha) * bias_logits)
+        return F.log_softmax(fused_logits, dim=-1)
 
 # ───────────────────────── α-fusion helpers (exposed) ─────────────────────────
 _FUSION_ALPHA_DEFAULT = float(os.getenv("FUSION_ALPHA", os.getenv("TALK_FUSION_ALPHA", str(FUSION_ALPHA))))

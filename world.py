@@ -69,6 +69,7 @@ def consensus_target(
     *,
     temperature: float = 1.0,
     rng: Optional[random.Random] = None,
+    use_majority_shortcut: bool = False,
 ) -> Optional[str]:
     """
     Pick a consensus victim from wolf night-discussion tallies.
@@ -96,11 +97,12 @@ def consensus_target(
         # all zeros → fall back to alphabetical first for stability
         return items[0][0]
 
-    # majority check
-    # use deterministic order for tie-breaking (items sorted by name asc)
+    # deterministic order for tie-breaking (items sorted by name asc)
     items_by_count = sorted(items, key=lambda kv: (-kv[1], kv[0]))
     top_name, top_count = items_by_count[0]
-    if top_count > (0.5 * total):
+    # Optional majority short-circuit. Off by default so behavior matches the
+    # thesis, which always samples a victim from the softmax over counts.
+    if use_majority_shortcut and top_count > (0.5 * total):
         return top_name
 
     # softmax fallback
@@ -126,8 +128,11 @@ def consensus_target(
 
     probs = [e / Z for e in exps]
 
-    # deterministic by default unless rng is provided by caller
-    r = rng if rng is not None else random.Random(0)
+    # Sample using the caller's RNG when given, else the module-global `random`,
+    # which the simulator seeds per game (set_seed(game_seed)). This ties night-kill
+    # sampling to the run seed instead of a fixed Random(0) that always biased the
+    # outcome toward the alphabetically-later target.
+    r = rng if rng is not None else random
     u = r.random()
     acc = 0.0
     for (name, _), p in zip(items, probs):
