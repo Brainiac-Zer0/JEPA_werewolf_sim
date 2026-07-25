@@ -1,0 +1,2 @@
+baseline,games_counted,villager_win_rate_mean,villager_win_rate_lo,villager_win_rate_hi,vote_accuracy_mean,vote_accuracy_lo,vote_accuracy_hi,judge_accept_mean,judge_accept_lo,judge_accept_hi,dz_mse_mean,dz_mse_lo,dz_mse_hi
+B2_jepa_planner,2,0.0,0.0,0.0,0.3415032679738562,0.29411764705882354,0.3888888888888889,nan,nan,nan,0.12710879867275554,0.12688527173466152,0.1273323256108496

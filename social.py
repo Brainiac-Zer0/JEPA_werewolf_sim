@@ -7,6 +7,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+# Canonical role names (villager role is configured as "Worker", not "Villager").
+try:
+    from roles import WEREWOLF as _WW_NAME, VILLAGER as _VL_NAME
+except Exception:  # pragma: no cover - fallback if roles not importable
+    _WW_NAME, _VL_NAME = "Werewolf", "Worker"
+
 # ------------------------------ helpers -------------------------------------
 
 def _as_2d(x: torch.Tensor) -> torch.Tensor:
@@ -79,12 +85,14 @@ class SocialInfluence(nn.Module):
         self.clamp_coef = float(max(0.0, clamp_coef))
         self.device = device
 
-        # Default 2x2 role affinity table
+        # Default 2x2 role affinity table, keyed by the configured role names
+        # (villager role is "Worker"). Previously this was hardcoded to
+        # "Villager"/"Werewolf", so every lookup missed and fell back to 0.5.
         self.role_affinity = role_affinity or {
-            ("Villager", "Villager"): 1.0,
-            ("Villager", "Werewolf"): 0.5,
-            ("Werewolf", "Villager"): 0.2,
-            ("Werewolf", "Werewolf"): 0.8,
+            (_VL_NAME, _VL_NAME): 1.0,
+            (_VL_NAME, _WW_NAME): 0.5,
+            (_WW_NAME, _VL_NAME): 0.2,
+            (_WW_NAME, _WW_NAME): 0.8,
         }
 
         # small MLP: input = latent_dim + 1 (for sim feature)

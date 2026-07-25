@@ -118,7 +118,13 @@ def leaks_hidden_info(text: str, role: str, phase: str, *, allow_seer: bool = Fa
 # ── Config values (env → YAML → defaults)
 MODEL_ID_DEFAULT = CFG.get("LLM_MODEL_ID", "o4-mini")
 DEVICE_CFG       = str(CFG.get("LLM_DEVICE", "")).strip().lower()
-PROVIDER_DEFAULT = _env_str("LLM_PROVIDER", "hf").strip().lower()
+# Provider precedence: env LLM_PROVIDER → config LLM_PROVIDER / llm.provider → "hf".
+# (Previously this ignored config, so the speaker could default to HF while the
+# judge, which reads config, used OpenAI — an inconsistent split backend.)
+_PROVIDER_CFG_DEFAULT = str(
+    CFG.get("LLM_PROVIDER", (CFG.get("llm", {}) or {}).get("provider", "hf"))
+).strip().lower()
+PROVIDER_DEFAULT = _env_str("LLM_PROVIDER", _PROVIDER_CFG_DEFAULT).strip().lower()
 
 # ── Hygiene helpers
 BAD_QUOTES = "“”\"'«»"

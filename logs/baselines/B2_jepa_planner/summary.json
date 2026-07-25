@@ -1,0 +1,22 @@
+{
+  "baseline": "B2_jepa_planner",
+  "games_counted": 2,
+  "by_seed": {
+    "1337": 2
+  },
+  "villager_win_rate_mean": 0.0,
+  "villager_win_rate_lo": 0.0,
+  "villager_win_rate_hi": 0.0,
+  "vote_accuracy_mean": 0.3415032679738562,
+  "vote_accuracy_lo": 0.29411764705882354,
+  "vote_accuracy_hi": 0.3888888888888889,
+  "judge_accept_mean": NaN,
+  "judge_accept_lo": NaN,
+  "judge_accept_hi": NaN,
+  "talk_vote_align_mean": 1.0,
+  "talk_vote_align_lo": 1.0,
+  "talk_vote_align_hi": 1.0,
+  "dz_mse_mean": 0.12710879867275554,
+  "dz_mse_lo": 0.12688527173466152,
+  "dz_mse_hi": 0.1273323256108496
+}

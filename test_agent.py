@@ -1,41 +1,36 @@
+import torch
 from agent import BaseAgent
-
-def test_agent_lifecycle():
-    alice = BaseAgent("Alice")
-    bob = BaseAgent("Bob")
-    charlie = BaseAgent("Charlie")
-
-    agents = [alice, bob, charlie]
-
-    # Assign dummy roles for now
-    alice.role = "Werewolf"
-    bob.role = "Villager"
-    charlie.role = "Villager"
-
-    # Mark Bob as dead
-    bob.alive = False
-
-    # Assign dummy last messages
-    alice.last_message = "I’m innocent."
-    bob.last_message = "Trust me."
-    charlie.last_message = "Lynch the werewolf."
-
-    # Observe
-    print("=== Alice's Observation ===")
-    print(alice.observe(agents))  # Should not include Alice or dead Bob
-
-    # Vote
-    print("=== Charlie Votes ===")
-    print("Charlie votes to eliminate:", charlie.vote(agents))  # Should not vote for self
-
-    # Night target
-    print("=== Alice (Werewolf) Chooses Night Target ===")
-    print("Target:", alice.choose_night_target(agents))  # Should not pick self or Bob (dead)
-
-    # Encode dummy beliefs
-    print("=== Encoded belief vector ===")
-    print(alice.encode_current_belief())  # Placeholder vector
+from roles import assign_roles
 
 
-if __name__ == "__main__":
-    test_agent_lifecycle()
+def _make_agents(n=3):
+    agents = [BaseAgent(f"Agent_{i}") for i in range(n)]
+    assign_roles(agents, 1, seed=1337)
+    return agents
+
+
+def test_encode_belief_shape():
+    agents = _make_agents(3)
+    a = agents[0]
+    z = a.encode_current_belief(round_num=1, agents=agents)
+    assert torch.is_tensor(z)
+    assert z.dim() == 1 and z.numel() > 0
+    assert torch.isfinite(z).all()
+
+
+def test_encode_stashes_raw_obs():
+    # The trainer relies on _last_obs_x being captured for JEPA encoder training.
+    agents = _make_agents(3)
+    a = agents[0]
+    a.encode_current_belief(round_num=1, agents=agents)
+    assert hasattr(a, "_last_obs_x")
+    assert torch.is_tensor(a._last_obs_x)
+
+
+def test_observe_excludes_self_and_dead():
+    agents = _make_agents(3)
+    agents[1].alive = False
+    observed = agents[0].observe(agents)
+    names = {n for (n, _m) in observed}
+    assert agents[0].name not in names
+    assert agents[1].name not in names

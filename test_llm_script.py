@@ -1,6 +1,15 @@
 # test_llm_script.py
-from llm_script import chatgpt_llm_from_latent
+import os
+import pytest
 import torch
+from llm_script import chatgpt_llm_from_latent
+
+# These exercise the OpenAI speaker backend; skip when it isn't configured
+# (offline/CI). Run with LLM_PROVIDER=openai and OPENAI_API_KEY set.
+pytestmark = pytest.mark.skipif(
+    os.getenv("LLM_PROVIDER", "").lower() != "openai" or not os.getenv("OPENAI_API_KEY"),
+    reason="OpenAI speaker backend not configured (set LLM_PROVIDER=openai + OPENAI_API_KEY)",
+)
 
 class DummyAgent:
     def __init__(self, name, role):

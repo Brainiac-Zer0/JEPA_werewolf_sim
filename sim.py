@@ -307,11 +307,18 @@ DISCUSS_TURNS = max(1, _env_int("DISCUSS_TURNS", DISCUSS_TURNS))
 
 # Judge availability toggle and helper
 JUDGE_ENABLED = _env_bool("JUDGE_ENABLED", True)
+# Judge backend provider: openai needs an API key; local providers (hf/…) do not.
+JUDGE_PROVIDER = _env_str(
+    "JUDGE_PROVIDER",
+    str(CFG.get("JUDGE_PROVIDER", CFG.get("LLM_PROVIDER", "openai")))
+).strip().lower()
 def _can_use_judge() -> bool:
     if not JUDGE_ENABLED:
         return False
-    key = os.getenv("OPENAI_API_KEY", "").strip()
-    return key != ""
+    # Only the OpenAI backend requires a key; a local HF judge can run offline.
+    if JUDGE_PROVIDER in ("openai", "oai", "azure", "azure_openai"):
+        return os.getenv("OPENAI_API_KEY", "").strip() != ""
+    return True
 
 if not USE_LANGUAGE:
     LLM_SPK_ENABLED = False
@@ -929,7 +936,18 @@ def simulate_game(visual: bool = True, seed: int | None = None):
         except Exception:
             lang_writer = None
 
+    _talk_align_accum: List[float] = []
+
     def _lang_emit(row: dict):
+        # Accumulate talk→vote alignment values for the per-game outcome summary.
+        try:
+            v = row.get("align_tv", None)
+            if v is not None:
+                fv = float(v)
+                if fv == fv:  # not NaN
+                    _talk_align_accum.append(fv)
+        except Exception:
+            pass
         if lang_writer is not None:
             if hasattr(lang_writer, "write"):
                 return lang_writer.write(row)
@@ -2224,6 +2242,25 @@ def simulate_game(visual: bool = True, seed: int | None = None):
         "num_agents": 0,
     }]
 
+    # ---- Per-game outcome summary (consumed by the baseline-ladder / sweep runners) ----
+    _wolves_final = [a for a in agents if a.alive and a.role == WEREWOLF]
+    _villager_win = (len(_wolves_final) == 0)
+    _vote_rows = [r for r in metrics_rows
+                  if r.get("phase") == "DAY_VOTE" and r.get("role") != WEREWOLF]
+    _acc = [float(r["target_is_wolf"]) for r in _vote_rows
+            if str(r.get("target_is_wolf", "")).strip() not in ("", "None")]
+    _vill_vote_acc = (sum(_acc) / len(_acc)) if _acc else float("nan")
+    _jrows = [r for r in metrics_rows
+              if str(r.get("judge_score", "")).strip() not in ("", "None")]
+    _jacc = float("nan")
+    if _jrows:
+        try:
+            _js = [float(r["judge_score"]) for r in _jrows]
+            _jacc = sum(1.0 for s in _js if s >= 0.5) / len(_js)
+        except Exception:
+            _jacc = float("nan")
+    _tv_align = (sum(_talk_align_accum) / len(_talk_align_accum)) if _talk_align_accum else float("nan")
+
     meta_out = {
         "rounds": round_num,
         "agents": agents,
@@ -2232,6 +2269,15 @@ def simulate_game(visual: bool = True, seed: int | None = None):
         "mask_logs": mask_logs,
         "social_stats": _social_stats,
         "policy": POLICY,
+        "outcome": {
+            "winner": "villagers" if _villager_win else "werewolves",
+            "villager_win": bool(_villager_win),
+            "vill_vote_accuracy": float(_vill_vote_acc),
+            "judge_accept": float(_jacc),
+            "talk_vote_align": float(_tv_align),
+            "rounds": int(round_num),
+            "seed": int(game_seed),
+        },
     }
     return rollout, meta_out
 

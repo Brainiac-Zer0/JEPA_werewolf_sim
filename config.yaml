@@ -392,7 +392,7 @@ determinism:
   cudnn_benchmark: false
 seed: 1337
 seeds:
-  global: 123
+  global: 1337
 telemetry:
   enabled: true
   out_dir: logs

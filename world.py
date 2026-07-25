@@ -231,6 +231,10 @@ def eliminate_player(agent):
 
 def night_kill_detailed(agents) -> Dict[str, Optional[str]]:
     """
+    DEPRECATED / UNUSED. Legacy single-wolf night kill that contradicts the thesis
+    (no multi-wolf aggregation, no exp(c_i/max_c) softmax). The live path is
+    ``consensus_target`` (used by sim.py); kept only for backward compatibility.
+
     Structured night kill:
       - chooses the first living werewolf as 'killer'
       - asks killer.choose_night_target(villagers) for target_name

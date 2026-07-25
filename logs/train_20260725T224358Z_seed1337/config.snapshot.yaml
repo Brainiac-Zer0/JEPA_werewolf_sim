@@ -359,7 +359,7 @@ runtime:
   save_config_snapshot: true
 seed: 1337
 seeds:
-  global: 1337
+  global: 123
 sim:
   discuss_turns: 2
   env_aliases:
