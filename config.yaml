@@ -11,7 +11,9 @@ PERSONA_SCALE: 0.2
 PERSONA_SEED: null
 PERSONA_CONFIG_PATH: configs/persona_vectors.yaml
 INCLUDE_RATIONALE: true
-ENABLE_PERSONA_STEER: false
+ENABLE_PERSONA_STEER: true
+# Scale on the persona->talk-intent bias (RQ5). 0 disables; 1.0 default.
+PERSONA_STEER_SCALE: 1.0
 DEBUG: false
 debug:
   llm_gate_strict: false
@@ -406,6 +408,14 @@ logging:
   debug: false
 runtime:
   save_config_snapshot: true
+# Top-level encoders config (read by encoders.py as config["encoders"]).
+encoders:
+  regularization:
+    # FEP-inspired planner regularization (RQ2), consumed in train_jepa_factorized.
+    # talk_entropy_w penalizes talk-intent entropy (more decisive planning);
+    # talk_kl_uniform_w pulls toward a uniform prior (preserves exploration).
+    talk_entropy_w: 0.01
+    talk_kl_uniform_w: 0.0
 PHASE_AWARE_JEPA: true
 TRAIN_PHASE_HEADS: true
 TELEMETRY_ENABLED: true

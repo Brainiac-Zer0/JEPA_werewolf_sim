@@ -1,0 +1,23 @@
+{
+  "baseline": "B1_planner_social",
+  "games_counted": 40,
+  "by_seed": {
+    "1337": 20,
+    "2718": 20
+  },
+  "villager_win_rate_mean": 0.325,
+  "villager_win_rate_lo": 0.175,
+  "villager_win_rate_hi": 0.475,
+  "vote_accuracy_mean": 0.2796377278981768,
+  "vote_accuracy_lo": 0.2183738551341589,
+  "vote_accuracy_hi": 0.3413214170536636,
+  "judge_accept_mean": NaN,
+  "judge_accept_lo": NaN,
+  "judge_accept_hi": NaN,
+  "talk_vote_align_mean": 1.0,
+  "talk_vote_align_lo": 1.0,
+  "talk_vote_align_hi": 1.0,
+  "dz_mse_mean": 0.16298940855832328,
+  "dz_mse_lo": 0.1574072518612864,
+  "dz_mse_hi": 0.16834448468605323
+}

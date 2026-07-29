@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from torch.cuda import amp as torch_amp
 
 from encoders import ActionEncoder, PlannerHead, WorldModelMLP, MLPBeliefEncoder, INPUT_DIM as INPUT_DIM_CFG
+from encoders import TALK_ENTROPY_W, TALK_KL_UNIF_W  # FEP-inspired planner regularization weights
 # Phase-aware + factorized planner path
 from encoders import PhaseActionEncoder  # learnable, persisted
 try:
@@ -1078,6 +1079,19 @@ def train_jepa_factorized(
                     if vals:
                         L_soc = torch.tensor(sum(vals)/len(vals), device=DEVICE)
 
+                # FEP-inspired planning regularization (RQ2): an entropy term on the
+                # talk-intent distribution ("penalize entropy" → more decisive plans)
+                # plus a KL-to-uniform term (a prior pull that preserves exploration
+                # when uncertain). Both weights default to 0 in config; set >0 to enable.
+                L_fep = torch.tensor(0.0, device=DEVICE)
+                if TALK_ENTROPY_W != 0.0 or TALK_KL_UNIF_W != 0.0:
+                    talk_logp = F.log_softmax(logits["talk"], dim=-1)
+                    talk_p = talk_logp.exp()
+                    ent = -(talk_p * talk_logp).sum(dim=-1).mean()            # H(talk)
+                    K = talk_logp.size(-1)
+                    kl_unif = (talk_p * (talk_logp + math.log(K))).sum(dim=-1).mean()  # KL(p‖uniform)
+                    L_fep = TALK_ENTROPY_W * ent + TALK_KL_UNIF_W * kl_unif
+
                 loss = (
                     L_mse
                     + (LAMBDA_TALK * L_talk)
@@ -1085,6 +1099,7 @@ def train_jepa_factorized(
                     + (lambda_role * L_role)
                     + L_lc
                     + (lambda_reg * L_soc)
+                    + L_fep
                 )
 
             optimizer.zero_grad(set_to_none=True)

@@ -304,6 +304,11 @@ LOG_DZ_KILL    = _env_bool("LOG_DZ_KILL", LOG_DZ_KILL)
 ALPHA_INTENT_BIAS = _env_float("ALPHA_INTENT_BIAS", ALPHA_INTENT_BIAS)
 SEED_GLOBAL = _env_int("SEED_GLOBAL", SEED_GLOBAL)
 DISCUSS_TURNS = max(1, _env_int("DISCUSS_TURNS", DISCUSS_TURNS))
+# Personality steering of the PLANNER (RQ5): when on, an agent's persona biases its
+# talk-intent selection (e.g. low-agreeableness/high-extraversion → more accusing).
+# Previously personas only affected the language surface, never the plan.
+ENABLE_PERSONA_STEER = _env_bool("ENABLE_PERSONA_STEER", bool(CFG.get("ENABLE_PERSONA_STEER", False)))
+PERSONA_STEER_SCALE = float(CFG.get("PERSONA_STEER_SCALE", 1.0))
 
 # Judge availability toggle and helper
 JUDGE_ENABLED = _env_bool("JUDGE_ENABLED", True)
@@ -467,6 +472,29 @@ def _finite_mean(xs: List[float]) -> float:
         return float("nan")
     return float(sum(vals) / len(vals))
 
+def _persona_talk_bias(ag: BaseAgent, num_cats: int, device) -> Optional[torch.Tensor]:
+    """
+    Persona-derived additive bias over talk-intent categories
+    (0 accuse, 1 defend, 2 hedge, 3 question, 4 vote). Gated by ENABLE_PERSONA_STEER.
+    Makes personality produce distinct *planning* styles, not just phrasing.
+    """
+    if not ENABLE_PERSONA_STEER:
+        return None
+    eff = getattr(ag, "persona_effects", None)
+    if not isinstance(eff, dict):
+        return None
+    b = torch.zeros(num_cats, device=device)
+    accuse_boost = (float(eff.get("accuse_bias_scale", 1.0)) - 1.0)   # ~[-0.5, +0.5]
+    hedge_boost = float(eff.get("hedge_prob_boost", 0.0)) * 2.0       # ~[-0.16, +0.24]
+    if num_cats > 0:
+        b[0] += accuse_boost                       # accuse
+    if num_cats > 4:
+        b[4] += 0.5 * accuse_boost                 # explicit vote (assertiveness)
+    if num_cats > 2:
+        b[2] += hedge_boost                        # hedge
+    return b * PERSONA_STEER_SCALE
+
+
 @torch.no_grad()
 def _fused_intent_for_agent(ag: BaseAgent, z_t: torch.Tensor, *, recent_texts: List[str], alpha: Optional[float] = None) -> Dict[str, torch.Tensor]:
     th_logits = None
@@ -476,6 +504,10 @@ def _fused_intent_for_agent(ag: BaseAgent, z_t: torch.Tensor, *, recent_texts: L
             num_cats = int(getattr(fp.talk.net[-1], "out_features", 5))  # type: ignore
             mask = torch.ones(1, num_cats, dtype=torch.bool, device=z_t.device)
             th_logits = fp.talk(z_t.unsqueeze(0), mask=mask).squeeze(0).float().detach()
+            # Personality steering of the plan (RQ5).
+            pbias = _persona_talk_bias(ag, num_cats, z_t.device)
+            if pbias is not None:
+                th_logits = th_logits + pbias
     except Exception:
         th_logits = None
 
