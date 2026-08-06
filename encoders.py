@@ -35,7 +35,7 @@ with open("config.yaml", "r") as f:
     config = yaml.safe_load(f) or {}
 
 # Core dims
-INPUT_DIM   = int(config.get("INPUT_DIM", 808))
+INPUT_DIM   = int(config.get("INPUT_DIM", 823))   # includes 15-dim identity block (role+self+persona)
 LATENT_DIM  = int(config.get("LATENT_DIM", 32))
 ACTION_DIM  = int(config.get("ACTION_DIM", 8))  # legacy default
 NUM_ACTIONS = int(config.get("NUM_ACTIONS", 6))
@@ -772,17 +772,21 @@ def talk_kl_to_uniform(talk_logits: torch.Tensor) -> torch.Tensor:
 # ───────────────────────────────────────────────────────────────────────────────
 # Feature packaging (add meta-friendly variant for logging)
 # ───────────────────────────────────────────────────────────────────────────────
-def package_features(agent_alive, round_num, self_msg_embed, neighbor_msg_embed, vote_vector, memory_summary):
+def package_features(agent_alive, round_num, self_msg_embed, neighbor_msg_embed,
+                     vote_vector, memory_summary, identity=None):
     alive_flag = torch.tensor([1.0 if agent_alive else 0.0])
     round_norm = torch.tensor([round_num / 10.0])
-    return torch.cat([
-        alive_flag,
-        round_norm,
-        self_msg_embed,
-        neighbor_msg_embed,
-        vote_vector,
-        memory_summary
-    ], dim=0)
+    parts = []
+    # Identity block FIRST (role bit + self one-hot + persona vector) so it survives
+    # the input-dim fit/truncation. Per thesis §3.3, the belief observation encodes
+    # the agent's own role and personality; without it every agent (offline) mapped
+    # to an identical latent.
+    if identity is not None:
+        parts.append(identity.to(alive_flag.device) if torch.is_tensor(identity)
+                     else torch.as_tensor(identity, dtype=torch.float32))
+    parts += [alive_flag, round_norm, self_msg_embed, neighbor_msg_embed,
+              vote_vector, memory_summary]
+    return torch.cat(parts, dim=0)
 
 def package_features_with_meta(agent_alive, round_num, self_msg_embed, neighbor_msg_embed, vote_vector, memory_summary):
     """

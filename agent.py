@@ -81,6 +81,9 @@ SOCIAL_LAMBDA_REG  = _env_float("SOCIAL_LAMBDA_REG", float(config.get("social", 
 SOCIAL_TRUST_MODE  = str(config.get("social", {}).get("trust", "none")).lower()
 SOCIAL_TAU         = _env_float("SOCIAL_TAU", float(config.get("social", {}).get("tau", 0.5)))
 SOCIAL_MAX_STEP    = _env_float("SOCIAL_MAX_STEP", float(config.get("social", {}).get("max_step", 0.25)))
+# Weight on the identity block (role + self + persona) in the belief observation,
+# so it is not swamped by the large-norm memory/message features (§3.3).
+IDENTITY_SCALE     = _env_float("IDENTITY_SCALE", float(config.get("IDENTITY_SCALE", 6.0)))
 SOCIAL_LAMBDA_EXT  = _env_float("SOCIAL_LAMBDA_EXT", float(config.get("social", {}).get("lambda_ext", 1.0)))
 
 # Prefer more-specific sim.social.enabled if present
@@ -786,6 +789,26 @@ class BaseAgent:
         else:
             memory_summary = torch.zeros(LATENT_DIM, device=device)
 
+        # Identity block (thesis §3.3): the agent's own role, self one-hot, and the
+        # fixed personality vector — so the belief latent actually encodes private
+        # role + persona (previously absent, making all agents identical offline).
+        role_bit = torch.tensor([1.0 if getattr(self, "is_wolf", False) else 0.0], device=device)
+        self_onehot = torch.zeros(NUM_AGENTS, device=device)
+        try:
+            _si = int(self.name.split("_")[1])
+            if 0 <= _si < NUM_AGENTS:
+                self_onehot[_si] = 1.0
+        except Exception:
+            pass
+        _persona = getattr(self, "persona", None) or {}
+        persona_vec = torch.tensor(
+            [float(_persona.get(k, 0.0)) for k in
+             ("extraversion", "agreeableness", "conscientiousness", "neuroticism", "openness")],
+            device=device)
+        # Scale the identity block so it is not swamped by the large-norm
+        # memory/message components (which are near-constant across agents offline).
+        identity = IDENTITY_SCALE * torch.cat([role_bit, self_onehot, persona_vec], dim=0)  # 1 + NUM_AGENTS + 5
+
         x = package_features(
             agent_alive=self.alive,
             round_num=round_num,
@@ -793,6 +816,7 @@ class BaseAgent:
             neighbor_msg_embed=neighbour_embed,
             vote_vector=vote_vec,
             memory_summary=memory_summary,
+            identity=identity,
         )
 
         # >>> HARDEN: match encoder's expected width (fixes 1x811 vs 808x64) <<<

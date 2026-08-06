@@ -17,7 +17,8 @@ PERSONA_STEER_SCALE: 1.0
 DEBUG: false
 debug:
   llm_gate_strict: false
-INPUT_DIM: 808
+INPUT_DIM: 823   # 808 base + 15 identity (1 role bit + 9 self one-hot + 5 persona), see package_features/§3.3
+IDENTITY_SCALE: 6.0
 LATENT_DIM: 32
 ACTION_DIM: 8
 NUM_ACTIONS: 6
