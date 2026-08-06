@@ -117,6 +117,24 @@ test_phase2.py):
   needs no reasoning; this cuts the dominant API cost of the full run ~5-10×. Set
   `JUDGE_MODEL_ID`/`judge.model_id` back to `o4-mini` for strict thesis fidelity.
 
+## Post-Phase-4 findings (surfaced by the consolidated re-pilot gate)
+
+- **Encoder norm instability → LayerNorm.** Across runs the belief-encoder output
+  norm drifted wildly (‖z‖ ~5 to ~1400) and could blow up, making Δz-MSE meaningless.
+  Added an output LayerNorm bounding ‖z‖ to ~√d. (A VICReg variance hinge was tried
+  first but caused scale explosion; disabled by default.)
+- **Belief observation missing role + persona (thesis §3.3) → fixed.** `package_features`
+  omitted the agent's own role and personality, so offline every agent encoded to an
+  identical latent (pairwise cosine 1.0) and social/persona had no inter-agent signal.
+  Added a scaled 15-dim identity block (role + self one-hot + persona); INPUT_DIM 808→823.
+  Cosine dropped to 0.974 and role now separates. Social became live (B1≠B2 in 73% of
+  games) though its *net* offline effect is within noise — the B1>B2 improvement needs
+  the language/judge signal of the full run to manifest.
+- **Offline validation ceiling.** With language off, agents' non-identity observations
+  are near-identical, so persona *diversity* and social *benefit* are validated by unit
+  tests but require the paid language pilot for end-to-end confirmation. Phases 1a/3/4
+  are fully offline-validated; 1b/2 are unit-validated.
+
 ## Known-stale (not yet fixed)
 - `test_roles.py` imports `DEFECTIVE/WORKER` (pre-rename API); `test_agent.py`
   calls `encode_current_belief()` with no args; `test_llm_script.py` requires the

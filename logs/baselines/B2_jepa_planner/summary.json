@@ -5,19 +5,19 @@
     "1337": 15,
     "2718": 15
   },
-  "villager_win_rate_mean": 0.4,
-  "villager_win_rate_lo": 0.23333333333333334,
-  "villager_win_rate_hi": 0.5666666666666667,
-  "vote_accuracy_mean": 0.2958694530443757,
-  "vote_accuracy_lo": 0.22645130288957682,
-  "vote_accuracy_hi": 0.36520104489164085,
+  "villager_win_rate_mean": 0.16666666666666666,
+  "villager_win_rate_lo": 0.03333333333333333,
+  "villager_win_rate_hi": 0.3,
+  "vote_accuracy_mean": 0.30010969553513417,
+  "vote_accuracy_lo": 0.23834408242829297,
+  "vote_accuracy_hi": 0.36444207045391247,
   "judge_accept_mean": NaN,
   "judge_accept_lo": NaN,
   "judge_accept_hi": NaN,
   "talk_vote_align_mean": 1.0,
   "talk_vote_align_lo": 1.0,
   "talk_vote_align_hi": 1.0,
-  "dz_mse_mean": 6.987648709362777,
-  "dz_mse_lo": 6.959290286409792,
-  "dz_mse_hi": 7.013743434532611
+  "dz_mse_mean": 43.51467828820554,
+  "dz_mse_lo": 43.172521401836214,
+  "dz_mse_hi": 43.86584493994203
 }
