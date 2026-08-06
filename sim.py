@@ -686,6 +686,35 @@ def _vote_topk_for_agent(ag: BaseAgent, z_t: torch.Tensor, agents: list[BaseAgen
             out.append((name, float(probs[idx].item())))
         return out
 
+def _jepa_only_vote(ag: BaseAgent, z_t: torch.Tensor, living: list[BaseAgent]) -> Optional[str]:
+    """
+    JEPA-only voting policy (baseline B3): score each candidate by rolling the
+    vote action through the JEPA world model and picking the target that minimizes
+    predicted free energy (one-step prediction surprise ‖f(z, a_vote) − z‖). Uses
+    ONLY the world model + phase-action encoder — no trained planner VoteHead — so
+    B3 is a genuinely different mechanism from the planner baselines (previously
+    both used the same VoteHead top-1, making B3 ≡ B2).
+    """
+    wm = getattr(ag, "world_model", None)
+    pae = getattr(ag, "phase_action_encoder", None)
+    alive = [x for x in living if getattr(x, "alive", False) and x.name != ag.name]
+    if wm is None or pae is None or not alive:
+        return None
+    z = z_t.unsqueeze(0) if z_t.dim() == 1 else z_t
+    best, best_score = None, None
+    with torch.no_grad():
+        for x in alive:
+            try:
+                idx = int(x.name.split("_")[1])
+                a_embed = pae(torch.tensor([1]), torch.tensor([idx]), is_talk=False)
+                z_pred = wm(z, a_embed)
+                score = float((z_pred - z).norm().item())      # expected free energy (surprise)
+            except Exception:
+                continue
+            if best_score is None or score < best_score:
+                best_score, best = score, x.name
+    return best
+
 def _agent_context_block(ag: BaseAgent, max_lines: int = 6) -> str:
     lines = []
     for n, m in list(ag.message_memory)[-max_lines:]:
@@ -904,34 +933,50 @@ def _speaker_llm_fallback_generate(
 
 # Heuristic vote chooser for heuristic policy
 def _heuristic_vote_choice(ag: BaseAgent, living: list[BaseAgent]) -> Optional[str]:
+    """
+    Hand-crafted, LANGUAGE-INDEPENDENT suspicion heuristic (baseline B5). Order:
+      (1) name-mention suspicion from recent talk (only fires when language is on);
+      (2) bandwagon: target the agent most-voted-against so far, aggregated across
+          every living agent's vote history;
+      (3) first-round deterministic fallback (a fixed rotation).
+    Crucially it NEVER falls back to the trained planner VoteHead — previously it
+    did, which made B5 collapse onto the planner offline.
+    """
+    alive_names = [x.name for x in living if x.alive and x.name != ag.name]
+    aset = set(alive_names)
+    if not alive_names:
+        return None
+
+    # (1) Suspicion from names mentioned in recent utterances (active with language).
     counts = Counter()
     try:
-        for n, m in list(getattr(ag, "message_memory", []))[-12:]:
+        for _n, m in list(getattr(ag, "message_memory", []))[-12:]:
             if not m:
                 continue
-            for other in living:
-                if other.name == ag.name:
-                    continue
-                if other.name in m:
-                    counts[other.name] += 1
+            for nm in aset:
+                if nm in m:
+                    counts[nm] += 1
     except Exception:
         pass
     if counts:
-        cand, _ = counts.most_common(1)[0]
-        if any(x.name == cand and x.alive for x in living):
-            return cand
+        return counts.most_common(1)[0][0]
+
+    # (2) Bandwagon on accumulated vote history (language-independent).
+    tally = Counter()
+    for a in living:
+        for name in list(getattr(a, "vote_history", []))[-9:]:
+            if name in aset:
+                tally[name] += 1
+    if tally:
+        return tally.most_common(1)[0][0]
+
+    # (3) Deterministic first-round fallback (not the VoteHead, not uniform random).
+    names = sorted(aset)
     try:
-        z_t = _finite(ag.encode_current_belief(getattr(ag, "round_num_hint", 0), living).detach())
+        me = int(ag.name.split("_")[1])
     except Exception:
-        z_t = None
-    try:
-        topk = _vote_topk_for_agent(ag, z_t, living, k=PLANNER_TOPK) if z_t is not None else []
-        if topk:
-            return topk[0][0]
-    except Exception:
-        pass
-    choices = [x.name for x in living if x.alive and x.name != ag.name]
-    return random.choice(choices) if choices else None
+        me = 0
+    return names[(me + 1) % len(names)]
 
 def simulate_game(visual: bool = True, seed: int | None = None):
     # Resolve the per-game seed. Priority: explicit arg > GAME_SEED env > SEED_GLOBAL.
@@ -1670,10 +1715,10 @@ def simulate_game(visual: bool = True, seed: int | None = None):
 
             # JEPA-only branch: top-1 from JEPA/plan head, no judge mixing
             if _IS_JEPA_ONLY_POLICY:
-                topk = _vote_topk_for_agent(ag, z_t, living, k=PLANNER_TOPK)
-                if not topk:
+                # World-model free-energy vote (no planner head).
+                best_name = _jepa_only_vote(ag, z_t, living)
+                if not best_name:
                     continue
-                best_name = topk[0][0]
                 target = next((x for x in living if x.name == best_name), None)
                 if target is None:
                     target = next((x for x in living if x.name != ag.name), living[0])

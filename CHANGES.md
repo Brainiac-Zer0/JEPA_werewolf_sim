@@ -102,6 +102,16 @@ test_phase2.py):
   loss taught it to be inert (reproduce the unshifted vote); δ is now trained only by
   the wolf-supervision signal.
 
+- **Phase 3 — Ablation differentiation (RQ1/RQ7).** The middle ladder rungs were
+  the same mechanism: `jepa_only` (B3), `planner` (B2), and the `heuristic` (B5, which
+  fell through to the VoteHead when no names were mentioned) all resolved to the trained
+  VoteHead top-1, so B5≡B3≡B2 cast identical votes offline. Fixed: (a) **JEPA-only** now
+  votes by rolling each candidate through the world model and minimizing predicted free
+  energy (‖f(z,a)−z‖) — no planner head; (b) the **heuristic** is now language-independent
+  (name-mention suspicion → vote-history bandwagon → deterministic fallback), never the
+  VoteHead. Verified: identical-vote fraction dropped from 1.00 to 0.07 (B2/B3) and 0.00
+  (B2/B5, B3/B5) — the rungs are now genuinely distinct policies.
+
 ## Known-stale (not yet fixed)
 - `test_roles.py` imports `DEFECTIVE/WORKER` (pre-rename API); `test_agent.py`
   calls `encode_current_belief()` with no args; `test_llm_script.py` requires the
