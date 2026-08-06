@@ -1,0 +1,21 @@
+# AgentSim — GPU image for the $0-API local-model run (RunPod/Vast or any CUDA host).
+# Uses a PyTorch CUDA base (torch already present); installs only the extra deps.
+# Most RunPod/Vast users skip this and just run `SETUP=1 bash run_local.sh` on a
+# PyTorch pod — this Dockerfile is for a fully containerized deploy.
+FROM pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
+
+ENV PYTHONUNBUFFERED=1 PYTHONUTF8=1 PIP_NO_CACHE_DIR=1 \
+    HF_HUB_DISABLE_TELEMETRY=1 SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+    LLM_PROVIDER=hf JUDGE_PROVIDER=hf USE_LANGUAGE=1 JUDGE_ENABLED=1 \
+    LLM_DEVICE=cuda JUDGE_DEVICE=cuda
+
+WORKDIR /app
+
+# Non-torch deps (do NOT reinstall torch — the base image ships the CUDA build).
+RUN pip install --upgrade pip \
+    && pip install transformers sentence-transformers pyyaml scipy scikit-learn pandas pygame-ce accelerate
+
+COPY . .
+RUN chmod +x run_local.sh
+
+CMD ["bash", "run_local.sh"]
