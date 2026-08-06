@@ -1200,6 +1200,18 @@ def simulate_game(visual: bool = True, seed: int | None = None):
                     except Exception:
                         arg_id = None
 
+                # Never direct accuse / vote / question at oneself. Self-reference
+                # ("Agent_4 questions Agent_4") came from the question path taking the
+                # last speaker in memory, which can be self. Self-defense ('defend')
+                # legitimately targets self and is left alone.
+                if named_target == ag.name and intent_name != "defend":
+                    prefer = [n for (n, _p) in topk_for_ref] if topk_for_ref else None
+                    named_target = _pick_valid_target(ag, living, prefer=prefer)
+                    try:
+                        arg_id = int(named_target.split("_")[1]) if named_target else None
+                    except Exception:
+                        arg_id = None
+
                 try:
                     plan = build_plan_tuple(
                         role=ag.role or "Unknown",
