@@ -251,7 +251,12 @@ class MLPBeliefEncoder(nn.Module):
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, 64),
             nn.ReLU(),
-            nn.Linear(64, latent_dim)
+            nn.Linear(64, latent_dim),
+            # Output LayerNorm bounds the latent norm (~sqrt(latent_dim)). Without it
+            # the encoder's output scale drifted wildly across runs (‖z‖ from ~5 to
+            # ~1400) and could blow up, making Δz-MSE meaningless and destabilizing
+            # training. It also removes the trivial large-constant collapse mode.
+            nn.LayerNorm(latent_dim),
         )
 
     def forward(self, input_vector):

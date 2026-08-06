@@ -88,6 +88,8 @@ LAMBDA_TALK: float = float(CFG.get("LAMBDA_TALK", LAMBDA_BC))  # CE weight for t
 # Weight on the social wolf-supervision term (Phase 2): trains δ_social to shift
 # villager votes toward the actual wolves so social becomes an effective component.
 SOCIAL_WOLF_W: float = float((CFG.get("social", {}) or {}).get("wolf_supervision_w", 0.5))
+# Anti-collapse variance-regularization weight on the belief encoder (VICReg-style).
+JEPA_VAR_W: float = float((CFG.get("training", {}) or {}).get("var_reg_w", 1.0))
 MAX_NORM: float = float(CFG.get("MAX_NORM", 1.0))
 
 # Optional dims (used by helpers below; keep legacy defaults)
@@ -1172,6 +1174,17 @@ def train_jepa_factorized(
                     kl_unif = (talk_p * (talk_logp + math.log(K))).sum(dim=-1).mean()  # KL(p‖uniform)
                     L_fep = TALK_ENTROPY_W * ent + TALK_KL_UNIF_W * kl_unif
 
+                # Anti-collapse variance regularization (VICReg-style). A constant
+                # encoder + identity world model drives the JEPA loss to ~0, so
+                # collapse (all agents → the same latent) is an attractor; stop-grad
+                # targets prevent zero-collapse but not constant-collapse. This hinge
+                # pushes each latent dimension's batch std toward >= 1, keeping
+                # representations diverse (so agents differ and social has signal).
+                L_var = torch.tensor(0.0, device=DEVICE)
+                if belief_encoder is not None and JEPA_VAR_W > 0.0 and z_t_tensor.size(0) > 1:
+                    std = torch.sqrt(z_t_tensor.var(dim=0) + 1e-4)
+                    L_var = torch.mean(F.relu(1.0 - std))
+
                 loss = (
                     L_mse
                     + (LAMBDA_TALK * L_talk)
@@ -1182,6 +1195,7 @@ def train_jepa_factorized(
                     + L_fep
                     + L_social_reg
                     + (SOCIAL_WOLF_W * L_social_wolf)
+                    + (JEPA_VAR_W * L_var)
                 )
 
             optimizer.zero_grad(set_to_none=True)

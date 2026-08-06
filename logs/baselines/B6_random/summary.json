@@ -14,10 +14,10 @@
   "judge_accept_mean": NaN,
   "judge_accept_lo": NaN,
   "judge_accept_hi": NaN,
-  "talk_vote_align_mean": 0.17434852184852187,
-  "talk_vote_align_lo": 0.12721395502645502,
-  "talk_vote_align_hi": 0.22576068607318608,
-  "dz_mse_mean": 2.6489085907340413,
-  "dz_mse_lo": 2.639928844367051,
-  "dz_mse_hi": 2.658793031537784
+  "talk_vote_align_mean": 0.17057359307359304,
+  "talk_vote_align_lo": 0.11969453463203465,
+  "talk_vote_align_hi": 0.22014502164502162,
+  "dz_mse_mean": 6.969487443891422,
+  "dz_mse_lo": 6.898261369936244,
+  "dz_mse_hi": 7.053676321475712
 }

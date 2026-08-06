@@ -1,0 +1,84 @@
+{
+  "run_id": "train_20260806T030538Z_seed1337",
+  "seed": 1337,
+  "roles": {
+    "Werewolf": {
+      "overall": {
+        "count": 369,
+        "mean_L2": 0.28512893424736624,
+        "mean_1mcos": 0.003910476760812568
+      },
+      "per_phase": {
+        "0": {
+          "count": 246,
+          "mean_L2": 0.1443333092351005,
+          "mean_1mcos": 0.00022022607849865426
+        },
+        "2": {
+          "count": 99,
+          "mean_L2": 0.5687004610745594,
+          "mean_1mcos": 0.011332316230041812
+        },
+        "1": {
+          "count": 24,
+          "mean_L2": 0.5585515424609184,
+          "mean_1mcos": 0.011120458443959555
+        }
+      },
+      "eval": {
+        "mse": 5.266341914975547,
+        "talk_ce": 1.589336705401661,
+        "vote_ce": 0.4451153005162875,
+        "kill_ce": 0.43074277916339915,
+        "talk_acc": 0.25609756097560976,
+        "vote_acc": 0.9166666666666666,
+        "kill_acc": 0.9797979797979798,
+        "vote_illegal": 0.0,
+        "kill_illegal": 0.0
+      }
+    },
+    "Worker": {
+      "overall": {
+        "count": 984,
+        "mean_L2": 0.7736570974811912,
+        "mean_1mcos": 0.0039985010294410275
+      },
+      "per_phase": {
+        "0": {
+          "count": 656,
+          "mean_L2": 0.5964648129940942,
+          "mean_1mcos": 0.0004289050291224224
+        },
+        "1": {
+          "count": 328,
+          "mean_L2": 1.1280416664553852,
+          "mean_1mcos": 0.011137693030078237
+        }
+      },
+      "eval": {
+        "mse": 3.23867783895353,
+        "talk_ce": 1.5932467158247785,
+        "vote_ce": 0.5575323395612763,
+        "kill_ce": 0.0,
+        "talk_acc": 0.2423780487804878,
+        "vote_acc": 0.9054878048780488,
+        "kill_acc": 0.0,
+        "vote_illegal": 0.0,
+        "kill_illegal": 0.0
+      }
+    }
+  },
+  "config": {
+    "mode": "factorized",
+    "epochs": 3,
+    "batch_size": 64,
+    "lr": 0.001,
+    "outer_cycles": 2,
+    "games_per_cycle": 20,
+    "speaker": 0,
+    "speaker_only": false,
+    "lambda_j": 1.0,
+    "lambda_c": 0.25,
+    "lambda_o": 0.2
+  }
+}

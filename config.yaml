@@ -372,6 +372,10 @@ training:
   max_grad_norm: 1.0
   lambda_bc: 0.5
   lambda_talk: 0.5
+  # Experimental VICReg-style variance hinge on the belief encoder. Disabled by
+  # default: without scale control it caused the latent norm to explode. The
+  # encoder's output LayerNorm now bounds the scale instead. 0 disables.
+  var_reg_w: 0.0
   device: auto
   speaker_enabled: true
   speaker_only: false

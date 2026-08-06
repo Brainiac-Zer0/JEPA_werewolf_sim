@@ -82,7 +82,8 @@ def test_sim_loads_trained_planner_not_fresh(tmp_path, monkeypatch):
 def test_social_delta_can_flip_planner_vote():
     """A scaled social correction must be *capable* of changing the vote argmax
     (guards against the inert-δ regression)."""
-    soc = T.load_shared_social(); soc.scale = 0.3
+    from social import SocialInfluence
+    soc = SocialInfluence(latent_dim=LATENT_DIM); soc.scale = 0.3
     fp = FactorizedPlanner(latent_dim=LATENT_DIM, num_agents=9, num_talk_cats=5)
     torch.manual_seed(0)
     m = torch.ones(1, 9, dtype=torch.bool)

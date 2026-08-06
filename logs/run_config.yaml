@@ -68,7 +68,7 @@ JUDGE_DEBUG: false
 JUDGE_DEBUG_DIR: logs
 JUDGE_DEVICE: auto
 JUDGE_MAX_NEW: 128
-JUDGE_MODEL_ID: o4-mini
+JUDGE_MODEL_ID: gpt-4o-mini
 JUDGE_PROVIDER: openai
 JUDGE_RUBRIC_PATH: judge_rubric.yaml
 LANGUAGE_COUPLING:
@@ -192,7 +192,7 @@ judge:
   frequency_penalty: null
   include_rationale: true
   max_new: 128
-  model_id: o4-mini
+  model_id: gpt-4o-mini
   presence_penalty: null
   rerank_topk: true
   rp_n: 2
@@ -203,7 +203,7 @@ judge:
 judge_openai:
   frequency_penalty: null
   max_tokens: 256
-  model: o4-mini
+  model: gpt-4o-mini
   presence_penalty: null
   system: You are a strict scoring judge. Return JSON only with subscores and a final
     score.
@@ -471,3 +471,4 @@ training:
   outer_cycles: 1
   speaker_enabled: true
   speaker_only: false
+  var_reg_w: 0.0

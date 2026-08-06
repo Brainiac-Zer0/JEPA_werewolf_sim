@@ -11,9 +11,15 @@ import pytest
 
 from encoders import (INPUT_DIM, LATENT_DIM, ACTION_DIM, WorldModelMLP,
                       PhaseActionEncoder, FactorizedPlanner)
+from social import SocialInfluence
 import training_utils as T
 
 WOLVES = [0] * 7 + [1, 1]        # agents 7,8 are wolves
+
+
+def _fresh_social():
+    """A fresh module so tests don't depend on ambient checkpoints/social.pt."""
+    return SocialInfluence(latent_dim=LATENT_DIM)
 
 
 def _villager_vote_rows(n=96):
@@ -29,7 +35,7 @@ def _villager_vote_rows(n=96):
 
 
 def test_delta_from_inputs_shapes_and_finite():
-    soc = T.load_shared_social()
+    soc = _fresh_social()
     z = torch.randn(4, LATENT_DIM); mu = torch.randn(4, LATENT_DIM)
     d = soc.delta_from_inputs(z, mu, None)
     assert d.shape == (4, LATENT_DIM) and torch.isfinite(d).all()
@@ -37,7 +43,7 @@ def test_delta_from_inputs_shapes_and_finite():
 
 def test_delta_relative_to_z_norm():
     """||delta|| should be ~ scale * ||z_self|| (robust to encoder norm)."""
-    soc = T.load_shared_social(); soc.scale = 0.15
+    soc = _fresh_social(); soc.scale = 0.15
     for zscale in (5.0, 30.0):
         z = torch.randn(1, LATENT_DIM); z = z / z.norm() * zscale
         mu = torch.randn(1, LATENT_DIM)
@@ -47,7 +53,7 @@ def test_delta_relative_to_z_norm():
 
 def test_message_pathway_changes_delta():
     """The message-content projection (thesis §3.9) affects δ."""
-    soc = T.load_shared_social()
+    soc = _fresh_social()
     assert soc.msg_proj is not None
     z = torch.randn(2, LATENT_DIM); mu = torch.randn(2, LATENT_DIM)
     msg = torch.randn(2, soc.msg_dim)
@@ -57,7 +63,7 @@ def test_message_pathway_changes_delta():
 
 
 def test_social_params_train():
-    soc = T.load_shared_social()
+    soc = _fresh_social()
     before = [p.detach().clone() for p in soc.parameters()]
     T.train_jepa_factorized(
         _villager_vote_rows(),
@@ -70,7 +76,7 @@ def test_social_params_train():
 
 
 def test_social_checkpoint_written(tmp_path, monkeypatch):
-    soc = T.load_shared_social()
+    soc = _fresh_social()
     monkeypatch.setattr(T, "CHECKPOINT_DIR", str(tmp_path))
     T.train_jepa_factorized(
         _villager_vote_rows(32),
@@ -85,7 +91,7 @@ def test_wolf_supervision_shifts_votes_toward_wolves():
     """After wolf-supervised training, adding δ moves the villager vote toward a
     wolf more often than the base planner alone."""
     torch.manual_seed(0)
-    soc = T.load_shared_social(); soc.scale = 0.2
+    soc = _fresh_social(); soc.scale = 0.2
     fp = FactorizedPlanner(latent_dim=LATENT_DIM, num_agents=9, num_talk_cats=5)
     rows = _villager_vote_rows(160)
     T.train_jepa_factorized(

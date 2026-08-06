@@ -1,0 +1,474 @@
+ACTION_DIM: 8
+ACTION_EMBED_DIM: 8
+ACTION_EMBED_KIND: onehot
+AGENT_R: 30
+BASE_STRENGTH: 1.0
+BIAS_CAP: 2.0
+CAT_ORDER:
+- accuse
+- defend
+- hedge
+- question
+- vote
+CHECKPOINT_DIR: checkpoints
+DEBUG: false
+DEBUG_MASKS: false
+DEFAULT_LEXICON:
+  accuse:
+  - accuse
+  - suspicious
+  - suspect
+  - lying
+  - deceive
+  - eliminate
+  - vote
+  defend:
+  - defend
+  - innocent
+  - trust
+  - ally
+  - support
+  - clear
+  hedge:
+  - maybe
+  - perhaps
+  - uncertain
+  - unsure
+  - might
+  - seems
+  - appears
+  question:
+  - why
+  - how
+  - what
+  - who
+  - where
+  - when
+  - '?'
+  vote:
+  - vote
+  - eliminate
+  - banish
+  - target
+  - lynch
+DEFAULT_TEMPLATES:
+- Accuse {target}
+- Defend {ally}
+- Ask {target} a question
+- Express uncertainty
+- Propose vote on {target}
+ENABLE_PERSONA_STEER: true
+ENTROPY_ATTENUATION: 0.5
+EXTRA_LEXICON: {}
+FPS: 1
+INCLUDE_RATIONALE: true
+INPUT_DIM: 808
+JUDGE_BATCH: 4
+JUDGE_DEBUG: false
+JUDGE_DEBUG_DIR: logs
+JUDGE_DEVICE: auto
+JUDGE_MAX_NEW: 128
+JUDGE_MODEL_ID: gpt-4o-mini
+JUDGE_PROVIDER: openai
+JUDGE_RUBRIC_PATH: judge_rubric.yaml
+LANGUAGE_COUPLING:
+  enabled: true
+  loss_weight: 0.05
+LATENT_DIM: 32
+LLM_DEVICE: auto
+LLM_MODEL_ID: o4-mini
+LLM_PROVIDER: openai
+LLM_SPEAKER: true
+LR_SCHEDULER: none
+MOUTHPIECE_REWARD_WEIGHTS:
+  coherence: 0.4
+  deception_wolf: 0.3
+  role_alignment: 0.3
+  social_safety: 0.15
+  talk_vote_alignment: 0.1
+  truthfulness_villager: 0.15
+MOUTHPIECE_TRAINING:
+  bias_head_entropy_reg: 0.005
+  bias_head_epochs: 1
+  bias_head_kl_reg: 0.0
+  bias_head_kl_to_intent: 0.01
+  bias_head_lr: 0.0005
+  speaker_bandit_arg_aux_weight: 0.25
+  speaker_bandit_baseline_ema: 0.9
+  speaker_bandit_entropy_reg: 0.01
+  speaker_bandit_epochs: 1
+  speaker_bandit_kl_to_intent: 0.01
+  speaker_bandit_lr: 0.0005
+MSG_BOX_W: 360
+MSG_BOX_X: 840
+MSG_LOG_LIMIT: 12
+NUM_ACTIONS: 6
+NUM_AGENTS: 9
+NUM_TALK_CATS: 5
+NUM_WEREWOLVES: 2
+N_GAMES: 50
+PERSONA_CONFIG_PATH: configs/persona_vectors.yaml
+PERSONA_SCALE: 0.2
+PERSONA_SEED: null
+PERSONA_STEER_SCALE: 1.0
+PER_CAT_SCALES:
+  question: 1.1
+  vote: 0.95
+PHASE_AWARE_JEPA: true
+PHASE_COUNT: 3
+PLANNER_TOPK: 3
+REWARD_USE_ROLE_ALIGNMENT: false
+ROLE_PRIORS:
+  VILLAGER: zeros
+  WEREWOLF: ones
+RUBRIC_PATH: judge_rubric.yaml
+RUN_SEED: 1337
+SAVE_OPTIM: false
+SCREEN_H: 600
+SCREEN_W: 1200
+STRATIFY_PHASE_BATCHES: true
+STRICT_LEXICON: false
+TALK_CATEGORIES:
+- accuse
+- defend
+- hedge
+- question
+- vote
+TALK_FUSION_ALPHA: 0.5
+TELEMETRY_ENABLED: true
+TRAIN_PHASE_HEADS: true
+TURNS_DAY_DISCUSS: 2
+USE_AMP: false
+VILLAGER: Worker
+WEREWOLF: Werewolf
+WORLD_INPUT_MODE: z_plus_action
+ablations:
+  bandit: false
+  fep_core: true
+  heuristic_vote: false
+  judge: true
+  language: true
+  personas: true
+  random_vote: false
+  social: true
+bias_head:
+  cat_order:
+  - accuse
+  - defend
+  - hedge
+  - question
+  - vote
+  epochs: 1
+  latent_dim: 32
+  lr: 0.0005
+  regularizer_lambda: 0.0
+  strength_cap: 2.0
+coalitions:
+  compare: false
+  hidden: 64
+  shared_kill: true
+debug:
+  llm_gate_strict: false
+determinism:
+  cudnn_benchmark: false
+  enabled: true
+  seed: 1337
+  torch_deterministic: true
+encoders:
+  regularization:
+    talk_entropy_w: 0.01
+    talk_kl_uniform_w: 0.0
+exploration:
+  epsilon: 0.05
+  ucb_c: 1.414
+fusion:
+  alpha_intent_bias: 0.65
+judge:
+  batch: 4
+  debug: false
+  debug_dir: logs
+  device: auto
+  enable_persona_steer: false
+  frequency_penalty: null
+  include_rationale: true
+  max_new: 128
+  model_id: gpt-4o-mini
+  presence_penalty: null
+  rerank_topk: true
+  rp_n: 2
+  rp_weight: 0.15
+  store_subscores: true
+  talk_vote_alignment: true
+  temperature: null
+judge_openai:
+  frequency_penalty: null
+  max_tokens: 256
+  model: gpt-4o-mini
+  presence_penalty: null
+  system: You are a strict scoring judge. Return JSON only with subscores and a final
+    score.
+  temperature: null
+language:
+  banned_bigrams:
+  - I believe
+  - Based on
+  bigram_penalty: 1.1
+  contraction_normalize: true
+  discourse_markers_cap_per5: 2
+  exemplar_pack: p7_default
+  force_question_prob: 0.35
+  guard_hidden_info: true
+  hedges_cap_per5: 2
+  intensifiers_cap_per5: 2
+  min_words: 12
+  question_prior_beta: 0.2
+  redo_max: 3
+  style_contract: true
+  trigram_veto: true
+llm:
+  bans_meta:
+  - Use
+  - Do not
+  - Don't
+  - 'No '
+  - 'Keep '
+  - Reply
+  - Provide
+  - Follow
+  - Instruction
+  - Rule
+  - sentence
+  - third person
+  - grammar
+  - punctuation
+  - No narration
+  device: auto
+  dtype: auto
+  encoders:
+    context:
+      add_role_bit: true
+      decay: 0.85
+      l2_norm: true
+      other_gate: 1.0
+      self_gate: 1.15
+      window: 6
+    text:
+      cache_size: 8192
+      l2_norm: true
+  hf_decoding:
+    attempts:
+    - max_new_tokens: 96
+      min_new_tokens: 12
+      no_repeat_ngram_size: 3
+      repetition_penalty: 1.15
+      temperature: 0.7
+      top_p: 0.9
+    - max_new_tokens: 72
+      min_new_tokens: 12
+      no_repeat_ngram_size: 4
+      repetition_penalty: 1.12
+      temperature: 0.8
+      top_p: 0.9
+    no_repeat_ngram_size: 3
+    repetition_penalty: 1.15
+    temperature: 0.7
+    top_p: 0.9
+  hygiene:
+    strip_role_words: true
+    trim_quotes: true
+  kv_cache: true
+  load_in_4bit: false
+  load_in_8bit: true
+  max_new_tokens: 80
+  max_seq: 4096
+  min_new_tokens: 16
+  model_id: o4-mini
+  no_repeat_ngram_size: 3
+  openai:
+    max_output_tokens: 128
+    stop:
+    - </s>
+    - '###'
+    - '[OOC]'
+    - 'Out of character:'
+  presence_penalty: 0.1
+  provider: openai
+  regularization:
+    talk_entropy_w: 0.0
+    talk_kl_uniform_w: 0.0
+  repetition_penalty: 1.08
+  speaker_enabled: true
+  temperature: 0.8
+  top_p: 0.92
+logging:
+  debug: false
+  judge_jsonl: logs/judge_calls.jsonl
+model:
+  action_dim: 8
+  encoders:
+    message_model: sentence-transformers/all-MiniLM-L6-v2
+  factorized_planner:
+    masks:
+      kill_wolves_only: true
+      mask_dead: true
+      mask_self: true
+    temperature: 1.0
+  input_dim: 811
+  latent_dim: 32
+  num_actions: 6
+  phases:
+    count: 3
+    num_talk_cats: 5
+    talk_categories:
+    - accuse
+    - defend
+    - hedge
+    - question
+    - vote
+openai:
+  frequency_penalty: null
+  max_output_tokens: 128
+  max_tokens: 128
+  model: o4-mini
+  presence_penalty: null
+  system: "You are the mouthpiece for a social-deduction agent. Speak in-character\
+    \ in 1\u20132 concise sentences, never reveal hidden info, avoid OOC or meta."
+  temperature: null
+paths:
+  checklists: null
+  checkpoints: checkpoints/
+  logs: logs/
+  mouthpiece: checkpoints/speakers/
+  rubric: judge_rubric.yaml
+phases:
+  talk_categories:
+  - accuse
+  - defend
+  - hedge
+  - question
+  - vote
+prompting:
+  guardrails:
+    avoid_ooc: true
+    stay_in_phase: true
+    taboo_night_identity: true
+  include_alive_list: true
+  include_context_window: 8
+  include_night_history: true
+  include_phase: true
+  include_role: true
+  include_round: true
+  include_vote_history: true
+  system_style: natural
+runtime:
+  save_config_snapshot: true
+seed: 1337
+seeds:
+  global: 1337
+sim:
+  discuss_turns: 2
+  env_aliases:
+    HEURISTIC_VOTE: 0
+    RANDOM_VOTE: 0
+    SOC_ENABLED: true
+    SOC_K: 6
+    SOC_SCALE: 0.05
+    VOTE_MODE: ''
+  log_dz_kill: false
+  log_dz_talk: false
+  night_chat:
+    delta_social_scale: 1.0
+    enabled: false
+    intent_target: top1
+    judge_on: false
+    turns: 2
+    ui_preview: false
+    use_bias_fusion: true
+  num_agents: 9
+  num_werewolves: 2
+  phases:
+    night_enabled: true
+  planner_topk: 3
+  social:
+    K: 6
+    apply_between: discuss_vote
+    enabled: true
+    hidden: 64
+    lambda_reg: 0.001
+    max_step: 0.25
+    scale: 0.05
+    tau: 0.25
+    trust: cosine
+    window: 2
+  talk_fusion_alpha: 0.5
+  talk_mask_all: true
+  ui:
+    enabled: true
+    fps: 1
+    msg_box_w: 360
+    msg_log_limit: 12
+    screen_h: 600
+    screen_w: 1200
+  use_language: true
+  vote_mix_alpha: 0.45
+  voting:
+    heuristic:
+      enabled: false
+      name: suspicion_top1
+    mode: random
+    random:
+      enabled: true
+      seed: null
+social:
+  enabled: true
+  lambda_reg: 0.001
+  max_step: 0.5
+  scale: 0.15
+  tau: 0.5
+  trust: cosine
+  window: 1
+  wolf_supervision_w: 0.5
+social_influence:
+  K: 6
+  enabled: true
+  scale: 1.0
+speaker:
+  enabled: true
+  entropy_bonus: 0.01
+  fusion_alpha: 0.5
+  hidden: 128
+  hist_k: 3
+  lambda_c: 0.25
+  lambda_j: 1.0
+  lambda_o: 0.2
+  lr: 0.001
+  warmup_steps: 100
+telemetry:
+  csv_name: telemetry.csv
+  enabled: true
+  flush_every: 1
+  judge_jsonl_name: judge_calls.jsonl
+  out_dir: logs
+  print_summary: true
+  snapshot_config: true
+templates:
+- Accuse {target}
+- Defend {ally}
+- Ask {target} a question
+- Express uncertainty
+- Propose vote on {target}
+training:
+  batch_size: 64
+  device: auto
+  epochs: 2
+  games_per_cycle: 1
+  lambda_bc: 0.5
+  lambda_talk: 0.5
+  lr: 0.001
+  max_grad_norm: 1.0
+  mode: factorized
+  n_games: 3
+  outer_cycles: 1
+  speaker_enabled: true
+  speaker_only: false
+  var_reg_w: 1.0
