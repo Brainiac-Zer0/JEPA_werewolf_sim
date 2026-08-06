@@ -1,8 +1,0 @@
-{
-  "completed_games": 300,
-  "by_seed": {
-    "1337": 150,
-    "2718": 150
-  },
-  "target_per_seed": 150
-}

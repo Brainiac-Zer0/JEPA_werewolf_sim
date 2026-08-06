@@ -1,3 +1,0 @@
-condition,family,games_counted,villager_win_rate_mean,villager_win_rate_lo,villager_win_rate_hi,vote_accuracy_mean,vote_accuracy_lo,vote_accuracy_hi,talk_vote_align_mean,talk_vote_align_lo,talk_vote_align_hi,dz_mse_mean,dz_mse_lo,dz_mse_hi
-S1_lambda0,lambda_reg,4,0.5,0.0,1.0,0.3154282765737874,0.14210526315789473,0.44349845201238386,1.0,1.0,1.0,0.035941622582160763,0.03550820083667835,0.036253123492416404
-S1_lambda1e-3,lambda_reg,4,0.5,0.0,1.0,0.3154282765737874,0.14210526315789473,0.44349845201238386,1.0,1.0,1.0,0.035941622582160763,0.03550820083667835,0.036253123492416404
