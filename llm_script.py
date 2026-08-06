@@ -943,19 +943,23 @@ class Mouthpiece:
                 for k in ("max_new_tokens","temperature","top_p","repetition_penalty","no_repeat_ngram_size","min_new_tokens"):
                     gen_kwargs.pop(k, None)
 
-                resp = self.pipe(
-                    anchored,
+                # HF rejects temperature<=0 with do_sample=True; map it to greedy
+                # decoding (do_sample=False) and drop the sampling-only args. This is
+                # what the judge (temperature=0.0) needs on the local HF backend.
+                _sample = temperature > 0.0
+                _gen = dict(
                     pad_token_id=getattr(self.tokenizer, "pad_token_id", None),
                     eos_token_id=getattr(self.tokenizer, "eos_token_id", None),
-                    do_sample=True,
+                    do_sample=_sample,
                     bad_words_ids=self._bad_ids or None,
                     max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
                     repetition_penalty=repetition_penalty,
                     no_repeat_ngram_size=no_repeat_ngram,
-                    **gen_kwargs,
-                )[0].get("generated_text", "")
+                )
+                if _sample:
+                    _gen["temperature"] = temperature
+                    _gen["top_p"] = top_p
+                resp = self.pipe(anchored, **_gen, **gen_kwargs)[0].get("generated_text", "")
         except Exception as e:
             print(f"[LLM ERROR/generate] {e}")
             return SAFE_FALLBACK
