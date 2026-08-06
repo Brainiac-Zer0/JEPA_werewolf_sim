@@ -715,6 +715,20 @@ def _jepa_only_vote(ag: BaseAgent, z_t: torch.Tensor, living: list[BaseAgent]) -
                 best_score, best = score, x.name
     return best
 
+def _game_over(agents: list) -> Optional[str]:
+    """
+    Win-condition check (testable). Villagers win when both werewolves are dead;
+    werewolves win when they reach numerical parity with villagers. Returns
+    "villagers", "werewolves", or None if the game continues.
+    """
+    wolves = sum(1 for a in agents if getattr(a, "alive", False) and a.role == WEREWOLF)
+    vills = sum(1 for a in agents if getattr(a, "alive", False) and a.role != WEREWOLF)
+    if wolves == 0:
+        return "villagers"
+    if wolves >= vills:
+        return "werewolves"
+    return None
+
 def _agent_context_block(ag: BaseAgent, max_lines: int = 6) -> str:
     lines = []
     for n, m in list(ag.message_memory)[-max_lines:]:
@@ -2313,15 +2327,12 @@ def simulate_game(visual: bool = True, seed: int | None = None):
                             row["dz_l2"] = f"{dz_by_agent.get(ag_name, 0.0):.6f}"
                             row["dz_1mcos"] = f"{cos_by_agent.get(ag_name, 0.0):.6f}"
 
-        wolves_alive = [a for a in agents if a.alive and a.role == WEREWOLF]
-        vill_alive = [a for a in agents if a.alive and a.role != WEREWOLF]
-        if not wolves_alive or len(wolves_alive) >= len(vill_alive):
+        if _game_over(agents) is not None:
             break
 
     # Compute game outcome after the loop
-    wolves_alive = [a for a in agents if a.alive and a.role == WEREWOLF]
-    vill_alive = [a for a in agents if a.alive and a.role != WEREWOLF]
-    villager_win = (len(wolves_alive) == 0)
+    villager_win = (_game_over(agents) == "villagers") or \
+        (len([a for a in agents if a.alive and a.role == WEREWOLF]) == 0)
     if villager_win:
         game_outcome = 1.0
     else:
