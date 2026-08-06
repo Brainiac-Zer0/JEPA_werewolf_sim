@@ -1,0 +1,13 @@
+# Loose deps for container builds (Railway/Docker). Unpinned so they resolve on the
+# image's Python; the code is not sensitive to exact minor versions. For an exact
+# local reproduction of the dev environment, use the pinned requirements.txt instead.
+torch                       # CPU wheel comes from the pytorch CPU --extra-index-url
+numpy
+pandas
+scipy
+scikit-learn
+pyyaml
+transformers
+sentence-transformers
+pygame-ce
+openai

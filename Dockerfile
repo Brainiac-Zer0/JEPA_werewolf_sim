@@ -15,12 +15,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-# CPU torch wheels + pinned deps + the OpenAI backend. If a pin is unavailable for
-# this Python, relax it in requirements.txt — the code is not sensitive to exact
-# minor versions (see RAILWAY.md).
+COPY requirements-docker.txt .
+# Loose deps (unpinned) so the build resolves on this image's Python. CPU torch from
+# the pytorch CPU index. The code is not sensitive to exact minor versions.
 RUN pip install --upgrade pip \
-    && pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt openai
+    && pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements-docker.txt
 
 COPY . .
 RUN chmod +x run_railway.sh
