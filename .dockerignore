@@ -1,0 +1,12 @@
+.git
+__pycache__/
+*.pyc
+.pytest_cache/
+checkpoints/
+logs/
+temp/
+*.pt
+*.log
+*.pptx
+data/*.db
+.vscode/
