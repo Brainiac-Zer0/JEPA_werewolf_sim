@@ -73,9 +73,11 @@ class SocialInfluence(nn.Module):
         max_step: float = 0.25,
         device: Optional[torch.device] = None,
         clamp_coef: float = 1.0,   # extra safety multiplier on the step after normalization
+        msg_dim: int = 384,        # neighbor message-embedding dim (MiniLM=384); 0 disables
     ):
         super().__init__()
         self.latent_dim = int(latent_dim)
+        self.msg_dim = int(msg_dim)
         self.enabled = bool(enabled)
         self.scale = float(scale)
         self.reg_lambda = float(reg_lambda)
@@ -102,6 +104,10 @@ class SocialInfluence(nn.Module):
             nn.Linear(hidden, self.latent_dim),
         )
         self.out_ln = nn.LayerNorm(self.latent_dim)
+        # Message-content pathway (thesis §3.9): projects the aggregated neighbor
+        # message embedding into a latent contribution to δ. Carries real signal only
+        # when language is on; offline the neighbor messages are the trivial fallback.
+        self.msg_proj = nn.Linear(self.msg_dim, self.latent_dim) if self.msg_dim > 0 else None
 
     # ------------------------- trust/similarity -----------------------------
 
@@ -305,6 +311,39 @@ class SocialInfluence(nn.Module):
                 "social_pressure": social_pressure,   # NEW
             })
         return delta.squeeze(0), info
+
+    # ------------------------- batched trainable path -----------------------
+    def delta_from_inputs(self, z_self: torch.Tensor, mu: torch.Tensor,
+                          msg_mean: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Batched, differentiable social correction from a precomputed neighbor-mean
+        latent ``mu`` (uniform trust) and an optional aggregated neighbor message
+        embedding ``msg_mean`` (thesis §3.9). Mirrors the net→bound→scale path of
+        forward() so the SAME parameters are trained here and reused at eval.
+        Shapes: z_self (B,D), mu (B,D), msg_mean (B,msg_dim) -> delta (B,D).
+        """
+        z_self = _as_2d(torch.nan_to_num(z_self, nan=0.0))
+        mu = _as_2d(torch.nan_to_num(mu, nan=0.0))
+        sim = self._cosine_sim(z_self, mu)                     # (B,1)
+        diff = mu - z_self
+        inp = torch.nan_to_num(torch.cat([diff, sim], dim=-1), nan=0.0)  # (B,D+1)
+        delta = self.out_ln(self.net(inp))                     # (B,D)
+        # Message-content contribution (δ_msg).
+        if msg_mean is not None and self.msg_proj is not None:
+            mm = _as_2d(torch.nan_to_num(msg_mean.float(), nan=0.0))
+            if mm.size(-1) == self.msg_dim:
+                delta = delta + self.msg_proj(mm)
+        # Scale δ to be `self.scale` FRACTION of ||z_self|| (per row), so the relative
+        # correction is robust to the belief encoder's (uncontrolled) output norm.
+        # A fixed magnitude was ~2.6% of ||z|| here and thus inert.
+        dnorm = _l2_norm(delta).clamp_min(1e-8)                # (B,1)
+        target = float(self.scale) * _l2_norm(z_self).clamp_min(1e-6)   # (B,1)
+        delta = delta / dnorm * target
+        return torch.nan_to_num(delta, nan=0.0)
+
+    # Back-compat alias (latent-only).
+    def delta_from_mean(self, z_self: torch.Tensor, mu: torch.Tensor) -> torch.Tensor:
+        return self.delta_from_inputs(z_self, mu, None)
 
     # ------------------------- loss regularizer -----------------------------
 

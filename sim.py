@@ -90,7 +90,7 @@ except Exception:
         c = Counter(tally_list)
         return c.most_common(1)[0][0]
 
-from training_utils import load_role_models, load_role_models_factorized, load_shared_belief_encoder
+from training_utils import load_role_models, load_role_models_factorized, load_shared_belief_encoder, load_shared_social
 try:
     from encoders import MessageEncoder
 except Exception:
@@ -1020,6 +1020,14 @@ def simulate_game(visual: bool = True, seed: int | None = None):
     for ag in agents:
         ag.encoder = shared_belief_encoder
 
+    # Load the shared, trained social-influence module and give every agent the same
+    # instance (previously each agent had a fresh, untrained one → inert corrections).
+    _shared_social = load_shared_social()
+    if _shared_social is not None:
+        _shared_social.eval()
+        for ag in agents:
+            ag.social = _shared_social
+
     # Load the trained factorized world model + phase-action encoder + factorized
     # planner per role, so decisions run on trained networks (previously the sim
     # loaded a legacy '{role}_jepa.pt' that training never produced → untrained).
@@ -1402,6 +1410,27 @@ def simulate_game(visual: bool = True, seed: int | None = None):
             if _xp is not None:
                 x_pre_map[ag.name] = _xp
 
+        # Uniform-trust neighbor-mean latent per agent, stored on vote rollouts so the
+        # social-influence module can be trained (delta_from_inputs) at train time.
+        zn_mean_map: Dict[str, torch.Tensor] = {}
+        # Aggregated neighbor message embedding per agent (thesis §3.9 δ_msg pathway).
+        msg_neigh_map: Dict[str, torch.Tensor] = {}
+        if len(living) > 1:
+            _msg_emb: Dict[str, torch.Tensor] = {}
+            for n in living:
+                try:
+                    e = n.message_encoder(getattr(n, "last_message", "") or "")
+                    _msg_emb[n.name] = _finite(e).detach().reshape(-1).float()
+                except Exception:
+                    pass
+            for ag in living:
+                others = [z_pre_map[n.name] for n in living if n.name != ag.name and n.name in z_pre_map]
+                if others:
+                    zn_mean_map[ag.name] = torch.stack(others, 0).mean(0).detach()
+                m_others = [_msg_emb[n.name] for n in living if n.name != ag.name and n.name in _msg_emb]
+                if m_others:
+                    msg_neigh_map[ag.name] = torch.stack(m_others, 0).mean(0)
+
         per_agent_deltas: List[float] = []
         per_agent_stats: List[dict] = []
         z_post_map: Dict[str, torch.Tensor] = {}
@@ -1410,14 +1439,26 @@ def simulate_game(visual: bool = True, seed: int | None = None):
         if SOCIAL_ENABLED_CFG:
             for ag in living:
                 z_self = _finite(z_pre_map[ag.name])
-                neighbors = [n for n in living if n.name != ag.name]
                 info = {}
+                # Use the trained, message-aware social correction (delta_from_inputs)
+                # so eval matches training and carries the wolf-directed signal.
                 try:
-                    res = ag.compute_social_update(z_self, neighbors)
-                    if isinstance(res, tuple) and len(res) >= 2:
-                        z_updated, info = res[0], (res[1] or {})
+                    mu = zn_mean_map.get(ag.name)
+                    mm = msg_neigh_map.get(ag.name)
+                    soc = getattr(ag, "social", None)
+                    if soc is not None and mu is not None and hasattr(soc, "delta_from_inputs"):
+                        with torch.no_grad():
+                            d = soc.delta_from_inputs(
+                                z_self.reshape(1, -1),
+                                mu.reshape(1, -1),
+                                mm.reshape(1, -1) if mm is not None else None,
+                            ).reshape(-1)
+                        z_updated = z_self + _finite(d)
+                        info = {"delta_norm": float(d.norm().item())}
+                        ag.last_delta_social_norm = float(d.norm().item())
                     else:
-                        z_updated, info = res, {}
+                        res = ag.compute_social_update(z_self, [n for n in living if n.name != ag.name])
+                        z_updated, info = (res[0], res[1] or {}) if isinstance(res, tuple) else (res, {})
                 except Exception:
                     z_updated, info = z_self, {}
 
@@ -2179,6 +2220,13 @@ def simulate_game(visual: bool = True, seed: int | None = None):
                 if isinstance(aux, dict):
                     aux.setdefault("x_t", x_pre_map.get(ag.name))
                     aux["x_next"] = x_next_cur
+                    # Neighbor-mean latent + message embedding for training social.
+                    _znm = zn_mean_map.get(ag.name)
+                    if _znm is not None:
+                        aux["z_neigh_mean"] = _znm
+                    _mnm = msg_neigh_map.get(ag.name)
+                    if _mnm is not None:
+                        aux["msg_neigh_mean"] = _mnm
                 rollout.append((
                     z_t,
                     torch.tensor(int(ph_code)),

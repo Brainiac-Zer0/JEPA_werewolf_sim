@@ -78,6 +78,30 @@ trains (kill accuracy > 0).
   judge acceptance, talk→vote alignment) so runners need no CSV parsing.
 - `requirements.txt`, `README.md`.
 
+## Post-review improvements (make promised components actually function)
+
+A component-level review found several thesis claims that were present but inert.
+Fixed in phases (each offline-validated, with regression tests in test_phase1.py /
+test_phase2.py):
+
+- **Phase 1a — FEP planning (RQ2).** `talk_entropy_w`/`talk_kl_uniform_w` were
+  declared but never consumed. Now added to the factorized planner loss (entropy
+  penalty + KL-to-uniform prior); verified the penalty lowers planner talk entropy.
+- **Phase 1b — Personality steering (RQ5).** Personas affected only phrasing.
+  Added a persona→talk-intent bias in the planner (`ENABLE_PERSONA_STEER`); verified
+  a high-accuse persona measurably raises P(accuse).
+- **Phase 2 — Social influence (RQ6).** The eval-time module was a fresh, untrained,
+  latent-only correction that never changed a vote (even at 5×‖z‖). Rebuilt so it is:
+  (a) **trained** — wolf-supervised so δ shifts villager votes toward the actual
+  wolves; (b) **message-aware** (§3.9) — a message-embedding projection feeds δ
+  (content signal activates with language on); (c) **relatively scaled** — ‖δ‖ is a
+  fraction of ‖z_self‖ (robust to the encoder's norm; a fixed magnitude was ~2.6% and
+  inert); (d) **checkpointed/loaded** as a shared instance (mirrors the encoder).
+  Verified offline: social now changes 37% of games and **improves villager vote
+  accuracy (+3 pts, B1 > B2)**. Key subtlety fixed: training δ inside the main BC
+  loss taught it to be inert (reproduce the unshifted vote); δ is now trained only by
+  the wolf-supervision signal.
+
 ## Known-stale (not yet fixed)
 - `test_roles.py` imports `DEFECTIVE/WORKER` (pre-rename API); `test_agent.py`
   calls `encode_current_belief()` with no args; `test_llm_script.py` requires the

@@ -85,6 +85,9 @@ with open("config.yaml", "r") as f:
 # Tunables
 LAMBDA_BC: float = float(CFG.get("LAMBDA_BC", 0.5))            # used for vote/kill heads (and legacy BC)
 LAMBDA_TALK: float = float(CFG.get("LAMBDA_TALK", LAMBDA_BC))  # CE weight for talk head (defaults to LAMBDA_BC)
+# Weight on the social wolf-supervision term (Phase 2): trains δ_social to shift
+# villager votes toward the actual wolves so social becomes an effective component.
+SOCIAL_WOLF_W: float = float((CFG.get("social", {}) or {}).get("wolf_supervision_w", 0.5))
 MAX_NORM: float = float(CFG.get("MAX_NORM", 1.0))
 
 # Optional dims (used by helpers below; keep legacy defaults)
@@ -837,6 +840,7 @@ def train_jepa_factorized(
     run_id: str = "run",
     epoch_logger: Optional[TrainingEpochLogger] = None,
     belief_encoder: Optional[MLPBeliefEncoder] = None,
+    social_module: Optional["SocialInfluence"] = None,
 ) -> None:
     """
     Full phase-aware and factorized-head trainer.
@@ -880,6 +884,12 @@ def train_jepa_factorized(
     )
     if belief_encoder is not None:
         params = list(belief_encoder.parameters()) + params
+    # Social-influence module: trained via the planner BC gradients (its correction
+    # is added to the latent before the planner heads) plus its own L2 regularizer.
+    if social_module is not None:
+        social_module.to(DEVICE)
+        social_module.train()
+        params = params + list(social_module.parameters())
     optimizer, scheduler = make_optimizer_and_scheduler(
         params,
         learning_rate,
@@ -994,15 +1004,51 @@ def train_jepa_factorized(
             vote_mask = build_vote_mask_from_aux(batch, NUM_AGENTS_CFG)
             kill_mask = build_kill_mask_from_aux(batch, NUM_AGENTS_CFG)
 
+            # Social-influence correction applied to the latent BEFORE the planner
+            # heads (per the thesis, z' = z + δ_social before planning). The world
+            # model still predicts from the pre-social latent. Rows carrying a
+            # neighbor-mean latent get a trainable δ; others are unchanged.
+            z_plan_in = z_t_tensor
+            L_social_reg = torch.tensor(0.0, device=DEVICE)
+            L_social_wolf = torch.tensor(0.0, device=DEVICE)
+            _soc_idx_t = None
+            _soc_delta = None
+            if social_module is not None:
+                mus, msgs, idxs = [], [], []
+                have_msg = True
+                for i, r in enumerate(batch):
+                    aux = r.aux if isinstance(r.aux, dict) else {}
+                    znm = aux.get("z_neigh_mean")
+                    if isinstance(znm, torch.Tensor):
+                        idxs.append(i)
+                        mus.append(znm.reshape(-1).float())
+                        mm = aux.get("msg_neigh_mean")
+                        if isinstance(mm, torch.Tensor):
+                            msgs.append(mm.reshape(-1).float())
+                        else:
+                            have_msg = False
+                if idxs:
+                    idx_t = torch.tensor(idxs, device=DEVICE, dtype=torch.long)
+                    mu_b = torch.stack(mus).to(DEVICE)
+                    msg_b = torch.stack(msgs).to(DEVICE) if (have_msg and msgs) else None
+                    # δ is computed from the DETACHED base latent so the ONLY training
+                    # signal it receives is the wolf-supervision below. Keeping δ out of
+                    # the main planner BC (z_plan_in stays = z_t) avoids the
+                    # BC-toward-inertness pressure that cancelled the social effect.
+                    z_sub = z_t_tensor.index_select(0, idx_t).detach()
+                    delta = social_module.delta_from_inputs(z_sub, mu_b, msg_b)   # (len, D)
+                    L_social_reg = float(getattr(social_module, "reg_lambda", 0.0)) * delta.pow(2).sum(-1).mean()
+                    _soc_idx_t, _soc_delta = idx_t, delta
+
             with torch_amp.autocast(enabled=USE_AMP):
                 z_pred = world_model(z_t_tensor, a_embed)
                 L_mse = mse_loss(z_pred, z_next_tensor)
 
-                role_logits = role_probe(z_t_tensor)
+                role_logits = role_probe(z_plan_in)
                 L_role = ce_loss(role_logits, role_labels)
 
                 logits = planner_factorized(
-                    z_t_tensor,
+                    z_plan_in,
                     talk_mask=talk_mask,
                     vote_mask=vote_mask,
                     kill_mask=kill_mask
@@ -1079,6 +1125,40 @@ def train_jepa_factorized(
                     if vals:
                         L_soc = torch.tensor(sum(vals)/len(vals), device=DEVICE)
 
+                # Wolf-supervision through the social correction (Phase 2): train δ to
+                # shift VILLAGER votes toward the actual wolves using peer information.
+                # z_t is detached here so this signal trains the social module (and the
+                # planner heads), not the belief encoder.
+                if social_module is not None and _soc_delta is not None:
+                    wj, wtgt = [], []
+                    for j, i in enumerate(idxs):
+                        r = batch[i]
+                        aux = r.aux if isinstance(r.aux, dict) else {}
+                        wolves = aux.get("wolves")
+                        if (r.choice_type == "VOTE_TARGET"
+                                and (r.role or "").lower() not in ("werewolf", "wolf")
+                                and isinstance(wolves, list) and len(wolves) == NUM_AGENTS_CFG
+                                and any(wolves)):
+                            wj.append(j)
+                            wtgt.append([1.0 if w else 0.0 for w in wolves])
+                    if wj:
+                        wj_t = torch.tensor(wj, device=DEVICE, dtype=torch.long)
+                        b_idx = _soc_idx_t.index_select(0, wj_t)
+                        z_wolf = z_t_tensor.index_select(0, b_idx).detach() + _soc_delta.index_select(0, wj_t)
+                        vmask_w = vote_mask.index_select(0, b_idx)
+                        vlog = planner_factorized(
+                            z_wolf,
+                            talk_mask=build_talk_mask(len(wj), NUM_TALK_CATS),
+                            vote_mask=vmask_w,
+                            kill_mask=vmask_w,
+                        )["vote"]
+                        tgt = torch.tensor(wtgt, device=DEVICE, dtype=torch.float32)
+                        tgt = tgt * vmask_w.float()                     # only legal (alive) wolves
+                        keep = tgt.sum(-1) > 0
+                        if keep.any():
+                            tgt = tgt[keep] / tgt[keep].sum(-1, keepdim=True).clamp_min(1e-6)
+                            L_social_wolf = -(tgt * F.log_softmax(vlog[keep], dim=-1)).sum(-1).mean()
+
                 # FEP-inspired planning regularization (RQ2): an entropy term on the
                 # talk-intent distribution ("penalize entropy" → more decisive plans)
                 # plus a KL-to-uniform term (a prior pull that preserves exploration
@@ -1100,6 +1180,8 @@ def train_jepa_factorized(
                     + L_lc
                     + (lambda_reg * L_soc)
                     + L_fep
+                    + L_social_reg
+                    + (SOCIAL_WOLF_W * L_social_wolf)
                 )
 
             optimizer.zero_grad(set_to_none=True)
@@ -1168,6 +1250,10 @@ def train_jepa_factorized(
         enc_path = os.path.join(CHECKPOINT_DIR, "belief_encoder.pt")
         torch.save({"belief_encoder": belief_encoder.state_dict(),
                     "input_dim": INPUT_DIM_CFG, "latent_dim": LATENT_DIM}, enc_path)
+    # Shared social-influence module checkpoint (trained across roles/cycles).
+    if social_module is not None:
+        soc_path = os.path.join(CHECKPOINT_DIR, "social.pt")
+        torch.save({"social": social_module.state_dict(), "latent_dim": LATENT_DIM}, soc_path)
     print(f"[SAVE] {role_name} (factorized) models saved → {save_path}")
 
 # =============================================================================
@@ -2109,6 +2195,44 @@ def load_shared_belief_encoder() -> MLPBeliefEncoder:
     else:
         print("[INIT] No shared belief encoder checkpoint; starting fresh.")
     return enc
+
+def load_shared_social() -> Optional["SocialInfluence"]:
+    """
+    Load the shared, trained social-influence module from checkpoints/social.pt if
+    present, else a freshly-initialized one. Constructed with the same config/env
+    params the agent uses so state_dict shapes match. Returns None if unavailable.
+    """
+    if SocialInfluence is None:
+        return None
+
+    def _envf(name, default):
+        v = os.getenv(name)
+        try:
+            return float(v) if v is not None else float(default)
+        except Exception:
+            return float(default)
+
+    scfg = (CFG.get("social", {}) or {})
+    soc = SocialInfluence(
+        latent_dim=LATENT_DIM,
+        scale=_envf("SOCIAL_SCALE", scfg.get("scale", 0.05)),
+        hidden=64,
+        reg_lambda=_envf("SOCIAL_LAMBDA_REG", scfg.get("lambda_reg", 1e-3)),
+        trust_mode=str(scfg.get("trust", "none")).lower(),
+        tau=_envf("SOCIAL_TAU", scfg.get("tau", 0.5)),
+        max_step=_envf("SOCIAL_MAX_STEP", scfg.get("max_step", 0.25)),
+    )
+    ckpt_path = os.path.join(CHECKPOINT_DIR, "social.pt")
+    if os.path.exists(ckpt_path):
+        try:
+            state = torch.load(ckpt_path, map_location="cpu")
+            soc.load_state_dict(state["social"])
+            print(f"[LOAD] shared social module ← {ckpt_path}")
+        except Exception as e:
+            print(f"[WARN] failed to load social module ({e}); starting fresh.")
+    else:
+        print("[INIT] No shared social checkpoint; starting fresh.")
+    return soc
 
 def load_role_models_phase(role: str) -> Tuple[WorldModelMLP, PhaseActionEncoder, PlannerHead]:
     """

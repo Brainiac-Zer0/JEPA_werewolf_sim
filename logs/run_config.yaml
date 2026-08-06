@@ -57,7 +57,7 @@ DEFAULT_TEMPLATES:
 - Ask {target} a question
 - Express uncertainty
 - Propose vote on {target}
-ENABLE_PERSONA_STEER: false
+ENABLE_PERSONA_STEER: true
 ENTROPY_ATTENUATION: 0.5
 EXTRA_LEXICON: {}
 FPS: 1
@@ -110,6 +110,7 @@ N_GAMES: 50
 PERSONA_CONFIG_PATH: configs/persona_vectors.yaml
 PERSONA_SCALE: 0.2
 PERSONA_SEED: null
+PERSONA_STEER_SCALE: 1.0
 PER_CAT_SCALES:
   question: 1.1
   vote: 0.95
@@ -173,6 +174,10 @@ determinism:
   enabled: true
   seed: 1337
   torch_deterministic: true
+encoders:
+  regularization:
+    talk_entropy_w: 0.01
+    talk_kl_uniform_w: 0.0
 exploration:
   epsilon: 0.05
   ucb_c: 1.414
@@ -417,11 +422,12 @@ sim:
 social:
   enabled: true
   lambda_reg: 0.001
-  max_step: 0.25
-  scale: 0.05
+  max_step: 0.5
+  scale: 0.15
   tau: 0.5
   trust: cosine
   window: 1
+  wolf_supervision_w: 0.5
 social_influence:
   K: 6
   enabled: true

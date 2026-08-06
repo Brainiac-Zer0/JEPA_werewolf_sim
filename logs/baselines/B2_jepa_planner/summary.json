@@ -1,23 +1,23 @@
 {
   "baseline": "B2_jepa_planner",
-  "games_counted": 40,
+  "games_counted": 30,
   "by_seed": {
-    "1337": 20,
-    "2718": 20
+    "1337": 15,
+    "2718": 15
   },
-  "villager_win_rate_mean": 0.325,
-  "villager_win_rate_lo": 0.175,
-  "villager_win_rate_hi": 0.475,
-  "vote_accuracy_mean": 0.2796377278981768,
-  "vote_accuracy_lo": 0.2183738551341589,
-  "vote_accuracy_hi": 0.3413214170536636,
+  "villager_win_rate_mean": 0.4666666666666667,
+  "villager_win_rate_lo": 0.3,
+  "villager_win_rate_hi": 0.6333333333333333,
+  "vote_accuracy_mean": 0.3543286320376104,
+  "vote_accuracy_lo": 0.2730164545350304,
+  "vote_accuracy_hi": 0.4397608359133128,
   "judge_accept_mean": NaN,
   "judge_accept_lo": NaN,
   "judge_accept_hi": NaN,
   "talk_vote_align_mean": 1.0,
   "talk_vote_align_lo": 1.0,
   "talk_vote_align_hi": 1.0,
-  "dz_mse_mean": 0.16299211228236793,
-  "dz_mse_lo": 0.15740449541736215,
-  "dz_mse_hi": 0.16833548239476623
+  "dz_mse_mean": 2.0868302691550484,
+  "dz_mse_lo": 2.0744984304857637,
+  "dz_mse_hi": 2.1017150251322954
 }

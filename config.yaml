@@ -464,12 +464,22 @@ SAVE_OPTIM: false
 DEBUG_MASKS: false
 social:
   enabled: true
-  scale: 0.05
+  # scale/max_step set so the trained social correction is a meaningful fraction of
+  # ||z|| (~10-25%) instead of the previous inert ~0.2%. The planner trains WITH the
+  # correction present, so it adapts; lambda_reg bounds ||delta||.
+  scale: 0.15               # ||delta|| as a fraction of ||z_self|| (relative)
   window: 1
   lambda_reg: 0.001
+  # Weight on the wolf-supervision term that trains delta_social to shift villager
+  # votes toward the actual wolves (peer-informed wolf detection). This is what
+  # makes the social correction a genuine positive component (B1 > B2).
+  wolf_supervision_w: 0.5
   trust: cosine
   tau: 0.5
-  max_step: 0.25
+  max_step: 0.5
+  # Weight on the wolf-supervision term that trains δ_social to shift villager votes
+  # toward the actual wolves (makes social an effective, non-inert component).
+  wolf_supervision_w: 0.5
 social_influence:
   enabled: true
   K: 6

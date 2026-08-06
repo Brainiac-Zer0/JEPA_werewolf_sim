@@ -37,6 +37,7 @@ from training_utils import (         # noqa: E402
     load_role_models_phase,
     load_role_models_factorized,
     load_shared_belief_encoder,
+    load_shared_social,
     run_sim_and_collect_rollouts,
     train_jepa,
     train_jepa_phaseaware,
@@ -622,6 +623,9 @@ def main() -> None:
     # Trained in-place across both roles each cycle so gradients reach the encoder,
     # then persisted to checkpoints/belief_encoder.pt for the simulator to load.
     shared_belief_encoder = load_shared_belief_encoder()
+    # Shared social-influence module, trained in-place across roles/cycles and
+    # persisted to checkpoints/social.pt for the simulator to load.
+    shared_social = load_shared_social()
 
     # For JEPA eval aggregation across cycles
     eval_cache: Dict[str, Dict[str, float]] = {}
@@ -707,6 +711,7 @@ def main() -> None:
                         epoch_logger=epoch_logger,
                         epochs=epochs, batch_size=batch_size, learning_rate=lr,
                         belief_encoder=shared_belief_encoder,
+                        social_module=shared_social,
                     )
                     eval_metrics = evaluate_jepa_factorized(role_rollouts, world_model, phase_action_encoder, fplanner, belief_encoder=shared_belief_encoder)
 
