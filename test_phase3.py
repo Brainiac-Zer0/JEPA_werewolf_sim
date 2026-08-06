@@ -113,3 +113,113 @@ def test_heuristic_name_mention_suspicion():
     living[0].message_memory = [("Agent_1", "I think Agent_4 is lying")]
     out = sim._heuristic_vote_choice(living[0], living)
     assert out == "Agent_4"
+
+
+# ==================== JEPA-only: edge cases + properties =================== #
+def test_jepa_only_deterministic():
+    ag = _jepa_agent(); living = _living(6); living[0] = ag
+    z = torch.randn(LATENT_DIM)
+    assert sim._jepa_only_vote(ag, z, living) == sim._jepa_only_vote(ag, z, living)
+
+
+def test_jepa_only_accepts_2d_latent():
+    ag = _jepa_agent(); living = _living(6); living[0] = ag
+    z = torch.randn(LATENT_DIM)
+    assert sim._jepa_only_vote(ag, z, living) == sim._jepa_only_vote(ag, z.unsqueeze(0), living)
+
+
+def test_jepa_only_single_candidate():
+    ag = _jepa_agent()
+    living = _living(6, alive=[True, False, False, False, False, True]); living[0] = ag
+    # only Agent_5 is an alive non-self candidate
+    assert sim._jepa_only_vote(ag, torch.randn(LATENT_DIM), living) == "Agent_5"
+
+
+def test_jepa_only_no_candidates_returns_none():
+    ag = _jepa_agent()
+    living = _living(6, alive=[True, False, False, False, False, False]); living[0] = ag
+    assert sim._jepa_only_vote(ag, torch.randn(LATENT_DIM), living) is None
+
+
+def test_jepa_only_never_targets_dead_or_self():
+    ag = _jepa_agent()
+    living = _living(7, alive=[True, True, False, True, False, True, True]); living[0] = ag
+    dead = {"Agent_2", "Agent_4"}
+    for _ in range(30):
+        out = sim._jepa_only_vote(ag, torch.randn(LATENT_DIM), living)
+        assert out not in dead and out != ag.name
+
+
+def test_jepa_only_skips_malformed_names():
+    ag = _jepa_agent()
+    living = _living(4); living[0] = ag
+    living.append(types.SimpleNamespace(name="Spectator", alive=True))   # no _index
+    out = sim._jepa_only_vote(ag, torch.randn(LATENT_DIM), living)
+    assert out is not None and out.startswith("Agent_")
+
+
+def test_jepa_only_is_z_sensitive():
+    """Over many latents the world-model vote spreads across candidates (uses z)."""
+    ag = _jepa_agent(); living = _living(9); living[0] = ag
+    picks = {sim._jepa_only_vote(ag, torch.randn(LATENT_DIM), living) for _ in range(80)}
+    assert len(picks) >= 3
+
+
+def test_jepa_only_works_without_planner_attr():
+    """Mechanism independence: no planner_factorized needed."""
+    ag = _jepa_agent()
+    assert not hasattr(ag, "planner_factorized")
+    living = _living(5); living[0] = ag
+    assert sim._jepa_only_vote(ag, torch.randn(LATENT_DIM), living) is not None
+
+
+# ==================== Heuristic: edge cases + properties ================== #
+def test_heuristic_deterministic():
+    living = _living(5)
+    for a in living:
+        a.vote_history = ["Agent_2", "Agent_3", "Agent_2"]
+    assert sim._heuristic_vote_choice(living[0], living) == sim._heuristic_vote_choice(living[0], living)
+
+
+def test_heuristic_name_mention_beats_bandwagon():
+    living = _living(5)
+    for a in living:
+        a.vote_history = ["Agent_3"] * 5              # bandwagon → Agent_3
+    living[0].message_memory = [("x", "Agent_1 is sus")]   # name mention → Agent_1 wins
+    assert sim._heuristic_vote_choice(living[0], living) == "Agent_1"
+
+
+def test_heuristic_fallback_is_fixed_rotation():
+    living = _living(5)
+    # Agent_0 → (0+1)%4 → sorted[Agent_1,Agent_2,Agent_3,Agent_4][1] → Agent_2
+    assert sim._heuristic_vote_choice(living[0], living) == "Agent_2"
+    # Agent_1 → (1+1)%4 → sorted[Agent_0,Agent_2,Agent_3,Agent_4][2] → Agent_3
+    assert sim._heuristic_vote_choice(living[1], living) == "Agent_3"
+
+
+def test_heuristic_single_other_returns_it():
+    living = _living(5, alive=[True, False, True, False, False])
+    assert sim._heuristic_vote_choice(living[0], living) == "Agent_2"
+
+
+def test_heuristic_no_others_returns_none():
+    living = _living(5, alive=[True, False, False, False, False])
+    assert sim._heuristic_vote_choice(living[0], living) is None
+
+
+def test_heuristic_vote_history_recency_window():
+    """Only the last 9 votes count, so a swamped-but-stale target loses."""
+    living = _living(5)
+    for a in living:
+        a.vote_history = ["Agent_1"] * 100 + ["Agent_3"] * 9   # last 9 = Agent_3
+    assert sim._heuristic_vote_choice(living[0], living) == "Agent_3"
+
+
+# ============================ In-sim integration =========================== #
+def test_jepa_only_policy_game_runs(monkeypatch):
+    """The jepa_only branch runs end-to-end and produces a valid outcome."""
+    monkeypatch.setattr(sim, "_IS_JEPA_ONLY_POLICY", True)
+    monkeypatch.setattr(sim, "_IS_RANDOM_POLICY", False)
+    monkeypatch.setattr(sim, "_IS_HEURISTIC_POLICY", False)
+    _, meta = sim.simulate_game(visual=False, seed=21)
+    assert meta["outcome"]["winner"] in ("villagers", "werewolves")
