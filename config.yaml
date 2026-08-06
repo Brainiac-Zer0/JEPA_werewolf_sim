@@ -127,7 +127,7 @@ coalitions:
   compare: false
   shared_kill: true
   hidden: 64
-JUDGE_MODEL_ID: o4-mini
+JUDGE_MODEL_ID: gpt-4o-mini   # non-reasoning judge (~5-10x cheaper than o4-mini); rubric scoring needs no reasoning tokens
 JUDGE_MAX_NEW: 128
 JUDGE_DEBUG: false
 JUDGE_DEBUG_DIR: logs
@@ -143,7 +143,7 @@ openai:
   system: "You are the mouthpiece for a social-deduction agent. Speak in-character\
     \ in 1\u20132 concise sentences, never reveal hidden info, avoid OOC or meta."
 judge_openai:
-  model: o4-mini
+  model: gpt-4o-mini
   max_tokens: 256
   temperature: null
   presence_penalty: null
@@ -151,7 +151,7 @@ judge_openai:
   system: You are a strict scoring judge. Return JSON only with subscores and a final
     score.
 judge:
-  model_id: o4-mini
+  model_id: gpt-4o-mini
   device: auto
   batch: 4
   max_new: 128

@@ -112,6 +112,11 @@ test_phase2.py):
   VoteHead. Verified: identical-vote fraction dropped from 1.00 to 0.07 (B2/B3) and 0.00
   (B2/B5, B3/B5) — the rungs are now genuinely distinct policies.
 
+- **Phase 4 — Judge cost.** Default judge model switched from `o4-mini` (a reasoning
+  model that bills hidden reasoning tokens as output) to `gpt-4o-mini`. Rubric scoring
+  needs no reasoning; this cuts the dominant API cost of the full run ~5-10×. Set
+  `JUDGE_MODEL_ID`/`judge.model_id` back to `o4-mini` for strict thesis fidelity.
+
 ## Known-stale (not yet fixed)
 - `test_roles.py` imports `DEFECTIVE/WORKER` (pre-rename API); `test_agent.py`
   calls `encode_current_belief()` with no args; `test_llm_script.py` requires the

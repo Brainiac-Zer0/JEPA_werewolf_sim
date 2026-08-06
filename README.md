@@ -66,7 +66,7 @@ On Windows PowerShell, set env vars with `$env:USE_LANGUAGE="0"` etc., and prefe
 ### 4a. Train (thesis scale: 5 cycles × 200 games/role = 1000/role)
 
 ```bash
-export OPENAI_API_KEY=...            # for the o4-mini speaker/judge
+export OPENAI_API_KEY=...            # judge defaults to gpt-4o-mini (cheap); speaker uses config's llm.model_id
 LLM_PROVIDER=openai USE_LANGUAGE=1 JUDGE_ENABLED=1 \
 python train.py --mode factorized \
   --outer_cycles 5 --games_per_cycle 200 --epochs 5 \
