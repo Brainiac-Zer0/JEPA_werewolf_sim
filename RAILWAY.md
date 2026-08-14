@@ -20,7 +20,7 @@ for a CPU job is a few dollars at most.
    Railway auto-detects the `Dockerfile`.
 3. **Variables** (Settings → Variables):
    - `OPENAI_API_KEY` = your key  *(required; the run exits fast without it)*
-   - `RUN_MODE` = `pilot` (default) or `full`
+   - `RUN_MODE` = `pilot` (default), `medium` (resolves B0-vs-B6 affordably), or `full`
    - optional: `SPEAKER_MODEL` / `JUDGE_MODEL` (default `gpt-4o-mini`),
      `KEEP_ALIVE=1` (keep the container up after finishing so you can exec in).
 4. **Volume** (required so results/checkpoints survive): add a Volume mounted at

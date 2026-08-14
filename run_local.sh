@@ -41,6 +41,10 @@ if [ "$MODE" = "full" ]; then
   python train.py --mode factorized --outer_cycles 5 --games_per_cycle 200 --epochs 5 --speaker 1 --seed 1337
   python run_baseline_ladder.py --games 450 --seeds 1337,2718,3141
   python run_sweeps.py --games 300 --seeds 1337,2718
+elif [ "$MODE" = "medium" ]; then
+  # Resolves B0-vs-B6 across the full ladder at a fraction of full's cost (no sweeps).
+  python train.py --mode factorized --outer_cycles 2 --games_per_cycle 40 --epochs 4 --speaker 1 --seed 1337
+  python run_baseline_ladder.py --games 100 --seeds 1337,2718,3141
 else
   python train.py --mode factorized --outer_cycles 1 --games_per_cycle 20 --epochs 3 --speaker 1 --seed 1337
   python run_baseline_ladder.py --games 20 --seeds 1337 --baselines B6_random,B2_jepa_planner,B0_full
