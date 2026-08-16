@@ -72,7 +72,10 @@ try:
 except Exception:
     MessageEncoder = None  # type: ignore
 
-CHECKPOINT_DIR = "checkpoints"
+# Env-overridable so ablation conditions can use namespaced checkpoints
+# (e.g. CHECKPOINT_DIR=checkpoints_social vs checkpoints_nosocial for a
+# retrain-per-condition ablation). Both training and eval read this.
+CHECKPOINT_DIR = os.getenv("CHECKPOINT_DIR", "checkpoints")
 LOGS_DIR = "logs"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 os.makedirs(LOGS_DIR, exist_ok=True)
@@ -88,6 +91,11 @@ LAMBDA_TALK: float = float(CFG.get("LAMBDA_TALK", LAMBDA_BC))  # CE weight for t
 # Weight on the social wolf-supervision term (Phase 2): trains δ_social to shift
 # villager votes toward the actual wolves so social becomes an effective component.
 SOCIAL_WOLF_W: float = float((CFG.get("social", {}) or {}).get("wolf_supervision_w", 0.5))
+# Integrated social training: when on, the planner BC trains on the social-corrected
+# latent (z + δ) and δ trains through it — the "planner trained WITH social" condition
+# for a fair retrain-per-condition ablation. When off (default), δ is a detached
+# add-on trained only by wolf-supervision (preserves prior behavior/tests).
+SOCIAL_INTEGRATE: bool = (os.getenv("SOCIAL_INTEGRATE", str((CFG.get("social", {}) or {}).get("integrate_planner", ""))).strip().lower() in ("1", "true", "yes", "on"))
 # Anti-collapse variance-regularization weight on the belief encoder (VICReg-style).
 JEPA_VAR_W: float = float((CFG.get("training", {}) or {}).get("var_reg_w", 1.0))
 MAX_NORM: float = float(CFG.get("MAX_NORM", 1.0))
@@ -1033,14 +1041,25 @@ def train_jepa_factorized(
                     idx_t = torch.tensor(idxs, device=DEVICE, dtype=torch.long)
                     mu_b = torch.stack(mus).to(DEVICE)
                     msg_b = torch.stack(msgs).to(DEVICE) if (have_msg and msgs) else None
-                    # δ is computed from the DETACHED base latent so the ONLY training
-                    # signal it receives is the wolf-supervision below. Keeping δ out of
-                    # the main planner BC (z_plan_in stays = z_t) avoids the
-                    # BC-toward-inertness pressure that cancelled the social effect.
-                    z_sub = z_t_tensor.index_select(0, idx_t).detach()
-                    delta = social_module.delta_from_inputs(z_sub, mu_b, msg_b)   # (len, D)
-                    L_social_reg = float(getattr(social_module, "reg_lambda", 0.0)) * delta.pow(2).sum(-1).mean()
-                    _soc_idx_t, _soc_delta = idx_t, delta
+                    _reg = float(getattr(social_module, "reg_lambda", 0.0))
+                    if SOCIAL_INTEGRATE:
+                        # INTEGRATED: apply δ to the planner's input and train δ through
+                        # the planner BC (the planner learns to USE the social correction),
+                        # plus the L2 reg. Outcome-weighting in the BC loss steers it toward
+                        # corrections that reproduce winning play. Wolf-supervision is off
+                        # in this mode (δ learns from the real task). z_t is NOT detached.
+                        z_sub = z_t_tensor.index_select(0, idx_t)
+                        delta = social_module.delta_from_inputs(z_sub, mu_b, msg_b)
+                        z_plan_in = z_t_tensor.index_copy(0, idx_t, z_sub + delta)
+                        L_social_reg = _reg * delta.pow(2).sum(-1).mean()
+                        _soc_idx_t, _soc_delta = None, None   # disable separate wolf-supervision
+                    else:
+                        # DETACHED add-on: δ trained only by the wolf-supervision below;
+                        # planner BC stays on z_t (avoids the BC-toward-inertness pressure).
+                        z_sub = z_t_tensor.index_select(0, idx_t).detach()
+                        delta = social_module.delta_from_inputs(z_sub, mu_b, msg_b)   # (len, D)
+                        L_social_reg = _reg * delta.pow(2).sum(-1).mean()
+                        _soc_idx_t, _soc_delta = idx_t, delta
 
             with torch_amp.autocast(enabled=USE_AMP):
                 z_pred = world_model(z_t_tensor, a_embed)

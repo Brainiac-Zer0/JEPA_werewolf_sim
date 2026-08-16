@@ -31,23 +31,30 @@ echo "=================================================================="
 echo " AgentSim run | MODE=$MODE | speaker=$LLM_MODEL_ID judge=$JUDGE_MODEL_ID"
 echo "=================================================================="
 
+# --retrain = retrain-per-condition: each rung trains its OWN model (namespaced
+# checkpoint dir) with exactly the components it is evaluated with, then is scored
+# against that model. B0/B4 train with language on → the judge/speaker (OpenAI) are
+# exercised during TRAINING too, so the planner actually sees the social+LLM inputs.
 set -e
 if [ "$MODE" = "full" ]; then
   # Thesis scale (expensive). ~thousands of games with judge/language; hours-to-days.
-  python train.py --mode factorized --outer_cycles 5 --games_per_cycle 200 --epochs 5 --speaker 1 --seed 1337
-  python run_baseline_ladder.py --games 450 --seeds 1337,2718,3141
+  python run_baseline_ladder.py --retrain \
+      --train-games 200 --train-cycles 5 --train-epochs 5 \
+      --games 450 --seeds 1337,2718,3141
   python run_sweeps.py --games 300 --seeds 1337,2718
 elif [ "$MODE" = "medium" ]; then
-  # Statistically-meaningful but affordable: resolves B0-vs-B6 (win-rate CI ~±0.09)
-  # across the full 7-rung ladder at a fraction of full's cost/time. No sweeps
-  # (Table 2) — run those only in full.
-  python train.py --mode factorized --outer_cycles 2 --games_per_cycle 40 --epochs 4 --speaker 1 --seed 1337
-  python run_baseline_ladder.py --games 100 --seeds 1337,2718,3141
+  # Statistically-meaningful but affordable: resolves the contrasts (win-rate CI
+  # ~±0.09) across the full 7-rung ladder. No sweeps (Table 2) — run those in full.
+  python run_baseline_ladder.py --retrain \
+      --train-games 40 --train-cycles 2 --train-epochs 4 \
+      --games 100 --seeds 1337,2718,3141
 else
   # Cheap pilot: confirm B0 (full) separates from the baselines before scaling up.
-  python train.py --mode factorized --outer_cycles 1 --games_per_cycle 20 --epochs 3 --speaker 1 --seed 1337
-  python run_baseline_ladder.py --games 20 --seeds 1337 --baselines B6_random,B2_jepa_planner,B0_full
+  python run_baseline_ladder.py --retrain \
+      --train-games 20 --train-cycles 1 --train-epochs 3 \
+      --games 20 --seeds 1337 --baselines B6_random,B2_jepa_planner,B0_full
 fi
+python assess_ladder.py || true
 set +e
 
 echo ""
