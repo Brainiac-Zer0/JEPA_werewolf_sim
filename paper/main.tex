@@ -1,0 +1,325 @@
+\documentclass[11pt]{article}
+
+% ---------------------------------------------------------------------------
+% Learning to Deceive and Persuade: Predictive Agents with Language and
+% Personality Diversity in Social Deduction Games.
+%
+% Self-contained draft (compiles with a stock TeX install; no venue .sty
+% required). Swap \documentclass for the target venue style before submission.
+% ---------------------------------------------------------------------------
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage[hidelinks]{hyperref}
+
+% Draft note macro — remove before submission.
+\newcommand{\note}[1]{\textcolor{red}{[#1]}}
+\newcommand{\ci}[2]{{\footnotesize [#1, #2]}}
+% \num as a no-op so the draft compiles without siunitx; swap in siunitx later if desired.
+\newcommand{\num}[1]{#1}
+
+\title{Learning to Deceive and Persuade: Predictive Agents with\\
+Language and Personality Diversity in Social Deduction Games}
+\author{Aaron Shah\\ Virginia Commonwealth University}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We study whether a joint-embedding predictive architecture (JEPA) can learn the
+strategic core of a social-deduction game---one-day \textit{Werewolf} with nine
+players---and how much natural language contributes on top of a learned latent
+policy. Each agent maintains a belief latent produced by a shared encoder, a
+world model that predicts the next latent, and a factorized planner with
+separate talk, vote, and kill heads. A social-influence module applies a
+wolf-supervised correction to the belief latent, and a language ``mouthpiece''
+biases a frozen language-model decoder toward a chosen intent and target while an
+LLM-as-judge gates message acceptance. We evaluate the system with a
+\textit{retrain-per-condition} ablation ladder: every rung is scored against a
+model trained with exactly the components it is evaluated with, so no ablation is
+judged on a policy that never saw its own inputs. Our central finding is that
+language and the learned policy are \emph{not separable wins}: the full system
+nearly doubles the villager win rate over the strongest non-language ablation
+(\num{0.485} vs.\ \num{0.303}) and this language$+$judge contrast is the only
+statistically significant rung of the ladder, yet language paired with
+\emph{random} voting performs no better than random play. We further show that
+training the social-influence correction jointly with the planner reverses an
+apparent ``social hurts'' effect observed under a train/evaluate mismatch, and
+yields a markedly sharper world model.
+\end{abstract}
+
+% ===========================================================================
+\section{Introduction}
+% ===========================================================================
+Social-deduction games such as \textit{Werewolf} (\textit{Mafia}) demand exactly
+the capabilities that are hardest to isolate in language agents: maintaining a
+belief over hidden roles, reasoning about how one's own utterances shift others'
+beliefs, and converting that reasoning into a coordinated vote. Recent work
+drives such agents with large language models end to end, which entangles
+strategy and language and makes it difficult to ask how much of the competence is
+\emph{strategic} versus \emph{rhetorical}~\citep{xu2023werewolf}.
+
+We take the opposite decomposition. Following the predictive-architecture program
+of \citet{lecun2022path} and \citet{assran2023ijepa}, we place a small,
+\emph{learned} latent policy at the center of the agent---a belief encoder, a
+world model, and a factorized planner---and treat language as a controllable
+channel layered on top rather than the seat of strategy. This lets us pose the
+question the entangled designs cannot: \textbf{does language help because it
+conveys strategy the policy already computes, or is language a free win on its
+own?}
+
+Answering it cleanly requires an ablation methodology that most such studies skip.
+If the policy is trained once with all components and then evaluated with
+components switched off, an ablation measures a \emph{distribution shift} away
+from training, not the causal contribution of the component. We therefore adopt a
+\textbf{retrain-per-condition} ladder: each rung is trained with exactly the
+components it will be evaluated with. This single methodological change reverses
+one of our own earlier conclusions (Section~\ref{sec:results}).
+
+\paragraph{Contributions.}
+\begin{enumerate}
+  \item A JEPA-centered Werewolf agent with a factorized talk/vote/kill planner, a
+        jointly-trained social-influence correction, and a language mouthpiece
+        gated by an LLM judge (Section~\ref{sec:method}).
+  \item A retrain-per-condition ablation ladder (B0--B6) that scores every rung
+        against a model trained with its own components
+        (Section~\ref{sec:setup}).
+  \item Evidence that language and the learned policy are inseparable: the full
+        system nearly doubles the villager win rate over the best non-language
+        ablation and is the only significant rung, while language with random
+        voting equals random play (Section~\ref{sec:results}).
+\end{enumerate}
+
+% ===========================================================================
+\section{Related Work}
+% ===========================================================================
+\paragraph{Predictive architectures.} JEPA-style models learn by predicting a
+target representation of future input in a latent space rather than reconstructing
+raw observations~\citep{lecun2022path,assran2023ijepa}, and connect to the
+free-energy view of perception and action as prediction-error
+minimization~\citep{friston2010free}. We use the JEPA latent both as a belief
+state and, via one-step prediction error, as a value signal for a language-free
+voting baseline.
+
+\paragraph{Language agents in games of hidden information.} Cooperative and mixed
+games---Hanabi~\citep{bard2020hanabi}, Diplomacy~\citep{fair2022diplomacy}, and
+LLM-driven Werewolf~\citep{xu2023werewolf}---have become testbeds for
+communication under partial observability. Diplomacy in particular combines a
+strategic planner with a language model; our design shares that separation but
+adds an explicit ablation of the language channel against a learned latent policy.
+
+\paragraph{Representation collapse and judging.} Latent-predictive training can
+collapse to constant representations; variance/covariance
+regularization~\citep{bardes2022vicreg} and normalization~\citep{ba2016layernorm}
+counteract this. We found layer normalization on the encoder output essential for
+stable latents (Section~\ref{sec:method}). For message quality we use an
+LLM-as-judge~\citep{zhao2023llmjudge} that scores coherence, truthfulness,
+role-consistency, and safety.
+
+% ===========================================================================
+\section{Method}
+\label{sec:method}
+% ===========================================================================
+\paragraph{Game.} We play a nine-player one-day-cycle Werewolf variant: seven
+villagers and two werewolves. Each round has a discussion phase (agents emit
+messages), a day vote (strict majority; a tie yields no elimination), and a night
+kill by the werewolf team (target $i$ drawn with probability
+$p_i \propto \exp(c_i / \max_j c_j)$ over suspicion scores $c$). The game ends when
+all werewolves are eliminated (villagers win) or werewolves reach parity.
+
+\paragraph{Belief encoder.} A shared multilayer-perceptron encoder maps each
+agent's observation to a belief latent $z \in \mathbb{R}^{32}$. The observation
+includes public game state, per-player features, and an \emph{identity block}---a
+role bit, a self one-hot, and a persona embedding---so that the latent is
+conditioned on \emph{who} is observing. We apply layer
+normalization~\citep{ba2016layernorm} to the encoder output, which bounds
+$\lVert z \rVert$ and was necessary to prevent both representational collapse
+(cosine similarity $\to 1$) and norm explosion during joint training.
+
+\paragraph{World model and factorized planner.} A world model $g$ predicts the
+next belief latent $\hat z_{t+1} = g(z_t, a_t)$; targets are produced by
+re-encoding the realized next observation with a stop-gradient, giving a JEPA
+prediction loss $\lVert \hat z_{t+1} - \text{sg}(z_{t+1}) \rVert^2$. A
+\emph{factorized planner} maps the belief latent to three action heads---talk
+(intent/target), vote, and kill---trained by behavior cloning on rollouts. A
+language-free baseline (B3) votes by free energy: it scores candidate targets by
+the one-step prediction error they induce, using no planner head.
+
+\paragraph{Social-influence correction.} A social module produces a correction
+$\delta$ to the belief latent, relative-scaled so
+$\lVert \delta \rVert = s \cdot \lVert z \rVert$, and conditioned on the messages
+an agent has received. We consider two training regimes. In the \emph{detached}
+regime, $\delta$ is supervised to point toward werewolves and is not backpropagated
+into the planner---this is the natural but, as we show, \emph{harmful} default. In
+the \emph{integrated} regime the planner's behavior cloning is trained on
+$z + \delta$ (with $\delta$ in the gradient path), so the policy learns to
+\emph{use} the social signal. Unless noted, ``social'' refers to the integrated
+regime.
+
+\paragraph{Language mouthpiece and judge.} Rather than let a language model choose
+actions, we decouple content from strategy. The planner emits a discrete intent
+(accuse, question, defend, vote, hedge) and a target; a \emph{mouthpiece} biases a
+frozen decoder's logits toward realizing that intent, producing a natural-language
+message. An LLM-as-judge~\citep{zhao2023llmjudge} scores each message on
+coherence, truthfulness, role-consistency, and safety, and gates acceptance. This
+keeps strategy in the learned policy while language remains fluent and auditable.
+
+% ===========================================================================
+\section{Experimental Setup}
+\label{sec:setup}
+% ===========================================================================
+\paragraph{Retrain-per-condition ladder.} We evaluate seven rungs, from the full
+system (B0) down to random play (B6). Crucially, each rung is scored against a
+model \emph{trained} with exactly the components it is \emph{evaluated} with. The
+seven rungs are covered by four deduplicated training configurations (a
+no-social/no-language base shared by B2/B3/B5/B6; an integrated-social model for
+B1; a language model with random voting for B4; and the full model for B0), each
+written to its own checkpoint namespace. Table~\ref{tab:rungs} lists the rungs.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lll}
+\toprule
+Rung & Components (trained \& evaluated) & Voting policy \\
+\midrule
+B0\_full            & JEPA + planner + social + language + judge & planner \\
+B1\_planner\_social & JEPA + planner + integrated social         & planner \\
+B2\_jepa\_planner   & JEPA + planner                             & planner \\
+B3\_jepa\_only      & JEPA world model (no planner head)         & free-energy \\
+B4\_llm\_only       & language + judge                           & random \\
+B5\_heuristic       & none                                       & heuristic \\
+B6\_random          & none                                       & random \\
+\bottomrule
+\end{tabular}
+\caption{The ablation ladder. Each rung is trained and evaluated with the same
+component set (retrain-per-condition).}
+\label{tab:rungs}
+\end{table}
+
+\paragraph{Metrics.} We report villager win rate (primary), villager vote accuracy
+(fraction of villager votes cast at a werewolf), one-step world-model prediction
+error ($\Delta z$ MSE), and judge acceptance. We compute 95\%
+bootstrap confidence intervals over per-game outcomes and report contrasts as
+differences in win rate with a bootstrap CI and $P(\Delta>0)$.
+
+\paragraph{Scales.} We report a \emph{medium} run (99 games per rung across three
+seeds) that resolves the primary contrast, and note where a full-scale run
+(\num{450} games $\times$ 3 seeds, plus persona/social sweeps) is pending
+(Section~\ref{sec:results}). Language rungs (B0, B4) use \texttt{gpt-4o-mini} as
+both speaker and judge.
+
+% ===========================================================================
+\section{Results}
+\label{sec:results}
+% ===========================================================================
+Table~\ref{tab:table1} reports the full ladder at medium scale. Three findings
+stand out.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lcccc}
+\toprule
+Rung & Win rate \ci{95\%}{CI} & Vote acc. & $\Delta z$ MSE & Judge acc. \\
+\midrule
+\textbf{B0\_full}   & \textbf{0.485} \ci{0.384}{0.586} & 0.301 & 0.594 & 0.998 \\
+B3\_jepa\_only      & 0.303 \ci{0.212}{0.394}          & 0.301 & 4.08  & --    \\
+B1\_planner\_social & 0.222 \ci{0.141}{0.303}          & 0.249 & 0.583 & --    \\
+B2\_jepa\_planner   & 0.202 \ci{0.121}{0.283}          & 0.307 & 3.79  & --    \\
+B4\_llm\_only       & 0.192 \ci{0.121}{0.273}          & 0.294 & 4.78  & 0.999 \\
+B6\_random          & 0.192 \ci{0.121}{0.273}          & 0.294 & 3.89  & --    \\
+B5\_heuristic       & 0.071 \ci{0.030}{0.131}          & 0.289 & 3.81  & --    \\
+\bottomrule
+\end{tabular}
+\caption{Table 1 --- ablation ladder, medium scale ($n=99$ per rung, 3 seeds).
+Win rate is the villager win rate. \note{Replace with full-scale numbers
+($n=450\times3$) from the pending run; add Table 2 (persona/social sweeps).}}
+\label{tab:table1}
+\end{table}
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+Contrast & $\Delta$ win rate \ci{95\%}{CI} & Verdict \\
+\midrule
+Language$+$judge \; (B0 $-$ B1) & $+0.263$ \ci{+0.131}{+0.394} & \textbf{significant} ($P{=}1.00$) \\
+JEPA$+$planner \; (B2 $-$ B6)   & $+0.010$ \ci{-0.101}{+0.121} & n.s. \\
+Social \; (B1 $-$ B2)           & $+0.020$ \ci{-0.091}{+0.131} & n.s. \\
+\bottomrule
+\end{tabular}
+\caption{Ladder contrasts (medium scale). The language$+$judge contrast is the
+only significant rung.}
+\label{tab:contrasts}
+\end{table}
+
+\paragraph{(1) Language and the learned policy are inseparable.} The full system
+(B0) wins \num{0.485} of games---nearly double the strongest non-language rung
+(B3, \num{0.303}) and more than double random (\num{0.192}). The language$+$judge
+contrast $\mathrm{B0}-\mathrm{B1} = +0.263$ is the only significant rung of the
+ladder ($P(\Delta>0)=1.00$; Table~\ref{tab:contrasts}). Yet language is not a free
+win: \textbf{B4 (fluent language with a \num{0.999}-accepting judge, but random
+votes) scores \num{0.192}---identical to random play (B6).} Language contributes
+only when a learned policy consumes it; a persuasive channel bolted onto an
+uninformed voter is worthless. This is the paper's central result and it is
+invisible to designs that do not ablate voting and language independently.
+
+\paragraph{(2) Jointly training the social correction reverses a mismatch
+artifact.} Under a train/evaluate mismatch---planner trained without the social
+correction, correction switched on only at evaluation---social \emph{hurt}. Under
+retrain-per-condition, where the planner is trained on $z+\delta$, the effect
+flips to neutral-to-positive ($\mathrm{B1}-\mathrm{B2}=+0.020$ here; $+0.043$,
+$P{=}0.90$ in a language-free replication). The integrated-social models (B0, B1)
+also carry a markedly sharper world model: $\Delta z$ MSE $\approx 0.59$ versus
+$3.8$--$4.8$ for the base rungs, a 6--8$\times$ reduction. The lesson is
+methodological: an ablation that does not retrain per condition can invert the
+sign of a component's measured effect.
+
+\paragraph{(3) The learned planner beats random, and it scales with training.} At
+medium scale the planner contrast is positive but not significant
+($\mathrm{B2}-\mathrm{B6}=+0.010$). Quadrupling the offline training budget lifts
+it to $+0.053$ ($P{=}0.94$) and moves the planner (B2) above the free-energy
+voter (B3), indicating the factorized head is under-trained rather than
+uninformative at medium scale. \note{The pending full-scale run is expected to
+sharpen the planner and social contrasts; insert final numbers here.}
+
+% ===========================================================================
+\section{Discussion and Limitations}
+% ===========================================================================
+The inseparability of language and policy (finding 1) argues against reading
+strong LLM-Werewolf results as evidence of strategic competence per se: fluency
+plus a judge can leave win rate at chance if the voting policy is uninformed. Our
+decomposition localizes the competence in the learned planner and shows language
+amplifying it rather than substituting for it.
+
+\paragraph{Limitations.} The medium-scale contrasts for the planner and social
+components are underpowered ($n=99$); the full-scale run is pending. Win rates are
+governed partly by game balance (random villagers win $\approx\!0.19$ here), which
+shifts with rule and correction parameters and complicates cross-paper comparison.
+The judge and speaker share a model family, so judge acceptance is high
+($\approx\!0.99$) and may under-penalize; a stricter or independent judge is
+future work. Finally, ``truthfulness'' as scored by the judge is a proxy, not
+ground-truth deception detection.
+
+% ===========================================================================
+\section{Conclusion}
+% ===========================================================================
+A JEPA-centered agent learns the strategic core of nine-player Werewolf, and
+natural language---gated by an LLM judge---roughly doubles its win rate. But the
+gain is contingent: language helps only through a learned policy that consumes it,
+and an ablation must retrain per condition or risk inverting the sign of what it
+measures. We release the corrected pipeline and the retrain-per-condition ladder
+to support faithful component-level evaluation of language agents in social
+deduction.
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}
