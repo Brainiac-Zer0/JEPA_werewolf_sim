@@ -42,6 +42,20 @@ if [ "$MODE" = "full" ]; then
       --train-games 200 --train-cycles 5 --train-epochs 5 \
       --games 450 --seeds 1337,2718,3141
   python run_sweeps.py --games 300 --seeds 1337,2718
+elif [ "$MODE" = "publish" ]; then
+  # Publication run, cost-optimized. The language contrast is already significant
+  # at medium training, so we do NOT pay to retrain the LLM models at full scale:
+  #   * free variants (ck_base/ck_social): trained BIG (200x5x5) to firm up the
+  #     planner (B2-B6) and social (B1-B2) contrasts — $0 API.
+  #   * language variants (ck_llm/ck_full): kept at medium (40x2x4) — the costly
+  #     OpenAI-in-the-loop training, held down because B0-B1 is already P=1.00.
+  # Evaluate all 7 rungs at 450x3 for tight CIs, then run the persona/social
+  # sweeps (Table 2). This delivers the as-titled paper at a fraction of `full`.
+  python run_baseline_ladder.py --retrain \
+      --train-games 200 --train-cycles 5 --train-epochs 5 \
+      --lang-train-games 40 --lang-train-cycles 2 --lang-train-epochs 4 \
+      --games 450 --seeds 1337,2718,3141
+  python run_sweeps.py --games 300 --seeds 1337,2718
 elif [ "$MODE" = "medium" ]; then
   # Statistically-meaningful but affordable: resolves the contrasts (win-rate CI
   # ~±0.09) across the full 7-rung ladder. No sweeps (Table 2) — run those in full.

@@ -20,7 +20,8 @@ for a CPU job is a few dollars at most.
    Railway auto-detects the `Dockerfile`.
 3. **Variables** (Settings → Variables):
    - `OPENAI_API_KEY` = your key  *(required; the run exits fast without it)*
-   - `RUN_MODE` = `pilot` (default), `medium` (resolves B0-vs-B6 affordably), or `full`
+   - `RUN_MODE` = `pilot` (default), `medium` (resolves B0-vs-B6 affordably),
+     `publish` (recommended for the paper — see below), or `full`
    - optional: `SPEAKER_MODEL` / `JUDGE_MODEL` (default `gpt-4o-mini`),
      `KEEP_ALIVE=1` (keep the container up after finishing so you can exec in).
 4. **Volume** (required so results/checkpoints survive): add a Volume mounted at
@@ -34,6 +35,21 @@ for a CPU job is a few dollars at most.
 - Full per-game CSVs persist on the Volume under `/data/logs/…`. To pull them, set
   `KEEP_ALIVE=1` and use Railway's shell (`railway run` / service shell) to `cat` or
   copy them out, or add a step that uploads them somewhere you control.
+
+## `publish` mode (recommended for the paper)
+`publish` is a cost-optimized publication run. The language contrast (B0 vs B1) is
+already statistically significant at *medium* training, so it does **not** pay to
+retrain the LLM-in-the-loop models at full scale:
+- **Free models** (`ck_base`, `ck_social`): trained big (200×5×5, **$0 API**) to
+  firm up the planner (B2−B6) and social (B1−B2) contrasts.
+- **Language models** (`ck_llm`, `ck_full`): kept at medium (40×2×4) — the only
+  OpenAI-billed training, held down deliberately.
+- Evaluates all 7 rungs at 450×3 (tight CIs) and runs the persona/social sweeps
+  (**Table 2**), which `medium` skips.
+
+Net: it delivers the full, as-titled paper (Table 1 tightened + Table 2) at a
+fraction of `full`'s API cost, because `full` retrains the two language models at
+200×5 with the judge in the loop.
 
 ## Cost / time notes
 - `pilot` = 1 training cycle (20 games) + a 3-rung ladder (20 games). Enough to see

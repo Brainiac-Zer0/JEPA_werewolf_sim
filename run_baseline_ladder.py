@@ -170,10 +170,19 @@ def _eval_env_for(b: str) -> dict:
 
 
 def train_variants(baselines: list[str], train_games: int, train_cycles: int,
-                   train_epochs: int, seed: int, force: bool):
+                   train_epochs: int, seed: int, force: bool,
+                   lang_train_games: int | None = None,
+                   lang_train_cycles: int | None = None,
+                   lang_train_epochs: int | None = None):
     """Train the distinct checkpoint variants needed by `baselines`, each with the
     exact components it will be evaluated with (retrain-per-condition). Deduped: the
-    4 variants in TRAIN_VARIANTS cover all 7 rungs, so shared bases train once."""
+    4 variants in TRAIN_VARIANTS cover all 7 rungs, so shared bases train once.
+
+    Language variants (ck_llm/ck_full) run the OpenAI speaker+judge during training
+    (costly). If lang_train_* are given, those variants use that (smaller) budget
+    while the free variants (ck_base/ck_social) use the larger train_* budget --- so
+    `publish` mode can scale the free planner/social training without paying to
+    retrain the already-significant language models at full scale."""
     CKPT_ROOT.mkdir(parents=True, exist_ok=True)
     needed = []
     for ck in dict.fromkeys(BASELINES[b]["ckpt"] for b in baselines):  # ordered-unique
@@ -186,18 +195,23 @@ def train_variants(baselines: list[str], train_games: int, train_cycles: int,
         if done_marker.exists() and not force:
             print(f"\n===== TRAIN[{ck}] SKIP (exists; use --retrain to force) =====", flush=True)
             continue
+        lang = tvar.get("USE_LANGUAGE", "0") == "1"
+        # Language variants can carry a separate (smaller) training budget.
+        g = lang_train_games  if (lang and lang_train_games  is not None) else train_games
+        c = lang_train_cycles if (lang and lang_train_cycles is not None) else train_cycles
+        e = lang_train_epochs if (lang and lang_train_epochs is not None) else train_epochs
         env = dict(os.environ)
         env.update({k: str(v) for k, v in tvar.items() if k != "speaker"})
         env["CHECKPOINT_DIR"] = str(ck_dir)
         env.setdefault("PYTHONIOENCODING", "utf-8")
         env.setdefault("PYTHONUTF8", "1")
-        lang = tvar.get("USE_LANGUAGE", "0") == "1"
-        print(f"\n===== TRAIN[{ck}] -> {ck_dir}  cfg={tvar}  (language={'ON' if lang else 'off'}) =====", flush=True)
+        print(f"\n===== TRAIN[{ck}] -> {ck_dir}  cfg={tvar}  budget={g}x{c}x{e}  "
+              f"(language={'ON' if lang else 'off'}) =====", flush=True)
         cmd = [sys.executable, os.path.abspath(os.path.join(os.path.dirname(__file__), "train.py")),
                "--mode", "factorized",
-               "--games_per_cycle", str(train_games),
-               "--outer_cycles", str(train_cycles),
-               "--epochs", str(train_epochs),
+               "--games_per_cycle", str(g),
+               "--outer_cycles", str(c),
+               "--epochs", str(e),
                "--speaker", str(tvar.get("speaker", "0")),
                "--seed", str(seed)]
         subprocess.run(cmd, env=env, check=True)
@@ -206,10 +220,13 @@ def train_variants(baselines: list[str], train_games: int, train_cycles: int,
 # ============================ ORCHESTRATOR ==================================
 def run_orchestrator(games: int, seeds: list[int], baselines: list[str], extra_env: dict,
                      retrain: bool = False, train_games: int = 40, train_cycles: int = 2,
-                     train_epochs: int = 4, train_seed: int = 1337, force_train: bool = False):
+                     train_epochs: int = 4, train_seed: int = 1337, force_train: bool = False,
+                     lang_train_games: int | None = None, lang_train_cycles: int | None = None,
+                     lang_train_epochs: int | None = None):
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
     if retrain:
-        train_variants(baselines, train_games, train_cycles, train_epochs, train_seed, force_train)
+        train_variants(baselines, train_games, train_cycles, train_epochs, train_seed,
+                       force_train, lang_train_games, lang_train_cycles, lang_train_epochs)
     summaries = []
     for b in baselines:
         env = dict(os.environ)
@@ -255,10 +272,15 @@ def main():
                     help="retrain-per-condition: train each baseline's own model into a "
                          "namespaced checkpoint dir, then evaluate it against that model")
     ap.add_argument("--force-train", action="store_true", help="retrain even if the checkpoint exists")
-    ap.add_argument("--train-games", type=int, default=40, help="games per training cycle")
-    ap.add_argument("--train-cycles", type=int, default=2, help="outer training cycles")
-    ap.add_argument("--train-epochs", type=int, default=4, help="epochs per cycle")
+    ap.add_argument("--train-games", type=int, default=40, help="games per training cycle (free variants)")
+    ap.add_argument("--train-cycles", type=int, default=2, help="outer training cycles (free variants)")
+    ap.add_argument("--train-epochs", type=int, default=4, help="epochs per cycle (free variants)")
     ap.add_argument("--train-seed", type=int, default=1337, help="training seed")
+    # Optional separate (usually smaller) budget for the costly language variants
+    # (ck_llm/ck_full, which run the OpenAI speaker+judge during training).
+    ap.add_argument("--lang-train-games", type=int, default=None, help="games/cycle for language variants")
+    ap.add_argument("--lang-train-cycles", type=int, default=None, help="cycles for language variants")
+    ap.add_argument("--lang-train-epochs", type=int, default=None, help="epochs for language variants")
     args = ap.parse_args()
 
     seeds = [int(x) for x in str(args.seeds).split(",") if str(x).strip()]
@@ -269,7 +291,10 @@ def main():
         run_orchestrator(args.games, seeds, bl, extra_env={},
                          retrain=args.retrain, train_games=args.train_games,
                          train_cycles=args.train_cycles, train_epochs=args.train_epochs,
-                         train_seed=args.train_seed, force_train=args.force_train)
+                         train_seed=args.train_seed, force_train=args.force_train,
+                         lang_train_games=args.lang_train_games,
+                         lang_train_cycles=args.lang_train_cycles,
+                         lang_train_epochs=args.lang_train_epochs)
 
 
 if __name__ == "__main__":
