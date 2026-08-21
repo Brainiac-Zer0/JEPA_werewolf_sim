@@ -8,7 +8,7 @@
 % required). Swap \documentclass for the target venue style before submission.
 % ---------------------------------------------------------------------------
 
-\usepackage[margin=1in]{geometry}
+\usepackage{arxiv}          % self-contained arXiv-preprint style (see arxiv.sty)
 \usepackage{amsmath,amssymb}
 \usepackage{booktabs}
 \usepackage{graphicx}
@@ -98,28 +98,92 @@ one of our own earlier conclusions (Section~\ref{sec:results}).
 % ===========================================================================
 \section{Related Work}
 % ===========================================================================
-\paragraph{Predictive architectures.} JEPA-style models learn by predicting a
-target representation of future input in a latent space rather than reconstructing
-raw observations~\citep{lecun2022path,assran2023ijepa}, and connect to the
-free-energy view of perception and action as prediction-error
-minimization~\citep{friston2010free}. We use the JEPA latent both as a belief
-state and, via one-step prediction error, as a value signal for a language-free
-voting baseline.
+Our design sits at the intersection of four lines of work: predictive
+architectures and world models, multi-agent learning in games of hidden
+information, language and deception in interactive agents, and machine theory of
+mind. We also position our ablation methodology against the common practice of
+train-once/evaluate-many.
 
-\paragraph{Language agents in games of hidden information.} Cooperative and mixed
-games---Hanabi~\citep{bard2020hanabi}, Diplomacy~\citep{fair2022diplomacy}, and
-LLM-driven Werewolf~\citep{xu2023werewolf}---have become testbeds for
-communication under partial observability. Diplomacy in particular combines a
-strategic planner with a language model; our design shares that separation but
-adds an explicit ablation of the language channel against a learned latent policy.
+\paragraph{Predictive architectures and world models.} JEPA-style models learn by
+predicting a target \emph{representation} of future input in a latent space rather
+than reconstructing raw observations~\citep{lecun2022path,assran2023ijepa}. This
+lineage is closely related to model-based reinforcement learning that plans in a
+learned latent---World Models~\citep{ha2018world} and latent-imagination agents
+such as Dreamer~\citep{hafner2020dream}---and to the free-energy view of
+perception and action as prediction-error
+minimization~\citep{friston2010free}. Where prior work uses the learned dynamics
+model chiefly for control, we additionally repurpose one-step latent prediction
+error as an intrinsic \emph{value} signal: our language-free B3 baseline votes for
+the target whose elimination the world model predicts will most reduce future
+prediction error, giving a policy-head-free lower bound on what the JEPA latent
+alone supports.
 
-\paragraph{Representation collapse and judging.} Latent-predictive training can
+\paragraph{Multi-agent learning in games of hidden information.} Games with
+partial observability and hidden roles have become standard testbeds for
+coordination and inference. Hanabi stresses implicit signalling under a no-talk
+constraint~\citep{bard2020hanabi}, and the Bayesian Action Decoder learns
+conventions by reasoning over public
+beliefs~\citep{foerster2019bayesian}. Closest to Werewolf, DeepRole combines
+counterfactual regret minimization with explicit deductive reasoning over hidden
+roles in \emph{The Resistance: Avalon}~\citep{serrino2019finding}. These systems
+achieve strong play with hand-designed or tightly-structured inference; our
+contribution is orthogonal---a \emph{learned} latent belief and factorized planner
+whose components we can switch on and off---and we ask how much a natural-language
+channel adds on top of that learned core.
+
+\paragraph{Language, negotiation, and deception.} Emergent-communication work shows
+that agents can learn discrete protocols to coordinate under partial
+observability~\citep{foerster2016learning}, and end-to-end negotiation agents learn
+to bargain---and to bluff---directly from dialogue~\citep{lewis2017deal}. At larger
+scale, CICERO couples a strategic planner with a language model to reach
+human-level play in Diplomacy, grounding messages in intended
+actions~\citep{fair2022diplomacy}. We adopt the same planner/language separation
+but invert the emphasis: rather than optimizing dialogue for persuasion, we hold
+the language channel fixed (an intent-conditioned mouthpiece over a frozen decoder,
+gated by a judge) and measure its \emph{marginal} contribution to win rate against
+a learned policy. This lets us test whether fluent, judge-approved speech is worth
+anything when the underlying voting policy is uninformed---a question the
+end-to-end systems cannot isolate.
+
+\paragraph{LLM social-deduction agents.} A recent line drives Werewolf and Avalon
+agents with large language models, either prompting frozen models to
+reason~\citep{xu2023werewolf} or adding adaptive/experience-based mechanisms to
+improve strategic play~\citep{lan2024werewolf}. More broadly, generative agents use
+LLMs to produce believable social behavior in open-ended
+simulations~\citep{park2023generative}. Because these agents entangle strategy and
+language inside one model, strong win rates are difficult to attribute: our
+decomposition and the B4 (language$+$random-voting) rung are designed precisely to
+separate rhetorical fluency from strategic competence
+(Section~\ref{sec:results}).
+
+\paragraph{Theory of mind and belief modeling.} Modeling other agents' hidden
+mental states is central to social deduction. Machine-theory-of-mind networks learn
+to predict others' beliefs and behavior from observation~\citep{rabinowitz2018machine},
+and Bayesian theory-of-mind underlies DeepRole's role
+inference~\citep{serrino2019finding}. Our social-influence module is a lightweight,
+learned analogue: it applies a wolf-supervised correction to an agent's belief
+latent conditioned on received messages, and---crucially---is trained
+\emph{jointly} with the planner so the policy learns to use it rather than being
+perturbed by it at test time.
+
+\paragraph{Representation collapse and LLM-as-judge.} Latent-predictive training can
 collapse to constant representations; variance/covariance
 regularization~\citep{bardes2022vicreg} and normalization~\citep{ba2016layernorm}
 counteract this. We found layer normalization on the encoder output essential for
-stable latents (Section~\ref{sec:method}). For message quality we use an
+stable latents, after a variance-hinge regularizer alone failed
+(Section~\ref{sec:method}). For message quality we use an
 LLM-as-judge~\citep{zhao2023llmjudge} that scores coherence, truthfulness,
-role-consistency, and safety.
+role-consistency, and safety, and note the standard caveat that a judge sharing a
+model family with the speaker tends toward leniency (Section~ef{sec:discussion}).
+
+\paragraph{Ablation under train--evaluate consistency.} Finally, our study is a
+methodological cautionary tale. Component ablations are routinely computed by
+training a single full model and disabling parts at evaluation. When a component
+(here, the social correction) participates in the learned policy, disabling it at
+test time measures a distribution shift away from training rather than the
+component's causal value---and, as we show, can invert the \emph{sign} of the
+measured effect. We therefore retrain per condition, an inexpensive discipline that
+we argue should be standard for component-level claims about interactive agents.
 
 % ===========================================================================
 \section{Method}
@@ -292,6 +356,7 @@ sharpen the planner and social contrasts; insert final numbers here.}
 
 % ===========================================================================
 \section{Discussion and Limitations}
+\label{sec:discussion}
 % ===========================================================================
 The inseparability of language and policy (finding 1) argues against reading
 strong LLM-Werewolf results as evidence of strategic competence per se: fluency
