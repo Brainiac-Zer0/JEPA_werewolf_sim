@@ -11,6 +11,7 @@
 \usepackage{arxiv}          % self-contained arXiv-preprint style (see arxiv.sty)
 \usepackage{amsmath,amssymb}
 \usepackage{booktabs}
+\usepackage{multirow}
 \usepackage{graphicx}
 \usepackage{xcolor}
 \usepackage[numbers,sort&compress]{natbib}
@@ -21,6 +22,8 @@
 \newcommand{\ci}[2]{{\footnotesize [#1, #2]}}
 % \num as a no-op so the draft compiles without siunitx; swap in siunitx later if desired.
 \newcommand{\num}[1]{#1}
+% \TBD marks a numeric cell to be filled from the pending publish-run outputs.
+\newcommand{\TBD}{\textcolor{red}{--}}
 
 \title{Learning to Deceive and Persuade: Predictive Agents with\\
 Language and Personality Diversity in Social Deduction Games}
@@ -116,7 +119,7 @@ model chiefly for control, we additionally repurpose one-step latent prediction
 error as an intrinsic \emph{value} signal: our language-free B3 baseline votes for
 the target whose elimination the world model predicts will most reduce future
 prediction error, giving a policy-head-free lower bound on what the JEPA latent
-alone supports.
+alone supports. We use it as a language-free voting rule.
 
 \paragraph{Multi-agent learning in games of hidden information.} Games with
 partial observability and hidden roles have become standard testbeds for
@@ -354,6 +357,51 @@ voter (B3), indicating the factorized head is under-trained rather than
 uninformative at medium scale. \note{The pending full-scale run is expected to
 sharpen the planner and social contrasts; insert final numbers here.}
 
+\subsection{Sensitivity sweeps (Table 2)}
+\label{sec:sweeps}
+Beyond the ablation ladder we sweep three design parameters at evaluation time
+against the full trained model, holding the trained weights fixed and varying one
+knob per family (Table~\ref{tab:table2}). \textbf{S1} varies the magnitude of the
+social-influence correction ($\lVert\delta\rVert$ as a fraction of
+$\lVert z\rVert$); $0$ disables the correction and the trained default is $0.15$.
+\textbf{S2} varies the intent-bias fusion weight $\alpha$ that blends the planner's
+chosen talk intent with the learned bias head when steering the decoder.
+\textbf{S3} is the \emph{personality-diversity} sweep: \texttt{PERSONA\_SCALE}
+controls the spread from which each agent's five-factor persona is drawn, so
+$0$ yields a homogeneous population and larger values a more diverse one. Because
+the persona enters both the encoder identity block and the speaker, S3 probes
+whether personality \emph{diversity} per se helps or hurts coordinated villager
+play---the question the paper's title raises.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{llccccc}
+\toprule
+Family & Condition & Win rate \ci{95\%}{CI} & Vote acc. & Talk--vote align. & Judge acc. & $\Delta z$ MSE \\
+\midrule
+\multirow{3}{*}{\shortstack[l]{S1: social\\ scale}}
+  & $\lVert\delta\rVert=0.00$ (off) & \TBD\ \ci{\TBD}{\TBD} & \TBD & \TBD & --    & \TBD \\
+  & $\lVert\delta\rVert=0.15$       & \TBD\ \ci{\TBD}{\TBD} & \TBD & \TBD & --    & \TBD \\
+  & $\lVert\delta\rVert=0.30$       & \TBD\ \ci{\TBD}{\TBD} & \TBD & \TBD & --    & \TBD \\
+\midrule
+\multirow{2}{*}{\shortstack[l]{S2: intent\\ fusion}}
+  & $\alpha=0.3$ & \TBD\ \ci{\TBD}{\TBD} & \TBD & \TBD & \TBD & \TBD \\
+  & $\alpha=0.7$ & \TBD\ \ci{\TBD}{\TBD} & \TBD & \TBD & \TBD & \TBD \\
+\midrule
+\multirow{3}{*}{\shortstack[l]{S3: persona\\ diversity}}
+  & homogeneous ($s{=}0.0$) & \TBD\ \ci{\TBD}{\TBD} & \TBD & \TBD & \TBD & \TBD \\
+  & moderate ($s{=}0.2$)    & \TBD\ \ci{\TBD}{\TBD} & \TBD & \TBD & \TBD & \TBD \\
+  & diverse ($s{=}0.4$)     & \TBD\ \ci{\TBD}{\TBD} & \TBD & \TBD & \TBD & \TBD \\
+\bottomrule
+\end{tabular}
+\caption{Table 2 --- eval-time sensitivity sweeps on the full model. \note{Populate
+from \texttt{logs/sweeps/sweep\_summary.csv} after the publish run; S1 is
+language-free (no judge). Report each family's trend and whether S3 shows a
+diversity effect on villager win rate.}}
+\label{tab:table2}
+\end{table}
+
 % ===========================================================================
 \section{Discussion and Limitations}
 \label{sec:discussion}
@@ -383,6 +431,68 @@ and an ablation must retrain per condition or risk inverting the sign of what it
 measures. We release the corrected pipeline and the retrain-per-condition ladder
 to support faithful component-level evaluation of language agents in social
 deduction.
+
+% ===========================================================================
+\appendix
+\section{Training and Implementation Details}
+\label{sec:appendix}
+% ===========================================================================
+All components are small networks trained from self-play rollouts; the only large
+models are the frozen speaker/judge (\texttt{gpt-4o-mini}). Code and configuration
+are released with the paper.
+
+\paragraph{Observation and identity block.} Each agent's observation is an
+823-dimensional vector: an 808-dimensional base (public game state, per-player
+features, and a MiniLM sentence embedding of recent
+messages\,---\,\texttt{all-MiniLM-L6-v2}) concatenated with a 15-dimensional
+\emph{identity block} (1 role bit $+$ 9 self one-hot $+$ 5 five-factor persona),
+scaled by $\textsc{identity\_scale}=6.0$. The identity block conditions the latent on
+who is observing and was necessary to break an encoder-collapse failure mode.
+
+\paragraph{Networks.} The belief encoder is an MLP mapping observations to a
+32-dimensional latent with an output \texttt{LayerNorm} (which bounds
+$\lVert z\rVert$ and prevents collapse/explosion; a VICReg-style variance hinge,
+tried first, destabilized the norm and is disabled). The world model predicts the
+next latent from $(z_t, a_t)$ with an 8-dimensional one-hot action embedding
+($\textsc{world\_input\_mode}=z\!\oplus\!a$). The factorized planner has three heads
+(talk over five intents $\{$accuse, defend, hedge, question, vote$\}$, vote, kill)
+with self/dead masking and wolves-only kill masking; planning uses top-$3$
+candidates.
+
+\paragraph{Social-influence module.} A message-conditioned network emits a
+correction $\delta$ with relative scaling $\lVert\delta\rVert = s\,\lVert z\rVert$
+($s=0.15$ trained), cosine trust, $\tau=0.5$, and $\lVert\delta\rVert$ bounded by a
+regularizer ($\lambda_{\text{reg}}=10^{-3}$). In the \emph{integrated} regime the
+planner's behavior cloning is trained on $z+\delta$; a wolf-supervision term
+(weight $0.5$) trains $\delta$ to shift villager votes toward true werewolves.
+
+\paragraph{Language and judge.} The planner emits a discrete intent and target; a
+learned bias head and speaker bandit steer a frozen decoder, blended by an
+intent-fusion weight $\alpha$ (default $0.65$; swept in S2). The judge
+(\texttt{gpt-4o-mini}) returns JSON subscores for coherence, truthfulness,
+role-consistency, and safety, and gates acceptance.
+
+\paragraph{Training objective and hyperparameters.} Factorized training combines
+behavior cloning ($\lambda_{\text{bc}}=0.5$), a talk-intent term
+($\lambda_{\text{talk}}=0.5$), a small FEP-style talk-entropy regularizer
+($0.01$), and the JEPA one-step latent-prediction loss, whose targets are the
+re-encoded next observation under a stop-gradient. Optimizer Adam, learning rate
+$10^{-3}$, batch size $64$, gradient-norm clip $1.0$. Speaker bandit and bias head
+use learning rate $5\times10^{-4}$. Determinism is seeded (global seed $1337$).
+
+\paragraph{Retrain-per-condition protocol.} The seven rungs are covered by four
+deduplicated checkpoints, each written to its own namespace:
+\texttt{ck\_base} (planner, no social/language; B2/B3/B5/B6),
+\texttt{ck\_social} (integrated social; B1),
+\texttt{ck\_llm} (language, random voting; B4), and
+\texttt{ck\_full} (all components; B0). In the publication run the language-free
+models (\texttt{ck\_base}, \texttt{ck\_social}) are trained at $200\times5$
+games$\times$cycles for $5$ epochs, while the language models
+(\texttt{ck\_llm}, \texttt{ck\_full}), which invoke the paid speaker/judge during
+training, are held at $40\times2$ for $4$ epochs (the language contrast is already
+significant, so the extra budget goes to the free components). Every rung is
+evaluated at $450$ games across seeds $\{1337, 2718, 3141\}$; sweeps (Table~2) use
+$300$ games across $\{1337, 2718\}$ against \texttt{ck\_full}.
 
 \bibliographystyle{plainnat}
 \bibliography{references}
