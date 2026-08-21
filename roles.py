@@ -1,5 +1,6 @@
 # roles.py (Phase-7: persona → backend-aware variability)
 from __future__ import annotations
+import os
 import random
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Any, Optional
@@ -9,6 +10,21 @@ import torch, yaml
 # ── Load config
 with open("config.yaml", "r") as f:
     CFG = yaml.safe_load(f) or {}
+
+
+def _env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    try:
+        return float(v) if v is not None and str(v).strip() != "" else float(default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return bool(default)
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 # ── Canonical role names (kept consistent with sim/agent/judge)
 WEREWOLF: str = CFG.get("WEREWOLF", "Werewolf")
@@ -71,11 +87,15 @@ ROLE_PRIORS = {
 }
 
 # ── Personality config (structured first, keep legacy mirrors)
-PERSONA_ENABLED: bool = bool(
-    CFG.get("persona", {}).get("enabled", CFG.get("PERSONA_ENABLED", True))
+# Env overrides win over config.yaml so sweeps (run_sweeps.py S3) can vary the
+# spread of personalities at eval time via PERSONA_SCALE / PERSONA_ENABLED.
+PERSONA_ENABLED: bool = _env_bool(
+    "PERSONA_ENABLED",
+    bool(CFG.get("persona", {}).get("enabled", CFG.get("PERSONA_ENABLED", True)))
 )
-PERSONA_SCALE: float = float(
-    CFG.get("persona", {}).get("scale", CFG.get("PERSONA_SCALE", 0.2))
+PERSONA_SCALE: float = _env_float(
+    "PERSONA_SCALE",
+    float(CFG.get("persona", {}).get("scale", CFG.get("PERSONA_SCALE", 0.2)))
 )
 
 @dataclass

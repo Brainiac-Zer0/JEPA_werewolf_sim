@@ -14,11 +14,14 @@ recreates it with the same output schema:
 Each condition sets environment variables that sim.py reads at import time, so
 conditions run in isolated subprocesses.
 
-  S2 (alpha_fusion): varies ALPHA_INTENT_BIAS (planner-intent vs bias-head blend).
-  S1 (lambda_reg):   varies the social-correction magnitude (SOC_SCALE); the
-                     thesis's λ_reg is a training-time regularizer with no eval
-                     effect, so eval-time robustness is probed via the social
-                     correction scale it governs.
+  S1 (lambda_reg):        varies the social-correction magnitude (SOCIAL_SCALE,
+                          read at eval by load_shared_social); the thesis's
+                          lambda_reg is a training-time regularizer with no eval
+                          effect, so eval-time robustness is probed via the scale.
+  S2 (alpha_fusion):      varies ALPHA_INTENT_BIAS (planner-intent vs bias-head blend).
+  S3 (persona_diversity): varies PERSONA_SCALE, the spread of Big-Five personas
+                          across agents (0 = homogeneous population). Backs the
+                          "personality diversity" claim in the title.
 
 Usage:
   python run_sweeps.py --games 300 --seeds 1337,2718
@@ -33,12 +36,24 @@ OUT_ROOT = Path("logs") / "sweeps"
 # family -> list of (condition_name, env_overrides)
 SWEEPS: dict[str, list[tuple[str, dict]]] = {
     "lambda_reg": [
-        ("S1_lambda0",    {"SOCIAL_ENABLED": "1", "SOC_SCALE": "0.0",  "USE_LANGUAGE": "0", "JUDGE_ENABLED": "0"}),
-        ("S1_lambda1e-3", {"SOCIAL_ENABLED": "1", "SOC_SCALE": "0.05", "USE_LANGUAGE": "0", "JUDGE_ENABLED": "0"}),
+        ("S1_scale0.00", {"SOCIAL_ENABLED": "1", "SOCIAL_SCALE": "0.00", "USE_LANGUAGE": "0", "JUDGE_ENABLED": "0"}),
+        ("S1_scale0.15", {"SOCIAL_ENABLED": "1", "SOCIAL_SCALE": "0.15", "USE_LANGUAGE": "0", "JUDGE_ENABLED": "0"}),
+        ("S1_scale0.30", {"SOCIAL_ENABLED": "1", "SOCIAL_SCALE": "0.30", "USE_LANGUAGE": "0", "JUDGE_ENABLED": "0"}),
     ],
     "alpha_fusion": [
         ("S2_alpha0.3", {"ALPHA_INTENT_BIAS": "0.3", "USE_LANGUAGE": "1"}),
         ("S2_alpha0.7", {"ALPHA_INTENT_BIAS": "0.7", "USE_LANGUAGE": "1"}),
+    ],
+    # S3 (personality diversity): PERSONA_SCALE governs how far each agent's
+    # Big-Five persona is drawn from neutral (roles.py:_sample_persona samples
+    # each trait ~ U[-scale, scale]). scale=0 -> homogeneous agents; larger ->
+    # more diverse. Eval-time sensitivity of the full (language-on) system to the
+    # spread of personalities in the population. This is the experiment behind the
+    # "personality diversity" claim in the title.
+    "persona_diversity": [
+        ("S3_homogeneous", {"PERSONA_SCALE": "0.0", "USE_LANGUAGE": "1", "JUDGE_ENABLED": "1"}),
+        ("S3_moderate",    {"PERSONA_SCALE": "0.2", "USE_LANGUAGE": "1", "JUDGE_ENABLED": "1"}),
+        ("S3_diverse",     {"PERSONA_SCALE": "0.4", "USE_LANGUAGE": "1", "JUDGE_ENABLED": "1"}),
     ],
 }
 
@@ -148,7 +163,8 @@ def main():
     ap = argparse.ArgumentParser(description="Sweep runner (Table 2)")
     ap.add_argument("--games", type=int, default=300)
     ap.add_argument("--seeds", type=str, default="1337,2718")
-    ap.add_argument("--only", type=str, default=None, help="single family: lambda_reg|alpha_fusion")
+    ap.add_argument("--only", type=str, default=None,
+                    help="single family: lambda_reg|alpha_fusion|persona_diversity")
     ap.add_argument("--run-one", type=str, default=None, help="(internal) family:condition")
     args = ap.parse_args()
     seeds = [int(x) for x in str(args.seeds).split(",") if str(x).strip()]

@@ -41,7 +41,9 @@ if [ "$MODE" = "full" ]; then
   python run_baseline_ladder.py --retrain \
       --train-games 200 --train-cycles 5 --train-epochs 5 \
       --games 450 --seeds 1337,2718,3141
-  python run_sweeps.py --games 300 --seeds 1337,2718
+  # Sweeps probe the FULL trained system's sensitivity → point them at ck_full
+  # (retrain-per-condition writes there, not to the default checkpoints/).
+  CHECKPOINT_DIR=checkpoints_ablation/ck_full python run_sweeps.py --games 300 --seeds 1337,2718
 elif [ "$MODE" = "publish" ]; then
   # Publication run, cost-optimized. The language contrast is already significant
   # at medium training, so we do NOT pay to retrain the LLM models at full scale:
@@ -55,7 +57,9 @@ elif [ "$MODE" = "publish" ]; then
       --train-games 200 --train-cycles 5 --train-epochs 5 \
       --lang-train-games 40 --lang-train-cycles 2 --lang-train-epochs 4 \
       --games 450 --seeds 1337,2718,3141
-  python run_sweeps.py --games 300 --seeds 1337,2718
+  # Sweeps probe the FULL trained system's sensitivity → point them at ck_full
+  # (retrain-per-condition writes there, not to the default checkpoints/).
+  CHECKPOINT_DIR=checkpoints_ablation/ck_full python run_sweeps.py --games 300 --seeds 1337,2718
 elif [ "$MODE" = "medium" ]; then
   # Statistically-meaningful but affordable: resolves the contrasts (win-rate CI
   # ~±0.09) across the full 7-rung ladder. No sweeps (Table 2) — run those in full.

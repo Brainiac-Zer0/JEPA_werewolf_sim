@@ -43,7 +43,7 @@ if [ "$MODE" = "full" ]; then
   python run_baseline_ladder.py --retrain \
       --train-games 200 --train-cycles 5 --train-epochs 5 \
       --games 450 --seeds 1337,2718,3141
-  python run_sweeps.py --games 300 --seeds 1337,2718
+  CHECKPOINT_DIR=checkpoints_ablation/ck_full python run_sweeps.py --games 300 --seeds 1337,2718
 elif [ "$MODE" = "medium" ]; then
   # Resolves the contrasts across the full ladder at a fraction of full's cost (no sweeps).
   python run_baseline_ladder.py --retrain \
