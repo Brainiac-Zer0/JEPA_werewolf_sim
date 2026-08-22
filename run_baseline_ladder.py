@@ -222,7 +222,7 @@ def run_orchestrator(games: int, seeds: list[int], baselines: list[str], extra_e
                      retrain: bool = False, train_games: int = 40, train_cycles: int = 2,
                      train_epochs: int = 4, train_seed: int = 1337, force_train: bool = False,
                      lang_train_games: int | None = None, lang_train_cycles: int | None = None,
-                     lang_train_epochs: int | None = None):
+                     lang_train_epochs: int | None = None, lang_games: int | None = None):
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
     if retrain:
         train_variants(baselines, train_games, train_cycles, train_epochs, train_seed,
@@ -237,10 +237,15 @@ def run_orchestrator(games: int, seeds: list[int], baselines: list[str], extra_e
             env["CHECKPOINT_DIR"] = str(CKPT_ROOT / BASELINES[b]["ckpt"])
         env.setdefault("PYTHONIOENCODING", "utf-8")
         env.setdefault("PYTHONUTF8", "1")
+        # Language rungs (B0/B4) call the paid speaker+judge per game; if lang_games
+        # is set, evaluate them at that (smaller) count. The language contrast is
+        # already significant, so the eval budget concentrates on the free rungs.
+        is_lang = BASELINES[b].get("USE_LANGUAGE", "0") == "1"
+        eval_games = lang_games if (is_lang and lang_games is not None) else games
         ck_note = f"  ckpt={env.get('CHECKPOINT_DIR', 'checkpoints')}"
-        print(f"\n===== {b}  toggles={_eval_env_for(b)}{ck_note} =====", flush=True)
+        print(f"\n===== {b}  toggles={_eval_env_for(b)}{ck_note}  games={eval_games} =====", flush=True)
         cmd = [sys.executable, os.path.abspath(__file__),
-               "--run-one", b, "--games", str(games), "--seeds", ",".join(str(s) for s in seeds)]
+               "--run-one", b, "--games", str(eval_games), "--seeds", ",".join(str(s) for s in seeds)]
         subprocess.run(cmd, env=env, check=True)
         sp = OUT_ROOT / b / "summary.json"
         if sp.exists():
@@ -281,6 +286,8 @@ def main():
     ap.add_argument("--lang-train-games", type=int, default=None, help="games/cycle for language variants")
     ap.add_argument("--lang-train-cycles", type=int, default=None, help="cycles for language variants")
     ap.add_argument("--lang-train-epochs", type=int, default=None, help="epochs for language variants")
+    ap.add_argument("--lang-games", type=int, default=None,
+                    help="eval games for the language rungs B0/B4 (paid); defaults to --games")
     args = ap.parse_args()
 
     seeds = [int(x) for x in str(args.seeds).split(",") if str(x).strip()]
@@ -294,7 +301,8 @@ def main():
                          train_seed=args.train_seed, force_train=args.force_train,
                          lang_train_games=args.lang_train_games,
                          lang_train_cycles=args.lang_train_cycles,
-                         lang_train_epochs=args.lang_train_epochs)
+                         lang_train_epochs=args.lang_train_epochs,
+                         lang_games=args.lang_games)
 
 
 if __name__ == "__main__":

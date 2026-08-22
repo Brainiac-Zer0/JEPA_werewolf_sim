@@ -45,18 +45,20 @@ if [ "$MODE" = "full" ]; then
   # (retrain-per-condition writes there, not to the default checkpoints/).
   CHECKPOINT_DIR=checkpoints_ablation/ck_full python run_sweeps.py --games 300 --seeds 1337,2718
 elif [ "$MODE" = "publish" ]; then
-  # Publication run, cost-optimized. The language contrast is already significant
-  # at medium training, so we do NOT pay to retrain the LLM models at full scale:
-  #   * free variants (ck_base/ck_social): trained BIG (200x5x5) to firm up the
-  #     planner (B2-B6) and social (B1-B2) contrasts — $0 API.
+  # Publication run, cost- AND memory-optimized. B0-B1 is already significant at
+  # medium training, so we do NOT retrain the LLM models at full scale:
+  #   * free variants (ck_base/ck_social): 40x8x6 — MORE total training than medium
+  #     to firm up planner (B2-B6) and social (B1-B2), but games_per_cycle stays at
+  #     40, the memory-safe peak. (200/cycle OOM-killed the container: train.py's
+  #     collect_rollouts_for_role holds a whole cycle of rollouts in RAM.) $0 API.
   #   * language variants (ck_llm/ck_full): kept at medium (40x2x4) — the costly
   #     OpenAI-in-the-loop training, held down because B0-B1 is already P=1.00.
-  # Evaluate all 7 rungs at 450x3 for tight CIs, then run the persona/social
-  # sweeps (Table 2). This delivers the as-titled paper at a fraction of `full`.
+  # Eval FREE rungs at 450x3 (tight CIs, $0); LANGUAGE rungs B0/B4 at 150x3 (already
+  # significant — saves API + wall-clock). Then persona/social sweeps (Table 2).
   python run_baseline_ladder.py --retrain \
-      --train-games 200 --train-cycles 5 --train-epochs 5 \
+      --train-games 40 --train-cycles 8 --train-epochs 6 \
       --lang-train-games 40 --lang-train-cycles 2 --lang-train-epochs 4 \
-      --games 450 --seeds 1337,2718,3141
+      --games 450 --lang-games 150 --seeds 1337,2718,3141
   # Sweeps probe the FULL trained system's sensitivity → point them at ck_full
   # (retrain-per-condition writes there, not to the default checkpoints/).
   CHECKPOINT_DIR=checkpoints_ablation/ck_full python run_sweeps.py --games 300 --seeds 1337,2718

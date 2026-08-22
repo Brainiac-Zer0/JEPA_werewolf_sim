@@ -486,13 +486,16 @@ deduplicated checkpoints, each written to its own namespace:
 \texttt{ck\_social} (integrated social; B1),
 \texttt{ck\_llm} (language, random voting; B4), and
 \texttt{ck\_full} (all components; B0). In the publication run the language-free
-models (\texttt{ck\_base}, \texttt{ck\_social}) are trained at $200\times5$
-games$\times$cycles for $5$ epochs, while the language models
+models (\texttt{ck\_base}, \texttt{ck\_social}) are trained at $40\times8$
+games$\times$cycles for $6$ epochs, while the language models
 (\texttt{ck\_llm}, \texttt{ck\_full}), which invoke the paid speaker/judge during
 training, are held at $40\times2$ for $4$ epochs (the language contrast is already
-significant, so the extra budget goes to the free components). Every rung is
-evaluated at $450$ games across seeds $\{1337, 2718, 3141\}$; sweeps (Table~2) use
-$300$ games across $\{1337, 2718\}$ against \texttt{ck\_full}.
+significant, so the extra budget goes to the free components; games-per-cycle is
+capped at $40$ to bound peak memory). The language-free rungs are evaluated at
+$450$ games across seeds $\{1337, 2718, 3141\}$; the language rungs (B0, B4), whose
+contrast is already significant and whose per-game cost is dominated by the paid
+judge/speaker, at $150$ games over the same seeds. Sweeps (Table~2) use $300$ games
+across $\{1337, 2718\}$ against \texttt{ck\_full}.
 
 \bibliographystyle{plainnat}
 \bibliography{references}
